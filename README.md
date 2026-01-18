@@ -4,11 +4,12 @@ Orchestra is a task orchestration system that processes markdown-based task file
 
 ## Features
 
-- **Task Management**: Process markdown task files with YAML frontmatter
+- **Task Management**: Process markdown task files with frontmatter
 - **Status Tracking**: Track tasks through pending, running, complete, incomplete, and failed states
 - **Completion Criteria**: Validate responses against configurable criteria (contains string, minimum length)
 - **Auto-Archiving**: Automatically move completed tasks to a dedicated completed folder
-- **Configurable**: Flexible configuration via YAML file
+- **Configurable**: Flexible configuration via Python file
+- **No External Dependencies**: Only requires the `requests` library
 - **OpenWebUI Compatible**: Works with OpenAI-compatible API endpoints
 
 ## Installation
@@ -50,7 +51,7 @@ Orchestra is a task orchestration system that processes markdown-based task file
 
 ## Task File Format
 
-Tasks are markdown files with YAML frontmatter. See `tasks/examples/sample.md` for a working example.
+Tasks are markdown files with frontmatter. See `tasks/examples/sample.md` for a working example.
 
 ```markdown
 ---
@@ -160,7 +161,7 @@ The script handles various error scenarios:
 - Missing tasks directory
 - Malformed task files
 - API connection failures
-- Invalid YAML frontmatter
+- Invalid frontmatter format
 - File system errors
 
 ## Requirements

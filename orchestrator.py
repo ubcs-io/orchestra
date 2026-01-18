@@ -63,7 +63,7 @@ def get_config():
 
 def parse_frontmatter(filepath):
     """
-    Parses a markdown file with YAML-like frontmatter.
+    Parses a markdown file with frontmatter.
     Returns a tuple (metadata, content).
     """
     with open(filepath, 'r') as f:
@@ -84,7 +84,7 @@ def parse_frontmatter(filepath):
     frontmatter_text = parts[1].strip()
     body = parts[2].strip()
     
-    # Parse simple YAML-like frontmatter
+    # Parse simple frontmatter
     metadata = {}
     try:
         for line in frontmatter_text.split('\n'):
@@ -115,10 +115,10 @@ def parse_frontmatter(filepath):
 
 def write_frontmatter(filepath, metadata, content, response=None):
     """
-    Writes a markdown file with YAML-like frontmatter.
+    Writes a markdown file with frontmatter.
     Optionally appends a response section at bottom.
     """
-    # Convert metadata to YAML-like format
+    # Convert metadata to frontmatter format
     frontmatter_lines = []
     for key, value in metadata.items():
         if isinstance(value, str):
