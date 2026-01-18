@@ -109,8 +109,8 @@ The `config.yaml` file contains all runtime settings:
 
 ```yaml
 # API Configuration
-api_url: "http://192.168.2.245:8080/api/v1/chat/completions"
-api_key: ""  # Bearer token for authentication
+api_url: "http://192.168.2.1:8080/api/v1/chat/completions"
+api_key: "sk-12345"  # OpenWebUI Bearer token for authentication
 
 # Directory Configuration
 tasks_directory: "./tasks"
