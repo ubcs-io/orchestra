@@ -163,4 +163,4 @@ The script handles various error scenarios:
 
 ## License
 
-[Add your license here]
+MIT
