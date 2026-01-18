@@ -1,7 +1,7 @@
 # Configuration files (contain sensitive information)
-config.yaml
+config.py
 # But keep the example file
-!config.yaml.example
+!config.example.py
 
 # macOS - all directories
 **/.DS_Store

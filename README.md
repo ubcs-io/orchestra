@@ -16,26 +16,26 @@ Orchestra is a task orchestration system that processes markdown-based task file
 1. Clone or download this repository
 2. Install required Python dependencies:
    ```bash
-   pip install requests pyyaml
+   pip install requests
    ```
 
 ## Setup
 
 1. Copy the example configuration file:
    ```bash
-   cp config.yaml.example config.yaml
+   cp config.example.py config.py
    ```
 
-2. Edit `config.yaml` with your settings:
-   - `api_url`: Your OpenWebUI API endpoint
-   - `api_key`: Your API key (leave empty if authentication is disabled)
-   - `default_model`: Default LLM model to use if not specified in task
-   - `default_workspace`: Default workspace identifier if not specified in task
-   - `tasks_directory`: Base tasks directory
-   - `pending_directory`: Directory containing tasks waiting to be processed
-   - `completed_directory`: Directory where completed tasks will be moved
-   - `failed_directory`: Directory where failed tasks will be moved
-   - `request_timeout`: Timeout in seconds for API requests
+2. Edit `config.py` with your settings:
+   - `API_URL`: Your OpenWebUI API endpoint
+   - `API_KEY`: Your API key (leave empty if authentication is disabled)
+   - `DEFAULT_MODEL`: Default LLM model to use if not specified in task
+   - `DEFAULT_WORKSPACE`: Default workspace identifier if not specified in task
+   - `TASKS_DIRECTORY`: Base tasks directory
+   - `PENDING_DIRECTORY`: Directory containing tasks waiting to be processed
+   - `COMPLETED_DIRECTORY`: Directory where completed tasks will be moved
+   - `FAILED_DIRECTORY`: Directory where failed tasks will be moved
+   - `REQUEST_TIMEOUT`: Timeout in seconds for API requests
 
 3. Create your tasks directory structure:
    ```
@@ -85,7 +85,7 @@ python orchestrator.py
 ```
 
 The script will:
-1. Load configuration from `config.yaml`
+1. Load configuration from `config.py`
 2. Scan the pending directory for `.md` files
 3. Process each pending task
 4. Update task status during processing
@@ -108,41 +108,41 @@ The script will:
 
 ## Configuration
 
-The `config.yaml` file contains all runtime settings:
+The `config.py` file contains all runtime settings:
 
-```yaml
+```python
 # API Configuration
-api_url: "http://192.168.2.1:8080/api/v1/chat/completions"
-api_key: "sk-12345"  # OpenWebUI Bearer token for authentication
+API_URL = "http://192.168.2.1:8080/api/v1/chat/completions"
+API_KEY = "sk-12345"  # OpenWebUI Bearer token for authentication
 
 # Default Task Settings
 # These are used as fallbacks if tasks don't specify model or workspace
-default_model: "llama3"
-default_workspace: "default"
+DEFAULT_MODEL = "llama3"
+DEFAULT_WORKSPACE = "default"
 
 # Directory Configuration
-tasks_directory: "./tasks"
-pending_directory: "./tasks/pending"
-completed_directory: "./tasks/completed"
-failed_directory: "./tasks/failed"
+TASKS_DIRECTORY = "./tasks"
+PENDING_DIRECTORY = "./tasks/pending"
+COMPLETED_DIRECTORY = "./tasks/completed"
+FAILED_DIRECTORY = "./tasks/failed"
 
 # Request Configuration
-request_timeout: 300  # seconds
+REQUEST_TIMEOUT = 300  # seconds
 ```
 
 ## Security
 
-- **config.yaml** contains sensitive information and is excluded from version control via `.gitignore`
-- Use `config.yaml.example` as a template for your configuration
-- Never commit `config.yaml` to version control
+- **config.py** contains sensitive information and is excluded from version control via `.gitignore`
+- Use `config.example.py` as a template for your configuration
+- Never commit `config.py` to version control
 
 ## Project Structure
 
 ```
 orchestra/
 ├── orchestrator.py          # Main orchestration script
-├── config.yaml              # Configuration file (not in git)
-├── config.yaml.example      # Configuration template
+├── config.py               # Configuration file (not in git)
+├── config.example.py       # Configuration template
 ├── .gitignore              # Git ignore rules
 ├── README.md               # This file
 └── tasks/
@@ -167,7 +167,6 @@ The script handles various error scenarios:
 
 - Python 3.6+
 - requests
-- pyyaml
 - Access to an OpenWebUI-compatible API endpoint
 
 ## License
