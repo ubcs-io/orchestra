@@ -12,7 +12,7 @@ default_workspace: "default"
 
 # Directory Configuration
 tasks_directory: "./tasks"
-queued_directory: "./tasks/queued"
+pending_directory: "./tasks/pending"
 completed_directory: "./tasks/completed"
 failed_directory: "./tasks/failed"
 

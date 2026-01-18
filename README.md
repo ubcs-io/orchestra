@@ -32,7 +32,7 @@ Orchestra is a task orchestration system that processes markdown-based task file
    - `default_model`: Default LLM model to use if not specified in task
    - `default_workspace`: Default workspace identifier if not specified in task
    - `tasks_directory`: Base tasks directory
-   - `queued_directory`: Directory containing tasks waiting to be processed
+   - `pending_directory`: Directory containing tasks waiting to be processed
    - `completed_directory`: Directory where completed tasks will be moved
    - `failed_directory`: Directory where failed tasks will be moved
    - `request_timeout`: Timeout in seconds for API requests
@@ -40,7 +40,7 @@ Orchestra is a task orchestration system that processes markdown-based task file
 3. Create your tasks directory structure:
    ```
    tasks/
-     ├── queued/           # Place new tasks here
+     ├── pending/          # Place new tasks here
      │   ├── task1.md
      │   └── task2.md
      ├── completed/        # Successfully completed tasks
@@ -86,7 +86,7 @@ python orchestrator.py
 
 The script will:
 1. Load configuration from `config.yaml`
-2. Scan the queued directory for `.md` files
+2. Scan the pending directory for `.md` files
 3. Process each pending task
 4. Update task status during processing
 5. Validate responses against completion criteria
@@ -95,7 +95,7 @@ The script will:
 
 ## Task Processing Flow
 
-1. **Queued Task**: Task is read from the queued directory and marked as 'running'
+1. **Pending Task**: Task is read from the pending directory and marked as 'running'
 2. **Execution**: Task content is submitted to the configured LLM API
 3. **Validation**: Response is checked against completion criteria
 4. **Status Update**:
@@ -122,7 +122,7 @@ default_workspace: "default"
 
 # Directory Configuration
 tasks_directory: "./tasks"
-queued_directory: "./tasks/queued"
+pending_directory: "./tasks/pending"
 completed_directory: "./tasks/completed"
 failed_directory: "./tasks/failed"
 
@@ -146,7 +146,7 @@ orchestra/
 ├── .gitignore              # Git ignore rules
 ├── README.md               # This file
 └── tasks/
-    ├── queued/            # Place new tasks here for processing
+    ├── pending/           # Place new tasks here for processing
     ├── completed/         # Successfully completed tasks
     ├── failed/            # Failed tasks
     └── examples/          # Example task templates

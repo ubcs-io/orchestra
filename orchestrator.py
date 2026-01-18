@@ -24,7 +24,7 @@ def load_config(config_path="config.yaml"):
             loaded_config = yaml.safe_load(f)
             
         # Validate required configuration
-        required_keys = ['api_url', 'api_key', 'tasks_directory', 'queued_directory', 'completed_directory', 'failed_directory', 'request_timeout', 'default_model', 'default_workspace']
+        required_keys = ['api_url', 'api_key', 'tasks_directory', 'pending_directory', 'completed_directory', 'failed_directory', 'request_timeout', 'default_model', 'default_workspace']
         for key in required_keys:
             if key not in loaded_config:
                 print(f"Error: Missing required configuration key '{key}' in config.yaml")
@@ -320,12 +320,12 @@ def main():
         print("Error: Failed to load configuration. Please create config.yaml from config.yaml.example")
         return
     
-    queued_directory = cfg['queued_directory']
+    pending_directory = cfg['pending_directory']
     completed_directory = cfg['completed_directory']
     failed_directory = cfg['failed_directory']
     
-    if not os.path.exists(queued_directory):
-        print(f"Directory '{queued_directory}' not found.")
+    if not os.path.exists(pending_directory):
+        print(f"Directory '{pending_directory}' not found.")
         return
 
     # Ensure the completed directory exists
@@ -346,10 +346,10 @@ def main():
             print(f"Error creating failed directory: {e}")
             return
 
-    # Iterate over all .md files in the queued directory
-    for filename in os.listdir(queued_directory):
+    # Iterate over all .md files in the pending directory
+    for filename in os.listdir(pending_directory):
         if filename.endswith(".md"):
-            filepath = os.path.join(queued_directory, filename)
+            filepath = os.path.join(pending_directory, filename)
             process_markdown_file(filepath)
 
 if __name__ == "__main__":
