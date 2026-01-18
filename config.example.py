@@ -7,7 +7,7 @@ API_KEY = ""  # Leave empty if local auth is disabled, otherwise add your Bearer
 
 # Default Task Settings
 # These are used as fallbacks if tasks don't specify model or workspace
-DEFAULT_MODEL = "llama3"
+DEFAULT_MODEL = "deepseek-r1:latest"
 DEFAULT_WORKSPACE = "default"
 
 # Directory Configuration
