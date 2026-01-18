@@ -358,7 +358,7 @@ def main():
     # Load configuration
     cfg = get_config()
     if cfg is None:
-        print("Error: Failed to load configuration. Please create config.yaml from config.yaml.example")
+        print("Error: Failed to load configuration. Please create config.py from config.example.py")
         return
     
     pending_directory = cfg['pending_directory']
@@ -387,11 +387,18 @@ def main():
             print(f"Error creating failed directory: {e}")
             return
 
+    # Get all .md files in the pending directory
+    md_files = [filename for filename in os.listdir(pending_directory) if filename.endswith(".md")]
+    
+    # Check if there are any pending tasks
+    if not md_files:
+        print("No pending tasks found in the pending directory.")
+        return
+
     # Iterate over all .md files in the pending directory
-    for filename in os.listdir(pending_directory):
-        if filename.endswith(".md"):
-            filepath = os.path.join(pending_directory, filename)
-            process_markdown_file(filepath)
+    for filename in md_files:
+        filepath = os.path.join(pending_directory, filename)
+        process_markdown_file(filepath)
 
 if __name__ == "__main__":
     main()
