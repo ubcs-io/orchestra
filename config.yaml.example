@@ -1,0 +1,13 @@
+# Orchestra Configuration Example
+# Copy this file to config.yaml and update with your settings
+
+# API Configuration
+api_url: "http://192.168.1.2:8080/api/v1/chat/completions"
+api_key: ""  # Leave empty if local auth is disabled, otherwise add your Bearer token
+
+# Directory Configuration
+tasks_directory: "./tasks"
+completed_directory: "./tasks/completed"
+
+# Request Configuration
+request_timeout: 300  # seconds to wait for API response

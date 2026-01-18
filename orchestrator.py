@@ -4,18 +4,47 @@ import requests
 import yaml
 from requests.exceptions import RequestException
 
-# --- CONFIGURATION ---
-# Default API URL for local OpenWebUI (OpenAI compatible endpoint)
-# Adjust port if your instance runs on a different port (default is 3000)
-API_URL = "http://192.168.2.245:8080/api/v1/chat/completions"
-API_KEY = ""  # Leave empty if local auth is disabled, otherwise add your Bearer token
+# --- CONFIGURATION LOADING ---
+config = None
 
-# Directory containing your task markdown files
-TASKS_DIRECTORY = "./tasks"
-COMPLETED_DIRECTORY = os.path.join(TASKS_DIRECTORY, "completed")
+def load_config(config_path="config.yaml"):
+    """
+    Loads configuration from a YAML file.
+    Returns a dictionary with configuration values.
+    """
+    global config
+    
+    if not os.path.exists(config_path):
+        print(f"Error: Config file '{config_path}' not found.")
+        print(f"Please copy 'config.yaml.example' to 'config.yaml' and configure your settings.")
+        return None
+    
+    try:
+        with open(config_path, 'r') as f:
+            loaded_config = yaml.safe_load(f)
+            
+        # Validate required configuration
+        required_keys = ['api_url', 'api_key', 'tasks_directory', 'completed_directory', 'request_timeout']
+        for key in required_keys:
+            if key not in loaded_config:
+                print(f"Error: Missing required configuration key '{key}' in config.yaml")
+                return None
+        
+        config = loaded_config
+        return config
+    except Exception as e:
+        print(f"Error loading config file: {e}")
+        return None
 
-# How long to wait (seconds) for a long-running API response before timing out
-REQUEST_TIMEOUT = 300 
+def get_config():
+    """
+    Returns the loaded configuration dictionary.
+    Loads config if not already loaded.
+    """
+    global config
+    if config is None:
+        config = load_config()
+    return config
 
 def parse_frontmatter(filepath):
     """
@@ -94,12 +123,17 @@ def submit_to_openwebui(model, content, workspace_id=None):
     """
     Sends the prompt to the OpenWebUI API.
     """
+    cfg = get_config()
+    if cfg is None:
+        print("Error: Configuration not loaded. Cannot submit to API.")
+        return None
+    
     headers = {
         "Content-Type": "application/json"
     }
     
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    if cfg.get('api_key'):
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
 
     payload = {
         "model": model,
@@ -115,7 +149,7 @@ def submit_to_openwebui(model, content, workspace_id=None):
         headers["X-Workspace-ID"] = workspace_id
 
     try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+        response = requests.post(cfg['api_url'], headers=headers, json=payload, timeout=cfg['request_timeout'])
         response.raise_for_status()
         data = response.json()
         
@@ -204,17 +238,24 @@ def move_to_completed(filepath):
     """
     Moves a completed task file to the ./completed directory.
     """
+    cfg = get_config()
+    if cfg is None:
+        print("Error: Configuration not loaded. Cannot move file.")
+        return
+    
+    completed_directory = cfg['completed_directory']
+    
     # Ensure the completed directory exists
-    if not os.path.exists(COMPLETED_DIRECTORY):
+    if not os.path.exists(completed_directory):
         try:
-            os.makedirs(COMPLETED_DIRECTORY)
-            print(f"Created directory: {COMPLETED_DIRECTORY}")
+            os.makedirs(completed_directory)
+            print(f"Created directory: {completed_directory}")
         except Exception as e:
             print(f"Error creating completed directory: {e}")
             return
     
     filename = os.path.basename(filepath)
-    destination = os.path.join(COMPLETED_DIRECTORY, filename)
+    destination = os.path.join(completed_directory, filename)
     
     try:
         # Move the file
@@ -224,23 +265,32 @@ def move_to_completed(filepath):
         print(f"Error moving file to completed folder: {e}")
 
 def main():
-    if not os.path.exists(TASKS_DIRECTORY):
-        print(f"Directory '{TASKS_DIRECTORY}' not found.")
+    # Load configuration
+    cfg = get_config()
+    if cfg is None:
+        print("Error: Failed to load configuration. Please create config.yaml from config.yaml.example")
+        return
+    
+    tasks_directory = cfg['tasks_directory']
+    completed_directory = cfg['completed_directory']
+    
+    if not os.path.exists(tasks_directory):
+        print(f"Directory '{tasks_directory}' not found.")
         return
 
     # Ensure the completed directory exists
-    if not os.path.exists(COMPLETED_DIRECTORY):
+    if not os.path.exists(completed_directory):
         try:
-            os.makedirs(COMPLETED_DIRECTORY)
-            print(f"Created directory: {COMPLETED_DIRECTORY}")
+            os.makedirs(completed_directory)
+            print(f"Created directory: {completed_directory}")
         except Exception as e:
             print(f"Error creating completed directory: {e}")
             return
 
     # Iterate over all .md files in the directory
-    for filename in os.listdir(TASKS_DIRECTORY):
+    for filename in os.listdir(tasks_directory):
         if filename.endswith(".md"):
-            filepath = os.path.join(TASKS_DIRECTORY, filename)
+            filepath = os.path.join(tasks_directory, filename)
             process_markdown_file(filepath)
 
 if __name__ == "__main__":
