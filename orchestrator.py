@@ -24,7 +24,7 @@ def load_config(config_path="config.yaml"):
             loaded_config = yaml.safe_load(f)
             
         # Validate required configuration
-        required_keys = ['api_url', 'api_key', 'tasks_directory', 'queued_directory', 'completed_directory', 'failed_directory', 'request_timeout']
+        required_keys = ['api_url', 'api_key', 'tasks_directory', 'queued_directory', 'completed_directory', 'failed_directory', 'request_timeout', 'default_model', 'default_workspace']
         for key in required_keys:
             if key not in loaded_config:
                 print(f"Error: Missing required configuration key '{key}' in config.yaml")
@@ -79,15 +79,20 @@ def parse_frontmatter(filepath):
     
     return metadata, body
 
-def write_frontmatter(filepath, metadata, content):
+def write_frontmatter(filepath, metadata, content, response=None):
     """
     Writes a markdown file with YAML frontmatter.
+    Optionally appends a response section at the bottom.
     """
     # Convert metadata to YAML
     frontmatter_text = yaml.dump(metadata, default_flow_style=False, sort_keys=False)
     
     # Construct the file content
     full_content = f"---\n{frontmatter_text}---\n\n{content}"
+    
+    # Append response if provided
+    if response:
+        full_content += f"\n\n---\n\n## Response\n\n{response}\n"
     
     with open(filepath, 'w') as f:
         f.write(full_content)
@@ -194,9 +199,10 @@ def process_markdown_file(filepath):
         print("Skipping: Task currently marked as running (might be handled by another process).")
         return
 
-    # 3. Extract Metadata
-    model = metadata.get('model', 'llama3') # Default model if not specified
-    workspace = metadata.get('workspace')
+    # 3. Extract Metadata (with fallback to config defaults)
+    cfg = get_config()
+    model = metadata.get('model', cfg.get('default_model', 'llama3'))
+    workspace = metadata.get('workspace', cfg.get('default_workspace', None))
     criteria = metadata.get('completion_criteria')
     
     # 4. Update Status to 'running' immediately to prevent double execution
@@ -234,7 +240,12 @@ def process_markdown_file(filepath):
 
     # 7. Final Write
     metadata['last_updated'] = time.strftime("%Y-%m-%d %H:%M:%S")
-    write_frontmatter(filepath, metadata, content)
+    
+    # Store the response in the file
+    if llm_response:
+        write_frontmatter(filepath, metadata, content, llm_response)
+    else:
+        write_frontmatter(filepath, metadata, content)
     
     # 8. Move to appropriate folder based on status
     if metadata.get('status') == 'complete':

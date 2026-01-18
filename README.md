@@ -38,16 +38,17 @@ Orchestra is a task orchestration system that processes markdown-based task file
 3. Create your tasks directory structure:
    ```
    tasks/
-     ├── queued/
+     ├── queued/           # Place new tasks here
      │   ├── task1.md
      │   └── task2.md
-     ├── completed/
-     └── failed/
+     ├── completed/        # Successfully completed tasks
+     ├── failed/           # Failed tasks
+     └── examples/         # Example task templates
    ```
 
 ## Task File Format
 
-Tasks are markdown files with YAML frontmatter. Example:
+Tasks are markdown files with YAML frontmatter. See `tasks/examples/sample.md` for a working example.
 
 ```markdown
 ---
@@ -138,9 +139,10 @@ orchestra/
 ├── .gitignore              # Git ignore rules
 ├── README.md               # This file
 └── tasks/
-    ├── queued/            # Tasks waiting to be processed
+    ├── queued/            # Place new tasks here for processing
     ├── completed/         # Successfully completed tasks
-    └── failed/            # Failed tasks
+    ├── failed/            # Failed tasks
+    └── examples/          # Example task templates
 ```
 
 ## Error Handling

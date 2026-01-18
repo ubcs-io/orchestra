@@ -5,6 +5,11 @@
 api_url: "http://192.168.1.2:8080/api/v1/chat/completions"
 api_key: ""  # Leave empty if local auth is disabled, otherwise add your Bearer token
 
+# Default Task Settings
+# These are used as fallbacks if tasks don't specify model or workspace
+default_model: "llama3"
+default_workspace: "default"
+
 # Directory Configuration
 tasks_directory: "./tasks"
 queued_directory: "./tasks/queued"

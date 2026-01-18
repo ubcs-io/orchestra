@@ -48,7 +48,10 @@ build/
 tasks/queued/*
 tasks/completed/*
 tasks/failed/*
+# Examples folder contents - these are tracked
+# tasks/examples/*
 # But keep the directories themselves
 !tasks/queued/.gitkeep
 !tasks/completed/.gitkeep
 !tasks/failed/.gitkeep
+!tasks/examples/.gitkeep
