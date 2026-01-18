@@ -24,7 +24,7 @@ def load_config(config_path="config.yaml"):
             loaded_config = yaml.safe_load(f)
             
         # Validate required configuration
-        required_keys = ['api_url', 'api_key', 'tasks_directory', 'completed_directory', 'request_timeout']
+        required_keys = ['api_url', 'api_key', 'tasks_directory', 'queued_directory', 'completed_directory', 'failed_directory', 'request_timeout']
         for key in required_keys:
             if key not in loaded_config:
                 print(f"Error: Missing required configuration key '{key}' in config.yaml")
@@ -165,7 +165,8 @@ def submit_to_openwebui(model, content, workspace_id=None):
 def process_markdown_file(filepath):
     """
     Reads a task file, executes it if pending, and updates status.
-    Moves completed tasks to the ./completed directory.
+    Moves completed tasks to the completed directory.
+    Moves failed tasks to the failed directory.
     """
     print(f"--- Processing {os.path.basename(filepath)} ---")
     
@@ -182,6 +183,11 @@ def process_markdown_file(filepath):
     if current_status == 'complete':
         print("Task already marked as complete. Moving to completed folder...")
         move_to_completed(filepath)
+        return
+    
+    if current_status == 'failed':
+        print("Task already marked as failed. Moving to failed folder...")
+        move_to_failed(filepath)
         return
     
     if current_status == 'running':
@@ -218,7 +224,7 @@ def process_markdown_file(filepath):
             # Optional: Store the response in the metadata or append to file
             # metadata['response_summary'] = llm_response[:200] + "..." 
         else:
-            print("Criteria NOT met. Marking as FAILED/INCOMPLETE.")
+            print("Criteria NOT met. Marking as INCOMPLETE.")
             metadata['status'] = 'incomplete'
             metadata['failure_reason'] = 'Completion criteria not met'
     else:
@@ -230,13 +236,15 @@ def process_markdown_file(filepath):
     metadata['last_updated'] = time.strftime("%Y-%m-%d %H:%M:%S")
     write_frontmatter(filepath, metadata, content)
     
-    # 8. Move to completed folder if task is complete
+    # 8. Move to appropriate folder based on status
     if metadata.get('status') == 'complete':
         move_to_completed(filepath)
+    elif metadata.get('status') == 'failed':
+        move_to_failed(filepath)
 
 def move_to_completed(filepath):
     """
-    Moves a completed task file to the ./completed directory.
+    Moves a completed task file to the completed directory.
     """
     cfg = get_config()
     if cfg is None:
@@ -264,6 +272,36 @@ def move_to_completed(filepath):
     except Exception as e:
         print(f"Error moving file to completed folder: {e}")
 
+def move_to_failed(filepath):
+    """
+    Moves a failed task file to the failed directory.
+    """
+    cfg = get_config()
+    if cfg is None:
+        print("Error: Configuration not loaded. Cannot move file.")
+        return
+    
+    failed_directory = cfg['failed_directory']
+    
+    # Ensure the failed directory exists
+    if not os.path.exists(failed_directory):
+        try:
+            os.makedirs(failed_directory)
+            print(f"Created directory: {failed_directory}")
+        except Exception as e:
+            print(f"Error creating failed directory: {e}")
+            return
+    
+    filename = os.path.basename(filepath)
+    destination = os.path.join(failed_directory, filename)
+    
+    try:
+        # Move the file
+        os.rename(filepath, destination)
+        print(f"Moved '{filename}' to failed folder.")
+    except Exception as e:
+        print(f"Error moving file to failed folder: {e}")
+
 def main():
     # Load configuration
     cfg = get_config()
@@ -271,11 +309,12 @@ def main():
         print("Error: Failed to load configuration. Please create config.yaml from config.yaml.example")
         return
     
-    tasks_directory = cfg['tasks_directory']
+    queued_directory = cfg['queued_directory']
     completed_directory = cfg['completed_directory']
+    failed_directory = cfg['failed_directory']
     
-    if not os.path.exists(tasks_directory):
-        print(f"Directory '{tasks_directory}' not found.")
+    if not os.path.exists(queued_directory):
+        print(f"Directory '{queued_directory}' not found.")
         return
 
     # Ensure the completed directory exists
@@ -286,11 +325,20 @@ def main():
         except Exception as e:
             print(f"Error creating completed directory: {e}")
             return
+    
+    # Ensure the failed directory exists
+    if not os.path.exists(failed_directory):
+        try:
+            os.makedirs(failed_directory)
+            print(f"Created directory: {failed_directory}")
+        except Exception as e:
+            print(f"Error creating failed directory: {e}")
+            return
 
-    # Iterate over all .md files in the directory
-    for filename in os.listdir(tasks_directory):
+    # Iterate over all .md files in the queued directory
+    for filename in os.listdir(queued_directory):
         if filename.endswith(".md"):
-            filepath = os.path.join(tasks_directory, filename)
+            filepath = os.path.join(queued_directory, filename)
             process_markdown_file(filepath)
 
 if __name__ == "__main__":

@@ -3,18 +3,18 @@ config.yaml
 # But keep the example file
 !config.yaml.example
 
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
+# macOS - all directories
+**/.DS_Store
+**/.AppleDouble
+**/.LSOverride
 
 # Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
+**/Thumbs.db
+**/ehthumbs.db
+**/Desktop.ini
 
 # Linux
-*~
+**/*~
 
 # Python
 __pycache__/
@@ -37,9 +37,18 @@ build/
 *~
 
 # Logs
-*.log
+**/*.log
 
 # Temporary files
-*.tmp
-*.bak
-*.cache
+**/*.tmp
+**/*.bak
+**/*.cache
+
+# Task folders contents
+tasks/queued/*
+tasks/completed/*
+tasks/failed/*
+# But keep the directories themselves
+!tasks/queued/.gitkeep
+!tasks/completed/.gitkeep
+!tasks/failed/.gitkeep

@@ -7,7 +7,9 @@ api_key: ""  # Leave empty if local auth is disabled, otherwise add your Bearer 
 
 # Directory Configuration
 tasks_directory: "./tasks"
+queued_directory: "./tasks/queued"
 completed_directory: "./tasks/completed"
+failed_directory: "./tasks/failed"
 
 # Request Configuration
 request_timeout: 300  # seconds to wait for API response
