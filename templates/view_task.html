@@ -58,20 +58,10 @@
         flex: 1;
     }
 
-    .task-filename {
-        font-family: 'Bebas Neue', sans-serif;
-        font-size: 42px;
-        color: #c0c0c0;
-        text-shadow: 2px 2px 0 #8B4513;
-        letter-spacing: 3px;
-        margin-bottom: 15px;
-        display: flex;
-        align-items: center;
-        gap: 15px;
-    }
 
     .task-name {
         color: #c0c0c0;
+        text-shadow: none;
     }
 
     .task-id-short {
@@ -80,6 +70,18 @@
         color: #8B4513;
         opacity: 0.5;
         letter-spacing: 2px;
+    }
+
+    .task-filename {
+        font-family: 'Bebas Neue', sans-serif;
+        font-size: 42px;
+        color: #c0c0c0;
+        text-shadow: none;
+        letter-spacing: 3px;
+        margin-bottom: 15px;
+        display: flex;
+        align-items: center;
+        gap: 15px;
     }
 
     .task-status {
@@ -275,9 +277,10 @@
     <div class="task-header-section">
         <div class="task-header-left">
             <div class="task-filename">
-                <span class="task-name">{{ task.filename.replace('.md', '') }}</span>
-                {% if task.metadata.get('task_id') %}
-                <span class="task-id-short">({{ task.metadata.get('task_id')[:6] }})</span>
+                {% set name_parts = task.filename.replace('.md', '').split('_') %}
+                <span class="task-name">{{ name_parts[0] }}</span>
+                {% if name_parts|length > 1 %}
+                <span class="task-id-short">({{ name_parts[-1] }})</span>
                 {% endif %}
             </div>
             <div class="task-status {{ task.category }}">{{ task.category|upper }}</div>

@@ -256,7 +256,7 @@
         {% for task in pending_tasks %}
             <div class="task-card pending">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename }}</div>
+                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
                     <div class="task-badge pending">PENDING</div>
                 </div>
                 <div class="task-meta">
@@ -283,7 +283,7 @@
         {% for task in completed_tasks %}
             <div class="task-card completed">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename }}</div>
+                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
                     <div class="task-badge completed">COMPLETE</div>
                 </div>
                 <div class="task-meta">
@@ -310,7 +310,7 @@
         {% for task in failed_tasks %}
             <div class="task-card failed">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename }}</div>
+                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
                     <div class="task-badge failed">FAILED</div>
                 </div>
                 <div class="task-meta">

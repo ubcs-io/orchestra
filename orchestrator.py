@@ -169,11 +169,21 @@ def check_completion_criteria(response_text, criteria):
 def submit_to_openwebui(model, content, workspace_id=None):
     """
     Sends the prompt to the OpenWebUI API.
+    Returns tuple: (content, log_data)
+    - content: The response message content (or None on error)
+    - log_data: Dictionary with detailed logging information (or None on success)
     """
+    import json
+    
     cfg = get_config()
     if cfg is None:
-        print("Error: Configuration not loaded. Cannot submit to API.")
-        return None
+        error_log = {
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'stage': 'Configuration',
+            'error': 'Configuration not loaded'
+        }
+        print(f"Error: {error_log['error']}")
+        return None, error_log
     
     headers = {
         "Content-Type": "application/json"
@@ -187,27 +197,93 @@ def submit_to_openwebui(model, content, workspace_id=None):
         "messages": [
             {"role": "user", "content": content}
         ],
-        "stream": False # We wait for the full response for this basic orchestrator
+        "stream": False
     }
 
-    # Optional: Some OpenWebUI setups pass workspace in headers or query params
-    # This is a placeholder for advanced routing if your specific setup needs it.
     if workspace_id:
         headers["X-Workspace-ID"] = workspace_id
 
+    # Log request details
+    request_log = {
+        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+        'stage': 'API Request',
+        'url': cfg['api_url'],
+        'method': 'POST',
+        'model': model,
+        'workspace': workspace_id,
+        'headers': {
+            k: v if k != 'Authorization' else 'Bearer [REDACTED]' 
+            for k, v in headers.items()
+        },
+        'payload_size': len(json.dumps(payload)),
+        'timeout': cfg['request_timeout']
+    }
+    
     try:
+        start_time = time.time()
         response = requests.post(cfg['api_url'], headers=headers, json=payload, timeout=cfg['request_timeout'])
+        elapsed_time = time.time() - start_time
+        
+        response_log = {
+            **request_log,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'stage': 'API Response',
+            'status_code': response.status_code,
+            'response_time_seconds': round(elapsed_time, 2),
+            'response_headers': dict(response.headers),
+            'response_size': len(response.text)
+        }
+        
         response.raise_for_status()
         data = response.json()
         
         # Extract content from standard OpenAI format response
-        return data['choices'][0]['message']['content']
+        content = data['choices'][0]['message']['content']
+        return content, None
+        
     except RequestException as e:
-        print(f"API Error: {e}")
-        return None
+        error_log = {
+            **request_log,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'stage': 'API Error',
+            'error_type': type(e).__name__,
+            'error_message': str(e),
+            'response_text': response.text if 'response' in locals() else 'No response available'
+        }
+        print(f"API Error: {error_log}")
+        return None, error_log
     except (KeyError, IndexError) as e:
-        print(f"Response Parsing Error: {e} - Response: {response.text}")
-        return None
+        error_log = {
+            **request_log,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'stage': 'Response Parsing Error',
+            'error_type': type(e).__name__,
+            'error_message': str(e),
+            'response_text': response.text if 'response' in locals() else 'No response available'
+        }
+        print(f"Parsing Error: {error_log}")
+        return None, error_log
+
+def format_error_log(log_data):
+    """
+    Formats error log data into readable markdown text.
+    """
+    import json
+    
+    lines = ["## Error Log\n\n"]
+    
+    for stage, data in log_data.items():
+        lines.append(f"### {stage}\n")
+        for key, value in data.items():
+            if key == 'headers' or key == 'response_headers':
+                lines.append(f"**{key}:**\n```\n{json.dumps(value, indent=2)}\n```\n")
+            elif key == 'response_text' or key == 'error_message':
+                lines.append(f"**{key}:**\n```\n{value}\n```\n")
+            else:
+                lines.append(f"**{key}:** {value}\n")
+        lines.append("\n")
+    
+    return '\n'.join(lines)
 
 def generate_task_id(timestamp):
     """
@@ -269,7 +345,7 @@ def process_markdown_file(filepath):
 
     # 5. Execute Task
     print(f"Submitting to model '{model}' in workspace '{workspace}'...")
-    llm_response = submit_to_openwebui(model, content, workspace)
+    llm_response, log_data = submit_to_openwebui(model, content, workspace)
 
     # 6. Evaluate Results
     if llm_response:
@@ -297,7 +373,10 @@ def process_markdown_file(filepath):
     if llm_response:
         write_frontmatter(filepath, metadata, content, llm_response)
     else:
-        write_frontmatter(filepath, metadata, content)
+        # On failure, store the error log as formatted text
+        import json
+        error_text = format_error_log(log_data)
+        write_frontmatter(filepath, metadata, content, error_text)
     
     # 8. Move to appropriate folder based on status
     if metadata.get('status') == 'complete':
