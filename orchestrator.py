@@ -225,7 +225,6 @@ def submit_to_openwebui(model, content, workspace_id=None):
         elapsed_time = time.time() - start_time
         
         response_log = {
-            **request_log,
             'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
             'stage': 'API Response',
             'status_code': response.status_code,
@@ -272,16 +271,30 @@ def format_error_log(log_data):
     
     lines = ["## Error Log\n\n"]
     
-    for stage, data in log_data.items():
-        lines.append(f"### {stage}\n")
-        for key, value in data.items():
-            if key == 'headers' or key == 'response_headers':
+    # If log_data is a single log entry (dict), format it directly
+    if isinstance(log_data, dict) and 'stage' in log_data:
+        lines.append(f"### {log_data['stage']}\n")
+        for key, value in log_data.items():
+            if key == 'stage':
+                continue  # Already used as header
+            elif key == 'headers' or key == 'response_headers':
                 lines.append(f"**{key}:**\n```\n{json.dumps(value, indent=2)}\n```\n")
             elif key == 'response_text' or key == 'error_message':
                 lines.append(f"**{key}:**\n```\n{value}\n```\n")
             else:
                 lines.append(f"**{key}:** {value}\n")
-        lines.append("\n")
+    else:
+        # If log_data is multiple stages, format each
+        for stage, data in log_data.items():
+            lines.append(f"### {stage}\n")
+            for key, value in data.items():
+                if key == 'headers' or key == 'response_headers':
+                    lines.append(f"**{key}:**\n```\n{json.dumps(value, indent=2)}\n```\n")
+                elif key == 'response_text' or key == 'error_message':
+                    lines.append(f"**{key}:**\n```\n{value}\n```\n")
+                else:
+                    lines.append(f"**{key}:** {value}\n")
+            lines.append("\n")
     
     return '\n'.join(lines)
 
