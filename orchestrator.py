@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 import requests
 from requests.exceptions import RequestException
 
@@ -208,6 +209,16 @@ def submit_to_openwebui(model, content, workspace_id=None):
         print(f"Response Parsing Error: {e} - Response: {response.text}")
         return None
 
+def generate_task_id(timestamp):
+    """
+    Generates a task ID by creating a SHA256 hash of the timestamp.
+    Returns the full hash and first 6 characters.
+    """
+    hash_obj = hashlib.sha256(timestamp.encode('utf-8'))
+    full_hash = hash_obj.hexdigest()
+    short_hash = full_hash[:6]
+    return full_hash, short_hash
+
 def process_markdown_file(filepath):
     """
     Reads a task file, executes it if pending, and updates status.
@@ -228,12 +239,12 @@ def process_markdown_file(filepath):
     
     if current_status == 'complete':
         print("Task already marked as complete. Moving to completed folder...")
-        move_to_completed(filepath)
+        move_to_completed(filepath, metadata, content)
         return
     
     if current_status == 'failed':
         print("Task already marked as failed. Moving to failed folder...")
-        move_to_failed(filepath)
+        move_to_failed(filepath, metadata, content)
         return
     
     if current_status == 'running':
@@ -290,13 +301,14 @@ def process_markdown_file(filepath):
     
     # 8. Move to appropriate folder based on status
     if metadata.get('status') == 'complete':
-        move_to_completed(filepath)
+        move_to_completed(filepath, metadata, content)
     elif metadata.get('status') == 'failed':
-        move_to_failed(filepath)
+        move_to_failed(filepath, metadata, content)
 
-def move_to_completed(filepath):
+def move_to_completed(filepath, metadata, content):
     """
     Moves a completed task file to the completed directory.
+    Adds task ID to metadata and filename.
     """
     cfg = get_config()
     if cfg is None:
@@ -314,19 +326,33 @@ def move_to_completed(filepath):
             print(f"Error creating completed directory: {e}")
             return
     
+    # Add created_at timestamp and task ID to metadata
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    full_hash, short_hash = generate_task_id(created_at)
+    
+    metadata['created_at'] = created_at
+    metadata['task_id'] = full_hash
+    
+    # Rewrite the file with updated metadata
+    write_frontmatter(filepath, metadata, content)
+    
+    # Generate new filename with short hash
     filename = os.path.basename(filepath)
-    destination = os.path.join(completed_directory, filename)
+    name_without_ext = os.path.splitext(filename)[0]
+    new_filename = f"{name_without_ext}_{short_hash}.md"
+    destination = os.path.join(completed_directory, new_filename)
     
     try:
-        # Move the file
+        # Move the file with new name
         os.rename(filepath, destination)
-        print(f"Moved '{filename}' to completed folder.")
+        print(f"Moved '{filename}' to completed folder as '{new_filename}'.")
     except Exception as e:
         print(f"Error moving file to completed folder: {e}")
 
-def move_to_failed(filepath):
+def move_to_failed(filepath, metadata, content):
     """
     Moves a failed task file to the failed directory.
+    Adds task ID to metadata and filename.
     """
     cfg = get_config()
     if cfg is None:
@@ -344,13 +370,26 @@ def move_to_failed(filepath):
             print(f"Error creating failed directory: {e}")
             return
     
+    # Add created_at timestamp and task ID to metadata
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    full_hash, short_hash = generate_task_id(created_at)
+    
+    metadata['created_at'] = created_at
+    metadata['task_id'] = full_hash
+    
+    # Rewrite the file with updated metadata
+    write_frontmatter(filepath, metadata, content)
+    
+    # Generate new filename with short hash
     filename = os.path.basename(filepath)
-    destination = os.path.join(failed_directory, filename)
+    name_without_ext = os.path.splitext(filename)[0]
+    new_filename = f"{name_without_ext}_{short_hash}.md"
+    destination = os.path.join(failed_directory, new_filename)
     
     try:
-        # Move the file
+        # Move the file with new name
         os.rename(filepath, destination)
-        print(f"Moved '{filename}' to failed folder.")
+        print(f"Moved '{filename}' to failed folder as '{new_filename}'.")
     except Exception as e:
         print(f"Error moving file to failed folder: {e}")
 

@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+
+{% block title %}Create Task - ORCHESTRA{% endblock %}
+
+{% block content %}
+<style>
+    .form-container {
+        max-width: 800px;
+        margin: 0 auto;
+    }
+
+    .section-title {
+        font-family: 'Bebas Neue', sans-serif;
+        font-size: 36px;
+        color: #CD853F;
+        text-shadow: 2px 2px 0 #8B4513;
+        letter-spacing: 4px;
+        margin-bottom: 30px;
+        padding-bottom: 15px;
+        border-bottom: 2px solid #8B4513;
+        position: relative;
+    }
+
+    .section-title::after {
+        content: '';
+        position: absolute;
+        bottom: -2px;
+        left: 0;
+        width: 100px;
+        height: 4px;
+        background: #CD853F;
+    }
+
+    .form-section {
+        margin-bottom: 30px;
+        padding: 25px;
+        background: #1a1a1a;
+        border: 1px solid #3d3d3d;
+        position: relative;
+    }
+
+    .form-section::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 4px;
+        height: 100%;
+        background: #8B4513;
+    }
+
+    .section-header {
+        color: #CD853F;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        margin-bottom: 20px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #3d3d3d;
+    }
+
+    .form-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+    }
+
+    .help-text {
+        color: #6b6b6b;
+        font-size: 11px;
+        margin-top: 5px;
+        font-style: italic;
+    }
+
+    textarea {
+        min-height: 300px;
+        line-height: 1.8;
+    }
+
+    .btn-group {
+        display: flex;
+        gap: 15px;
+        margin-top: 30px;
+    }
+
+    .btn-submit {
+        padding: 15px 40px;
+        background: linear-gradient(180deg, #8B4513, #A0522D);
+        color: #fff;
+        border: none;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        cursor: pointer;
+        position: relative;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    }
+
+    .btn-submit:hover {
+        background: linear-gradient(180deg, #A0522D, #8B4513);
+        box-shadow: 0 0 15px rgba(205, 133, 63, 0.5);
+    }
+
+    .btn-submit::before {
+        content: '⚙';
+        margin-right: 10px;
+    }
+
+    .btn-cancel {
+        padding: 15px 40px;
+        background: #2d2d2d;
+        color: #c0c0c0;
+        border: 2px solid #3d3d3d;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        cursor: pointer;
+        text-decoration: none;
+        transition: all 0.3s ease;
+    }
+
+    .btn-cancel:hover {
+        border-color: #8B4513;
+        color: #CD853F;
+    }
+
+    .input-hint {
+        color: #6b6b6b;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-top: 5px;
+    }
+</style>
+
+<div class="form-container">
+    <h2 class="section-title">/// NEW TASK CREATION ///</h2>
+
+    <form method="POST" action="{{ url_for('create_task') }}">
+        
+        <div class="form-section">
+            <div class="section-header">Task Configuration</div>
+            
+            <div class="form-group">
+                <label for="filename">Task Filename</label>
+                <input type="text" id="filename" name="filename" placeholder="my-task" required>
+                <div class="input-hint">.md extension will be added automatically</div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="model">Model</label>
+                    <input type="text" id="model" name="model" value="{{ default_model }}" required>
+                    <div class="help-text">LLM model to use for processing</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="workspace">Workspace</label>
+                    <input type="text" id="workspace" name="workspace" value="{{ default_workspace }}" required>
+                    <div class="help-text">Workspace identifier for routing</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="form-section">
+            <div class="section-header">Task Content</div>
+            
+            <div class="form-group">
+                <label for="content">Task Description</label>
+                <textarea id="content" name="content" placeholder="Enter your task description here...
+                
+Example: Please perform a web search to find the current best price for a 65-inch Sony Bravia OLED TV.
+
+Provide a brief summary of the specifications and list the price found at the top retailer." required></textarea>
+                <div class="help-text">Describe the task you want the LLM to perform</div>
+            </div>
+        </div>
+
+        <div class="btn-group">
+            <button type="submit" class="btn-submit">Create Task</button>
+            <a href="{{ url_for('index') }}" class="btn-cancel">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

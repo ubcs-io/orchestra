@@ -1,0 +1,342 @@
+{% extends "base.html" %}
+
+{% block title %}View Task - ORCHESTRA{% endblock %}
+
+{% block content %}
+<style>
+    .task-detail-container {
+        max-width: 1000px;
+        margin: 0 auto;
+    }
+
+    .section-title {
+        font-family: 'Bebas Neue', sans-serif;
+        font-size: 36px;
+        color: #CD853F;
+        text-shadow: 2px 2px 0 #8B4513;
+        letter-spacing: 4px;
+        margin-bottom: 30px;
+        padding-bottom: 15px;
+        border-bottom: 2px solid #8B4513;
+        position: relative;
+    }
+
+    .section-title::after {
+        content: '';
+        position: absolute;
+        bottom: -2px;
+        left: 0;
+        width: 100px;
+        height: 4px;
+        background: #CD853F;
+    }
+
+    .task-header-section {
+        background: #1a1a1a;
+        border: 2px solid #8B4513;
+        padding: 25px;
+        margin-bottom: 25px;
+        position: relative;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 30px;
+    }
+
+    .task-header-section::before {
+        content: '';
+        position: absolute;
+        top: -2px;
+        left: -2px;
+        right: -2px;
+        bottom: -2px;
+        border: 1px solid #A0522D;
+        pointer-events: none;
+    }
+
+    .task-header-left {
+        flex: 1;
+    }
+
+    .task-filename {
+        font-family: 'Bebas Neue', sans-serif;
+        font-size: 42px;
+        color: #c0c0c0;
+        text-shadow: 2px 2px 0 #8B4513;
+        letter-spacing: 3px;
+        margin-bottom: 15px;
+        display: flex;
+        align-items: center;
+        gap: 15px;
+    }
+
+    .task-name {
+        color: #c0c0c0;
+    }
+
+    .task-id-short {
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 18px;
+        color: #8B4513;
+        opacity: 0.5;
+        letter-spacing: 2px;
+    }
+
+    .task-status {
+        display: inline-block;
+        padding: 8px 20px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        font-weight: bold;
+    }
+
+    .task-status.pending {
+        background: #4a3a1a;
+        color: #FFA500;
+        border: 2px solid #FFA500;
+    }
+
+    .task-status.completed {
+        background: #1a4a1a;
+        color: #90EE90;
+        border: 2px solid #228B22;
+    }
+
+    .task-status.failed {
+        background: #4a1a1a;
+        color: #FF6B6B;
+        border: 2px solid #8B0000;
+    }
+
+    .task-header-right {
+        flex-shrink: 0;
+        min-width: 250px;
+    }
+
+    .task-metadata-grid {
+        display: flex;
+        flex-direction: row;
+        gap: 20px;
+        justify-content: flex-end;
+    }
+
+    .meta-item {
+        color: #8B8B8B;
+        font-size: 11px;
+        text-align: center;
+    }
+
+    .meta-item strong {
+        display: block;
+        color: #CD853F;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        margin-bottom: 5px;
+    }
+
+    .content-wrapper {
+        display: flex;
+        gap: 20px;
+        margin-bottom: 25px;
+    }
+
+    .content-wrapper > * {
+        flex: 1;
+    }
+
+    .content-section {
+        background: #1a1a1a;
+        border: 1px solid #3d3d3d;
+        padding: 25px;
+        position: relative;
+        min-height: 400px;
+    }
+
+    .content-section::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 4px;
+        height: 100%;
+        background: #8B4513;
+    }
+
+    .content-title {
+        color: #CD853F;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        margin-bottom: 15px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #3d3d3d;
+    }
+
+    .task-content {
+        color: #c0c0c0;
+        font-size: 14px;
+        line-height: 1.8;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+
+    .frontmatter-section .content-title {
+        color: #8B4513;
+        border-color: #2d2d2d;
+    }
+
+    .frontmatter-section pre {
+        color: #6b6b6b;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 12px;
+        overflow-x: auto;
+    }
+
+    .action-buttons {
+        display: flex;
+        gap: 15px;
+        justify-content: center;
+        margin-top: 30px;
+    }
+
+    .btn {
+        padding: 15px 40px;
+        background: linear-gradient(180deg, #8B4513, #A0522D);
+        color: #fff;
+        border: none;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        cursor: pointer;
+        text-decoration: none;
+        position: relative;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        transition: all 0.3s ease;
+    }
+
+    .btn:hover {
+        background: linear-gradient(180deg, #A0522D, #8B4513);
+        box-shadow: 0 0 15px rgba(205, 133, 63, 0.5);
+    }
+
+    .btn.delete {
+        background: linear-gradient(180deg, #8B0000, #A52A2A);
+    }
+
+    .btn.delete:hover {
+        background: linear-gradient(180deg, #A52A2A, #8B0000);
+        box-shadow: 0 0 15px rgba(139, 0, 0, 0.5);
+    }
+
+    .btn.retry {
+        background: linear-gradient(180deg, #1a4a4a, #008B8B);
+    }
+
+    .btn.retry:hover {
+        background: linear-gradient(180deg, #008B8B, #1a4a4a);
+        box-shadow: 0 0 15px rgba(0, 139, 139, 0.5);
+    }
+
+    .btn.retry::before {
+        content: '↻';
+    }
+
+    .response-section {
+        background: #1a1a1a;
+        border: 2px solid #228B22;
+        padding: 25px;
+        margin-bottom: 25px;
+        position: relative;
+    }
+
+    .response-section::before {
+        content: '';
+        position: absolute;
+        top: -2px;
+        left: -2px;
+        right: -2px;
+        bottom: -2px;
+        border: 1px solid #32CD32;
+        pointer-events: none;
+    }
+
+    .response-section .content-title {
+        color: #90EE90;
+        border-color: #228B22;
+    }
+</style>
+
+<div class="task-detail-container">
+    <h2 class="section-title">/// TASK DETAILS ///</h2>
+
+    <div class="task-header-section">
+        <div class="task-header-left">
+            <div class="task-filename">
+                <span class="task-name">{{ task.filename.replace('.md', '') }}</span>
+                {% if task.metadata.get('task_id') %}
+                <span class="task-id-short">({{ task.metadata.get('task_id')[:6] }})</span>
+                {% endif %}
+            </div>
+            <div class="task-status {{ task.category }}">{{ task.category|upper }}</div>
+        </div>
+        
+        <div class="task-header-right">
+            <div class="task-metadata-grid">
+                <div class="meta-item">
+                    <strong>Modified</strong>
+                    {{ task.modified.strftime('%Y-%m-%d %H:%M:%S') }}
+                </div>
+                <div class="meta-item">
+                    <strong>Status</strong>
+                    {{ task.metadata.get('status', 'N/A')|upper }}
+                </div>
+                <div class="meta-item">
+                    <strong>Model</strong>
+                    {{ task.metadata.get('model', 'N/A') }}
+                </div>
+                <div class="meta-item">
+                    <strong>Workspace</strong>
+                    {{ task.metadata.get('workspace', 'N/A') }}
+                </div>
+                {% if task.metadata.get('created_at') %}
+                <div class="meta-item">
+                    <strong>Created</strong>
+                    {{ task.metadata.get('created_at') }}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="content-wrapper">
+        <div class="content-section frontmatter-section">
+            <div class="content-title">/// FRONTMATTER ///</div>
+            <pre>{% for key, value in task.metadata.items() %}{{ key }}: {{ value }}
+{% endfor %}</pre>
+        </div>
+
+        <div class="content-section">
+            <div class="content-title">/// TASK CONTENT ///</div>
+            <div class="task-content">{{ task.content }}</div>
+        </div>
+    </div>
+
+    {% if task.response %}
+    <div class="response-section">
+        <div class="content-title">/// RESPONSE ///</div>
+        <div class="task-content">{{ task.response }}</div>
+    </div>
+    {% endif %}
+
+    <div class="action-buttons">
+        <a href="{{ url_for('index') }}" class="btn">← Back to Dashboard</a>
+        {% if task.category == 'failed' %}
+            <a href="{{ url_for('retry_task', filename=task.filename) }}" class="btn retry" onclick="return confirm('⚠ RETRY TASK: {{ task.filename }}?\n\nThis will create a copy in the pending queue.');">↻ Retry Task</a>
+        {% endif %}
+        <a href="{{ url_for('delete_task', category=task.category, filename=task.filename) }}" class="btn delete" onclick="return confirm('⚠ DELETE TASK: {{ task.filename }}?\n\nThis action cannot be undone!');">⚠ Delete Task</a>
+    </div>
+</div>
+{% endblock %}

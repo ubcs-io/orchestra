@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}ORCHESTRA{% endblock %}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a1a;
+            background-image: 
+                repeating-linear-gradient(
+                    0deg,
+                    transparent,
+                    transparent 2px,
+                    rgba(0, 0, 0, 0.1) 2px,
+                    rgba(0, 0, 0, 0.1) 4px
+                ),
+                linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+            color: #c0c0c0;
+            font-family: 'Share Tech Mono', monospace;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            padding: 30px 0;
+            border-bottom: 3px solid #8B4513;
+            margin-bottom: 30px;
+            position: relative;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 5px;
+            background: linear-gradient(90deg, #8B4513, #A0522D, #8B4513);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .logo {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 64px;
+            color: #CD853F;
+            text-shadow: 
+                3px 3px 0 #8B4513,
+                -1px -1px 0 #000,
+                1px -1px 0 #000,
+                -1px 1px 0 #000,
+                1px 1px 0 #000;
+            letter-spacing: 8px;
+            position: relative;
+            display: inline-block;
+        }
+
+        .logo::after {
+            content: '///';
+            position: absolute;
+            top: 50%;
+            right: -40px;
+            transform: translateY(-50%);
+            font-size: 24px;
+            color: #A0522D;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #8B8B8B;
+            margin-top: 10px;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+        }
+
+        /* Navigation */
+        .nav {
+            background: #2d2d2d;
+            padding: 15px 20px;
+            border: 2px solid #8B4513;
+            margin-bottom: 30px;
+            position: relative;
+            box-shadow: 
+                inset 0 0 20px rgba(0, 0, 0, 0.5),
+                0 4px 8px rgba(0, 0, 0, 0.3);
+        }
+
+        .nav::before,
+        .nav::after {
+            content: '';
+            position: absolute;
+            width: 10px;
+            height: 100%;
+            background: linear-gradient(180deg, #8B4513, #A0522D);
+            top: 0;
+        }
+
+        .nav::before {
+            left: -10px;
+            border-radius: 3px 0 0 3px;
+        }
+
+        .nav::after {
+            right: -10px;
+            border-radius: 0 3px 3px 0;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .nav-link {
+            color: #c0c0c0;
+            text-decoration: none;
+            padding: 10px 20px;
+            background: #1a1a1a;
+            border: 1px solid #8B4513;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 2px;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .nav-link:hover {
+            background: #8B4513;
+            color: #fff;
+            box-shadow: 0 0 10px rgba(205, 133, 63, 0.5);
+        }
+
+        .nav-link::before {
+            content: '▶';
+            margin-right: 8px;
+            font-size: 10px;
+        }
+
+        .nav-link.start {
+            background: #1a4a1a;
+            border-color: #228B22;
+        }
+
+        .nav-link.start:hover {
+            background: #228B22;
+            box-shadow: 0 0 10px rgba(34, 139, 34, 0.5);
+        }
+
+        .nav-link.stop {
+            background: #4a1a1a;
+            border-color: #8B0000;
+        }
+
+        .nav-link.stop:hover {
+            background: #8B0000;
+            box-shadow: 0 0 10px rgba(139, 0, 0, 0.5);
+        }
+
+        /* Content */
+        .content {
+            background: #2d2d2d;
+            border: 3px solid #8B4513;
+            padding: 30px;
+            position: relative;
+            box-shadow: 
+                inset 0 0 30px rgba(0, 0, 0, 0.5),
+                0 8px 16px rgba(0, 0, 0, 0.4);
+        }
+
+        .content::before {
+            content: '';
+            position: absolute;
+            top: -5px;
+            left: -5px;
+            right: -5px;
+            bottom: -5px;
+            border: 1px solid #A0522D;
+            pointer-events: none;
+        }
+
+        /* Flash messages */
+        .flash {
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            border: 2px solid;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 2px;
+        }
+
+        .flash.success {
+            background: #2d4d2d;
+            border-color: #228B22;
+            color: #90EE90;
+        }
+
+        .flash.error {
+            background: #4d2d2d;
+            border-color: #8B0000;
+            color: #FF6B6B;
+        }
+
+        /* Form styling */
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            color: #CD853F;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-bottom: 8px;
+        }
+
+        input[type="text"],
+        textarea {
+            width: 100%;
+            padding: 15px;
+            background: #1a1a1a;
+            border: 2px solid #8B4513;
+            color: #c0c0c0;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 14px;
+            resize: vertical;
+        }
+
+        input[type="text"]:focus,
+        textarea:focus {
+            outline: none;
+            border-color: #CD853F;
+            box-shadow: 0 0 10px rgba(205, 133, 63, 0.3);
+        }
+
+        .btn {
+            padding: 15px 40px;
+            background: linear-gradient(180deg, #8B4513, #A0522D);
+            color: #fff;
+            border: none;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            cursor: pointer;
+            position: relative;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        }
+
+        .btn:hover {
+            background: linear-gradient(180deg, #A0522D, #8B4513);
+            box-shadow: 0 0 15px rgba(205, 133, 63, 0.5);
+        }
+
+        .btn::before {
+            content: '⚙';
+            margin-right: 10px;
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 30px;
+            color: #6b6b6b;
+            font-size: 12px;
+            margin-top: 30px;
+            border-top: 1px solid #3d3d3d;
+        }
+
+        /* Decorative elements */
+        .rivet {
+            width: 12px;
+            height: 12px;
+            background: radial-gradient(circle at 30% 30%, #CD853F, #8B4513);
+            border-radius: 50%;
+            position: absolute;
+            box-shadow: 
+                inset 0 0 4px rgba(0, 0, 0, 0.5),
+                0 1px 3px rgba(0, 0, 0, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">ORCHESTRA  ./</div>
+            <div class="subtitle">Task Orchestration System</div>
+        </header>
+
+        <nav class="nav">
+            <div class="nav-links">
+                <a href="{{ url_for('index') }}" class="nav-link">Dashboard</a>
+                <a href="{{ url_for('create_task') }}" class="nav-link">Create Task</a>
+                {% if orchestrator_running %}
+                    <a href="{{ url_for('stop_orchestrator') }}" class="nav-link stop">⏹ Stop Orchestrator</a>
+                {% else %}
+                    <a href="{{ url_for('start_orchestrator') }}" class="nav-link start">▶ Start Orchestrator</a>
+                {% endif %}
+            </div>
+        </nav>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <main class="content">
+            {% block content %}{% endblock %}
+        </main>
+
+        <footer class="footer">
+            /// ORCHESTRA v1.0 /// SIMPLE TASK MANAGEMENT ///
+        </footer>
+    </div>
+</body>
+</html>
