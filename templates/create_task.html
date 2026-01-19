@@ -107,6 +107,29 @@
         margin-right: 10px;
     }
 
+    select {
+        width: 100%;
+        padding: 15px;
+        background: #1a1a1a;
+        border: 2px solid #8B4513;
+        color: #c0c0c0;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 14px;
+        cursor: pointer;
+    }
+
+    select:focus {
+        outline: none;
+        border-color: #CD853F;
+        box-shadow: 0 0 10px rgba(205, 133, 63, 0.3);
+    }
+
+    select option {
+        background: #1a1a1a;
+        color: #c0c0c0;
+        padding: 10px;
+    }
+
     .btn-cancel {
         padding: 15px 40px;
         background: #2d2d2d;
@@ -152,8 +175,12 @@
             <div class="form-row">
                 <div class="form-group">
                     <label for="model">Model</label>
-                    <input type="text" id="model" name="model" value="{{ default_model }}" required>
-                    <div class="help-text">LLM model to use for processing</div>
+                    <select id="model" name="model" required>
+                        {% for model in available_models %}
+                            <option value="{{ model }}"{% if model == default_model %} selected{% endif %}>{{ model }}</option>
+                        {% endfor %}
+                    </select>
+                    <div class="help-text">Select LLM model to use for processing</div>
                 </div>
 
                 <div class="form-group">
@@ -170,11 +197,28 @@
             <div class="form-group">
                 <label for="content">Task Description</label>
                 <textarea id="content" name="content" placeholder="Enter your task description here...
-                
+
 Example: Please perform a web search to find the current best price for a 65-inch Sony Bravia OLED TV.
 
-Provide a brief summary of the specifications and list the price found at the top retailer." required></textarea>
+Provide a brief summary of specifications and list the price found at a top retailer." required></textarea>
                 <div class="help-text">Describe the task you want the LLM to perform</div>
+            </div>
+        </div>
+
+        <div class="form-section">
+            <div class="section-header">Acceptance Criteria</div>
+            
+            <div class="form-group">
+                <label for="acceptance_criteria">Acceptance Criteria</label>
+                <textarea id="acceptance_criteria" name="acceptance_criteria" placeholder="Define what constitutes a successful task completion...
+
+Example: The task is considered complete when:
+- Price information is found
+- At least one retailer is listed
+- Specifications are briefly summarized
+- Response is in a clear, readable format">min-length:100
+max-length:500</textarea>
+                <div class="help-text">Define criteria for when the task should be considered successfully completed</div>
             </div>
         </div>
 

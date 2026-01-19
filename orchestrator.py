@@ -308,11 +308,151 @@ def generate_task_id(timestamp):
     short_hash = full_hash[:6]
     return full_hash, short_hash
 
+def strip_acceptance_criteria(content):
+    """
+    Removes the Acceptance Criteria section from the content.
+    Returns the content without the acceptance criteria section.
+    """
+    lines = content.split('\n')
+    result_lines = []
+    skip_section = False
+    
+    for line in lines:
+        # Check if this is the start of Acceptance Criteria section
+        if line.strip() == '## Acceptance Criteria':
+            skip_section = True
+            continue
+        
+        # If we're skipping, continue until we hit another heading
+        if skip_section:
+            if line.startswith('## ') and not line.strip() == '## Acceptance Criteria':
+                skip_section = False
+                result_lines.append(line)
+            continue
+        
+        result_lines.append(line)
+    
+    return '\n'.join(result_lines)
+
+def parse_evaluator_response(evaluator_response):
+    """
+    Parses the evaluator's response to extract JSON data.
+    Returns tuple: (json_data, error_message)
+    """
+    import json
+    
+    # Try to find JSON in the response
+    # Look for JSON blocks (```json ... ```) or just raw JSON
+    try:
+        # Try direct JSON parse first
+        json_data = json.loads(evaluator_response)
+        return json_data, None
+    except json.JSONDecodeError:
+        pass
+    
+    # Try to find JSON in code blocks
+    json_start = evaluator_response.find('```json')
+    if json_start != -1:
+        json_start += 7  # Skip '```json'
+        json_end = evaluator_response.find('```', json_start)
+        if json_end != -1:
+            json_text = evaluator_response[json_start:json_end].strip()
+            try:
+                json_data = json.loads(json_text)
+                return json_data, None
+            except json.JSONDecodeError:
+                pass
+    
+    # Try to find JSON between { and }
+    brace_start = evaluator_response.find('{')
+    if brace_start != -1:
+        brace_end = evaluator_response.rfind('}')
+        if brace_end != -1 and brace_end > brace_start:
+            json_text = evaluator_response[brace_start:brace_end + 1]
+            try:
+                json_data = json.loads(json_text)
+                return json_data, None
+            except json.JSONDecodeError:
+                pass
+    
+    return None, "Could not parse JSON from evaluator response"
+
+def create_subtask(original_task_name, evaluator_response, original_metadata):
+    """
+    Creates a new subtask file with the evaluator's response.
+    Returns the filepath of the created subtask.
+    """
+    cfg = get_config()
+    pending_directory = cfg['pending_directory']
+    
+    # Remove 6-digit hash from original task name if present
+    import re
+    cleaned_task_name = re.sub(r'_[a-f0-9]{6}$', '', original_task_name)
+    
+    # Generate subtask filename (without _eval suffix)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    subtask_name = f"{cleaned_task_name}_{timestamp}.md"
+    subtask_path = os.path.join(pending_directory, subtask_name)
+    
+    # Create metadata for subtask
+    subtask_metadata = {
+        'status': 'pending',
+        'model': original_metadata.get('model', cfg.get('default_model', 'llama3')),
+        'workspace': 'evaluator',
+        'original_task': original_task_name,
+        'created_at': time.strftime("%Y-%m-%d %H:%M:%S"),
+        'task_type': 'evaluation'
+    }
+    
+    # Write the subtask with evaluator response as content
+    write_frontmatter(subtask_path, subtask_metadata, evaluator_response)
+    
+    print(f"Created evaluation subtask: {subtask_name}")
+    return subtask_path
+
+def create_next_steps_subtasks(original_task_name, next_steps, original_metadata):
+    """
+    Creates subtasks for each item in the next_steps array.
+    Returns list of created filepaths.
+    """
+    cfg = get_config()
+    pending_directory = cfg['pending_directory']
+    created_files = []
+    
+    # Remove 6-digit hash from original task name if present
+    import re
+    cleaned_task_name = re.sub(r'_[a-f0-9]{6}$', '', original_task_name)
+    
+    for i, step in enumerate(next_steps):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        subtask_name = f"{cleaned_task_name}_step{i+1}_{timestamp}.md"
+        subtask_path = os.path.join(pending_directory, subtask_name)
+        
+        # Create metadata for subtask
+        subtask_metadata = {
+            'status': 'pending',
+            'model': original_metadata.get('model', cfg.get('default_model', 'llama3')),
+            'workspace': original_metadata.get('workspace', cfg.get('default_workspace', None)),
+            'original_task': original_task_name,
+            'created_at': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'task_type': 'next_step',
+            'step_number': i + 1
+        }
+        
+        # Write the subtask with the step content
+        write_frontmatter(subtask_path, subtask_metadata, str(step))
+        
+        print(f"Created next step subtask: {subtask_name}")
+        created_files.append(subtask_path)
+    
+    return created_files
+
 def process_markdown_file(filepath):
     """
     Reads a task file, executes it if pending, and updates status.
     Moves completed tasks to the completed directory.
     Moves failed tasks to the failed directory.
+    After successful completion, sends response to evaluator workspace and creates subtask.
     """
     print(f"--- Processing {os.path.basename(filepath)} ---")
     
@@ -340,7 +480,12 @@ def process_markdown_file(filepath):
         print("Skipping: Task currently marked as running (might be handled by another process).")
         return
 
-    # 3. Extract Metadata (with fallback to config defaults)
+    # 3. Strip acceptance criteria from content before sending to OpenWebUI
+    content_to_send = strip_acceptance_criteria(content)
+    if content_to_send != content:
+        print("Acceptance criteria section removed from request")
+    
+    # 4. Extract Metadata (with fallback to config defaults)
     cfg = get_config()
     model = metadata.get('model', cfg.get('default_model', 'llama3'))
     workspace = metadata.get('workspace', cfg.get('default_workspace', None))
@@ -356,9 +501,9 @@ def process_markdown_file(filepath):
         print(f"Error writing running status: {e}")
         return
 
-    # 5. Execute Task
+    # 5. Execute Task (without acceptance criteria)
     print(f"Submitting to model '{model}' in workspace '{workspace}'...")
-    llm_response, log_data = submit_to_openwebui(model, content, workspace)
+    llm_response, log_data = submit_to_openwebui(model, content_to_send, workspace)
 
     # 6. Evaluate Results
     if llm_response:
@@ -383,21 +528,60 @@ def process_markdown_file(filepath):
     metadata['last_updated'] = time.strftime("%Y-%m-%d %H:%M:%S")
     
     # Store the response in the file
+    response_to_write = None
     if llm_response:
-        write_frontmatter(filepath, metadata, content, llm_response)
+        response_to_write = llm_response
     else:
         # On failure, store the error log as formatted text
         import json
-        error_text = format_error_log(log_data)
-        write_frontmatter(filepath, metadata, content, error_text)
+        response_to_write = format_error_log(log_data)
+    
+    write_frontmatter(filepath, metadata, content, response_to_write)
     
     # 8. Move to appropriate folder based on status
     if metadata.get('status') == 'complete':
-        move_to_completed(filepath, metadata, content)
+        # Before moving, send response to evaluator workspace and create subtask
+        print("Sending response to evaluator workspace...")
+        original_task_name = os.path.splitext(os.path.basename(filepath))[0]
+        evaluator_response, evaluator_log = submit_to_openwebui(model, llm_response, 'evaluator')
+        
+        if evaluator_response:
+            print("Evaluator response received. Parsing response...")
+            
+            # Parse evaluator response to look for JSON with acceptance_status
+            json_data, parse_error = parse_evaluator_response(evaluator_response)
+            
+            if json_data:
+                print("Successfully parsed evaluator response JSON")
+                
+                # Check for acceptance_status
+                acceptance_status = json_data.get('acceptance_status', '').lower()
+                print(f"Acceptance status: {acceptance_status}")
+                
+                if acceptance_status == 'no':
+                    # Look for NEXT STEPS array
+                    next_steps = json_data.get('NEXT STEPS', json_data.get('next_steps', json_data.get('next_steps', [])))
+                    
+                    if next_steps and isinstance(next_steps, list) and len(next_steps) > 0:
+                        print(f"Found {len(next_steps)} next steps. Creating subtasks...")
+                        create_next_steps_subtasks(original_task_name, next_steps, metadata)
+                    else:
+                        print("No next steps found in evaluator response")
+                
+                # Always create the evaluation subtask with full response
+                create_subtask(original_task_name, evaluator_response, metadata)
+            else:
+                print(f"Could not parse evaluator response as JSON: {parse_error}")
+                # Still create subtask with raw response
+                create_subtask(original_task_name, evaluator_response, metadata)
+        else:
+            print(f"Warning: Failed to get evaluator response: {evaluator_log.get('error_message', 'Unknown error') if evaluator_log else 'No log available'}")
+        
+        move_to_completed(filepath, metadata, content, response_to_write)
     elif metadata.get('status') == 'failed':
-        move_to_failed(filepath, metadata, content)
+        move_to_failed(filepath, metadata, content, response_to_write)
 
-def move_to_completed(filepath, metadata, content):
+def move_to_completed(filepath, metadata, content, response=None):
     """
     Moves a completed task file to the completed directory.
     Adds task ID to metadata and filename.
@@ -425,8 +609,8 @@ def move_to_completed(filepath, metadata, content):
     metadata['created_at'] = created_at
     metadata['task_id'] = full_hash
     
-    # Rewrite the file with updated metadata
-    write_frontmatter(filepath, metadata, content)
+    # Rewrite the file with updated metadata, preserving response
+    write_frontmatter(filepath, metadata, content, response)
     
     # Generate new filename with short hash
     filename = os.path.basename(filepath)
@@ -441,7 +625,7 @@ def move_to_completed(filepath, metadata, content):
     except Exception as e:
         print(f"Error moving file to completed folder: {e}")
 
-def move_to_failed(filepath, metadata, content):
+def move_to_failed(filepath, metadata, content, response=None):
     """
     Moves a failed task file to the failed directory.
     Adds task ID to metadata and filename.
@@ -469,8 +653,8 @@ def move_to_failed(filepath, metadata, content):
     metadata['created_at'] = created_at
     metadata['task_id'] = full_hash
     
-    # Rewrite the file with updated metadata
-    write_frontmatter(filepath, metadata, content)
+    # Rewrite the file with updated metadata, preserving response
+    write_frontmatter(filepath, metadata, content, response)
     
     # Generate new filename with short hash
     filename = os.path.basename(filepath)

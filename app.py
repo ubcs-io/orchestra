@@ -6,6 +6,7 @@ import importlib.util
 import threading
 import time
 import subprocess
+import requests
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-this'
@@ -40,6 +41,127 @@ def load_config():
 
 config = load_config()
 
+def fetch_available_models():
+    """Fetch available models from OpenWebUI /api/models endpoint"""
+    # Create logs directory if it doesn't exist
+    logs_dir = "logs"
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
+    log_file = os.path.join(logs_dir, "model_fetch_errors.log")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def write_log(message):
+        """Helper to write to log file immediately"""
+        with open(log_file, 'a') as f:
+            f.write(message)
+    
+    try:
+        # Load config to get API URL and key
+        config_path = "config.py"
+        if not os.path.exists(config_path):
+            write_log(f"[{timestamp}] Error: config.py not found\n\n")
+            return []
+        
+        spec = importlib.util.spec_from_file_location("config", config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config_module)
+        
+        api_url = getattr(config_module, 'API_URL', None)
+        api_key = getattr(config_module, 'API_KEY', '')
+        
+        if not api_url:
+            write_log(f"[{timestamp}] Error: API_URL not configured in config.py\n\n")
+            return []
+        
+        # Construct models endpoint URL
+        # API_URL might be full endpoint path (e.g., http://host/api/v1/chat/completions)
+        # We need to extract base URL and add /models or /api/models
+        from urllib.parse import urlparse
+        
+        parsed = urlparse(api_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        
+        # Try different possible model endpoint paths
+        possible_endpoints = [
+            "/api/models",
+            "/api/v1/models", 
+            "/v1/models",
+            "/models"
+        ]
+        
+        models_url = None
+        response = None
+        for endpoint in possible_endpoints:
+            models_url = f"{base_url}{endpoint}"
+            write_log(f"Trying endpoint: {models_url}\n")
+            try:
+                response = requests.get(models_url, headers=headers, timeout=10)
+                write_log(f"Status Code: {response.status_code}\n")
+                
+                if response.status_code == 200:
+                    write_log(f"Success! Got response from {models_url}\n")
+                    break
+                else:
+                    write_log(f"Failed (status {response.status_code}), trying next endpoint...\n")
+                    continue
+            except Exception as e:
+                write_log(f"Failed: {e}, trying next endpoint...\n")
+                continue
+        else:
+            # All endpoints failed
+            write_log(f"All endpoints failed, using last tried: {models_url}\n")
+        
+        # Log request details immediately
+        write_log(f"[{timestamp}] Fetching models from: {models_url}\n")
+        
+        # Log response details immediately (response is already fetched above)
+        write_log(f"Response Headers: {dict(response.headers)}\n")
+        write_log(f"Response Text: {response.text}\n")
+        
+        try:
+            response.raise_for_status()
+        except Exception as http_error:
+            write_log(f"HTTP Error: {type(http_error).__name__}: {http_error}\n\n")
+            raise http_error
+        
+        # Try to parse JSON
+        try:
+            data = response.json()
+            write_log(f"Parsed JSON: {data}\n")
+        except Exception as json_error:
+            write_log(f"JSON Parse Error: {type(json_error).__name__}: {json_error}\n\n")
+            raise json_error
+        
+        # Extract model names from response
+        # OpenWebUI typically returns {"data": [{"id": "model-name", ...}]}
+        models = []
+        if isinstance(data, dict) and 'data' in data:
+            for model_data in data['data']:
+                if isinstance(model_data, dict) and 'id' in model_data:
+                    models.append(model_data['id'])
+        elif isinstance(data, list):
+            # Handle case where response is directly a list
+            for model_data in data:
+                if isinstance(model_data, dict) and 'id' in model_data:
+                    models.append(model_data['id'])
+        
+        write_log(f"Found {len(models)} models: {models}\n\n")
+        
+        return models
+    except Exception as e:
+        write_log(f"[{timestamp}] Error fetching models: {type(e).__name__}: {e}\n\n")
+        print(f"Error fetching models: {e}")
+        return []
+
 def run_orchestrator():
     """Background thread to run orchestrator every 5 minutes"""
     global orchestrator_running
@@ -59,7 +181,7 @@ def run_orchestrator():
 
 @app.route('/orchestrator/start')
 def start_orchestrator():
-    """Start the orchestrator background thread"""
+    """Start orchestrator background thread"""
     global orchestrator_running, orchestrator_thread
     
     if orchestrator_running:
@@ -74,7 +196,7 @@ def start_orchestrator():
 
 @app.route('/orchestrator/stop')
 def stop_orchestrator():
-    """Stop the orchestrator background thread"""
+    """Stop orchestrator background thread"""
     global orchestrator_running
     
     if not orchestrator_running:
@@ -249,6 +371,13 @@ def view_task(category, filename):
 @app.route('/create', methods=['GET', 'POST'])
 def create_task():
     """Create a new task"""
+    # Fetch available models
+    available_models = fetch_available_models()
+    
+    # If no models found, use default
+    if not available_models:
+        available_models = [config['default_model']]
+    
     if request.method == 'POST':
         filename = request.form.get('filename', '').strip()
         if not filename.endswith('.md'):
@@ -257,6 +386,7 @@ def create_task():
         model = request.form.get('model', config['default_model'])
         workspace = request.form.get('workspace', config['default_workspace'])
         content = request.form.get('content', '').strip()
+        acceptance_criteria = request.form.get('acceptance_criteria', '')
         
         # Create frontmatter
         frontmatter = f"""---
@@ -266,6 +396,14 @@ status: "pending"
 ---
 
 {content}"""
+
+        # Add acceptance criteria if provided
+        if acceptance_criteria.strip():
+            frontmatter += f"""
+
+## Acceptance Criteria
+
+{acceptance_criteria}"""
         
         # Ensure directory exists
         if not os.path.exists(config['pending_directory']):
@@ -283,7 +421,8 @@ status: "pending"
     
     return render_template('create_task.html', 
                           default_model=config['default_model'],
-                          default_workspace=config['default_workspace'])
+                          default_workspace=config['default_workspace'],
+                          available_models=available_models)
 
 @app.route('/retry/<filename>')
 def retry_task(filename):
