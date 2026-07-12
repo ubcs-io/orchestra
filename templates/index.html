@@ -256,18 +256,18 @@
         {% for task in pending_tasks %}
             <div class="task-card pending">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
-                    <div class="task-badge pending">PENDING</div>
+                    <div class="task-title">{{ task.name }}</div>
+                    <div class="task-badge pending">{{ task.status|upper }}</div>
                 </div>
                 <div class="task-meta">
                     <span><strong>MODEL:</strong> {{ task.model }}</span>
                     <span><strong>WORKSPACE:</strong> {{ task.workspace }}</span>
                     <span><strong>MODIFIED:</strong> {{ task.modified.strftime('%Y-%m-%d %H:%M') }}</span>
                 </div>
-                <div class="task-preview">{{ task.content }}</div>
+                <div class="task-preview">{{ task.content_preview }}</div>
                 <div class="task-actions">
-                    <a href="{{ url_for('view_task', category='pending', filename=task.filename) }}" class="task-link">View</a>
-                    <a href="{{ url_for('delete_task', category='pending', filename=task.filename) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.filename }}?');">Delete</a>
+                    <a href="{{ url_for('view_task', task_id=task.id) }}" class="task-link">View</a>
+                    <a href="{{ url_for('delete_task', task_id=task.id) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.name }}?');">Delete</a>
                 </div>
             </div>
         {% endfor %}
@@ -283,7 +283,7 @@
         {% for task in completed_tasks %}
             <div class="task-card completed">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
+                    <div class="task-title">{{ task.name }}</div>
                     <div class="task-badge completed">COMPLETE</div>
                 </div>
                 <div class="task-meta">
@@ -291,10 +291,10 @@
                     <span><strong>WORKSPACE:</strong> {{ task.workspace }}</span>
                     <span><strong>COMPLETED:</strong> {{ task.modified.strftime('%Y-%m-%d %H:%M') }}</span>
                 </div>
-                <div class="task-preview">{{ task.content }}</div>
+                <div class="task-preview">{{ task.content_preview }}</div>
                 <div class="task-actions">
-                    <a href="{{ url_for('view_task', category='completed', filename=task.filename) }}" class="task-link">View</a>
-                    <a href="{{ url_for('delete_task', category='completed', filename=task.filename) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.filename }}?');">Delete</a>
+                    <a href="{{ url_for('view_task', task_id=task.id) }}" class="task-link">View</a>
+                    <a href="{{ url_for('delete_task', task_id=task.id) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.name }}?');">Delete</a>
                 </div>
             </div>
         {% endfor %}
@@ -310,7 +310,7 @@
         {% for task in failed_tasks %}
             <div class="task-card failed">
                 <div class="task-header">
-                    <div class="task-title">{{ task.filename.replace('.md', '') }}</div>
+                    <div class="task-title">{{ task.name }}</div>
                     <div class="task-badge failed">FAILED</div>
                 </div>
                 <div class="task-meta">
@@ -318,10 +318,10 @@
                     <span><strong>WORKSPACE:</strong> {{ task.workspace }}</span>
                     <span><strong>FAILED:</strong> {{ task.modified.strftime('%Y-%m-%d %H:%M') }}</span>
                 </div>
-                <div class="task-preview">{{ task.content }}</div>
+                <div class="task-preview">{{ task.content_preview }}</div>
                 <div class="task-actions">
-                    <a href="{{ url_for('view_task', category='failed', filename=task.filename) }}" class="task-link">View</a>
-                    <a href="{{ url_for('delete_task', category='failed', filename=task.filename) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.filename }}?');">Delete</a>
+                    <a href="{{ url_for('view_task', task_id=task.id) }}" class="task-link">View</a>
+                    <a href="{{ url_for('delete_task', task_id=task.id) }}" class="task-link delete" onclick="return confirm('⚠ DELETE TASK: {{ task.name }}?');">Delete</a>
                 </div>
             </div>
         {% endfor %}

@@ -1,12 +1,13 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
 import os
-import glob
 from datetime import datetime
 import importlib.util
 import threading
 import time
 import subprocess
 import requests
+
+import db
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-this'
@@ -20,26 +21,23 @@ def load_config():
     config_path = "config.py"
     if not os.path.exists(config_path):
         return {
-            'pending_directory': './tasks/pending',
-            'completed_directory': './tasks/completed',
-            'failed_directory': './tasks/failed',
+            'db_path': './orchestra.db',
             'default_model': 'llama3',
             'default_workspace': 'default'
         }
-    
+
     spec = importlib.util.spec_from_file_location("config", config_path)
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
-    
+
     return {
-        'pending_directory': getattr(config_module, 'PENDING_DIRECTORY', './tasks/pending'),
-        'completed_directory': getattr(config_module, 'COMPLETED_DIRECTORY', './tasks/completed'),
-        'failed_directory': getattr(config_module, 'FAILED_DIRECTORY', './tasks/failed'),
+        'db_path': getattr(config_module, 'DB_PATH', './orchestra.db'),
         'default_model': getattr(config_module, 'DEFAULT_MODEL', 'llama3'),
         'default_workspace': getattr(config_module, 'DEFAULT_WORKSPACE', 'default'),
     }
 
 config = load_config()
+db.init_db()
 
 def fetch_available_models():
     """Fetch available models from OpenWebUI /api/models endpoint"""
@@ -207,98 +205,42 @@ def stop_orchestrator():
     flash('Orchestrator stopped!', 'success')
     return redirect(url_for('index'))
 
-def parse_frontmatter(filepath):
-    """Parse markdown file with frontmatter and separate response if present"""
-    with open(filepath, 'r') as f:
-        content = f.read()
-    
-    if not content.startswith('---'):
-        return {}, content
-    
-    parts = content.split('---', 2)
-    
-    if len(parts) < 3:
-        return {}, content
-    
-    frontmatter_text = parts[1].strip()
-    body = parts[2]
-    
-    metadata = {}
-    for line in frontmatter_text.split('\n'):
-        line = line.strip()
-        if ':' in line:
-            key, value = line.split(':', 1)
-            key = key.strip().lower()
-            value = value.strip()
-            
-            if value.startswith('"') and value.endswith('"'):
-                value = value[1:-1]
-            elif value.startswith("'") and value.endswith("'"):
-                value = value[1:-1]
-            
-            metadata[key] = value
-    
-    return metadata, body
+def enrich_task(task):
+    """Add derived display fields to a task row dict."""
+    if task is None:
+        return None
+    task['content_preview'] = (
+        (task.get('content') or '')[:200] + '...'
+        if len(task.get('content') or '') > 200
+        else (task.get('content') or '')
+    )
+    task['model'] = task.get('model') or config['default_model']
+    task['workspace'] = task.get('workspace') or config['default_workspace']
+    task['category'] = status_to_category(task.get('status'))
 
-def write_frontmatter(filepath, metadata, content, response=None):
-    """Writes a markdown file with frontmatter"""
-    # Convert metadata to frontmatter format
-    frontmatter_lines = []
-    for key, value in metadata.items():
-        if isinstance(value, str):
-            frontmatter_lines.append(f'{key}: "{value}"')
-        else:
-            frontmatter_lines.append(f'{key}: {value}')
-    
-    frontmatter_text = '\n'.join(frontmatter_lines)
-    
-    # Construct the file content
-    full_content = f"---\n{frontmatter_text}\n---\n\n{content}"
-    
-    # Append response if provided
-    if response:
-        full_content += f"\n\n---\n\n## Response\n\n{response}\n"
-    
-    with open(filepath, 'w') as f:
-        f.write(full_content)
+    # Parse a timestamp for display; fall back to now if missing/malformed.
+    ts = task.get('updated_at') or task.get('created_at')
+    try:
+        task['modified'] = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        task['modified'] = datetime.now()
+    return task
 
-def get_tasks_from_directory(directory):
-    """Get all tasks from a directory"""
-    tasks = []
-    if not os.path.exists(directory):
-        return tasks
-    
-    for filepath in glob.glob(os.path.join(directory, '*.md')):
-        filename = os.path.basename(filepath)
-        metadata, content = parse_frontmatter(filepath)
-        
-        # Get file modification time
-        mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-        
-        task = {
-            'filename': filename,
-            'filepath': filepath,
-            'metadata': metadata,
-            'content': content[:200] + '...' if len(content) > 200 else content,
-            'full_content': content,
-            'modified': mod_time,
-            'status': metadata.get('status', 'pending'),
-            'model': metadata.get('model', config['default_model']),
-            'workspace': metadata.get('workspace', config['default_workspace'])
-        }
-        tasks.append(task)
-    
-    # Sort by modification time (newest first)
-    tasks.sort(key=lambda x: x['modified'], reverse=True)
-    return tasks
+def status_to_category(status):
+    """Map a task status to one of the dashboard buckets."""
+    if status == 'complete':
+        return 'completed'
+    if status == 'failed':
+        return 'failed'
+    return 'pending'
 
 @app.route('/')
 def index():
     """Main dashboard"""
-    pending_tasks = get_tasks_from_directory(config['pending_directory'])
-    completed_tasks = get_tasks_from_directory(config['completed_directory'])
-    failed_tasks = get_tasks_from_directory(config['failed_directory'])
-    
+    pending_tasks = [enrich_task(t) for t in db.list_tasks(status=['pending', 'running', 'incomplete'])]
+    completed_tasks = [enrich_task(t) for t in db.list_tasks(status='complete')]
+    failed_tasks = [enrich_task(t) for t in db.list_tasks(status='failed')]
+
     # Calculate statistics
     stats = {
         'total': len(pending_tasks) + len(completed_tasks) + len(failed_tasks),
@@ -316,56 +258,15 @@ def index():
                           failed_tasks=failed_tasks,
                           orchestrator_running=orchestrator_running)
 
-@app.route('/task/<category>/<filename>')
-def view_task(category, filename):
+@app.route('/task/<int:task_id>')
+def view_task(task_id):
     """View a specific task"""
-    if category == 'pending':
-        directory = config['pending_directory']
-    elif category == 'completed':
-        directory = config['completed_directory']
-    elif category == 'failed':
-        directory = config['failed_directory']
-    else:
-        flash('Invalid category', 'error')
-        return redirect(url_for('index'))
-    
-    filepath = os.path.join(directory, filename)
-    if not os.path.exists(filepath):
+    task = db.get_task(task_id)
+    if task is None:
         flash('Task not found', 'error')
         return redirect(url_for('index'))
-    
-    metadata, body = parse_frontmatter(filepath)
-    mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-    
-    # Separate response from content if it exists
-    response = None
-    content = body
-    
-    # Check if there's a response section separated by ---
-    if '\n---\n' in body and '## Response' in body:
-        # Split on the third --- which separates task content from response
-        # We look for the separator that comes before the Response heading
-        body_parts = body.split('\n---\n', 1)
-        if len(body_parts) > 1:
-            # First part is the task content
-            content = body_parts[0].strip()
-            # Second part contains the response section
-            response_part = body_parts[1]
-            # Find the Response heading and get everything after it
-            response_idx = response_part.find('## Response')
-            if response_idx != -1:
-                # Get everything after the Response heading
-                response = response_part[response_idx + len('## Response'):].strip()
-    
-    task = {
-        'filename': filename,
-        'category': category,
-        'metadata': metadata,
-        'content': content,
-        'response': response,
-        'modified': mod_time
-    }
-    
+
+    task = enrich_task(task)
     return render_template('view_task.html', task=task)
 
 @app.route('/create', methods=['GET', 'POST'])
@@ -373,122 +274,71 @@ def create_task():
     """Create a new task"""
     # Fetch available models
     available_models = fetch_available_models()
-    
+
     # If no models found, use default
     if not available_models:
         available_models = [config['default_model']]
-    
+
     if request.method == 'POST':
-        filename = request.form.get('filename', '').strip()
-        if not filename.endswith('.md'):
-            filename += '.md'
-        
+        name = request.form.get('filename', '').strip()
+        if name.endswith('.md'):
+            name = name[:-3]
+
         model = request.form.get('model', config['default_model'])
         workspace = request.form.get('workspace', config['default_workspace'])
         content = request.form.get('content', '').strip()
-        acceptance_criteria = request.form.get('acceptance_criteria', '')
-        
-        # Create frontmatter
-        frontmatter = f"""---
-model: "{model}"
-workspace: "{workspace}"
-status: "pending"
----
+        acceptance_criteria = request.form.get('acceptance_criteria', '').strip() or None
 
-{content}"""
-
-        # Add acceptance criteria if provided
-        if acceptance_criteria.strip():
-            frontmatter += f"""
-
-## Acceptance Criteria
-
-{acceptance_criteria}"""
-        
-        # Ensure directory exists
-        if not os.path.exists(config['pending_directory']):
-            os.makedirs(config['pending_directory'])
-        
-        # Write task file
-        filepath = os.path.join(config['pending_directory'], filename)
         try:
-            with open(filepath, 'w') as f:
-                f.write(frontmatter)
-            flash(f'Task "{filename}" created successfully!', 'success')
+            db.create_task(
+                name=name,
+                content=content,
+                status='pending',
+                model=model,
+                workspace=workspace,
+                acceptance_criteria=acceptance_criteria,
+                task_type='root',
+            )
+            flash(f'Task "{name}" created successfully!', 'success')
             return redirect(url_for('index'))
         except Exception as e:
             flash(f'Error creating task: {str(e)}', 'error')
-    
-    return render_template('create_task.html', 
+
+    return render_template('create_task.html',
                           default_model=config['default_model'],
                           default_workspace=config['default_workspace'],
                           available_models=available_models)
 
-@app.route('/retry/<filename>')
-def retry_task(filename):
-    """Retry a failed task by copying it to pending directory"""
-    failed_directory = config['failed_directory']
-    pending_directory = config['pending_directory']
-    
-    # Ensure pending directory exists
-    if not os.path.exists(pending_directory):
-        os.makedirs(pending_directory)
-    
-    source_path = os.path.join(failed_directory, filename)
-    
-    if not os.path.exists(source_path):
-        flash('Task not found in failed directory', 'error')
+@app.route('/retry/<int:task_id>')
+def retry_task(task_id):
+    """Retry a failed task by resetting it to pending"""
+    task = db.get_task(task_id)
+    if task is None:
+        flash('Task not found', 'error')
         return redirect(url_for('index'))
-    
-    # Read the failed task
-    metadata, content = parse_frontmatter(source_path)
-    
-    # Update status to pending
-    metadata['status'] = 'pending'
-    
-    # Remove any failure reason from metadata
-    if 'failure_reason' in metadata:
-        del metadata['failure_reason']
-    
-    # Create new filename with retry timestamp
-    base_name = filename.replace('.md', '')
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    new_filename = f"{base_name}_retry_{timestamp}.md"
-    
-    # Write to pending directory
-    destination_path = os.path.join(pending_directory, new_filename)
-    
+
     try:
-        write_frontmatter(destination_path, metadata, content)
-        flash(f'Task "{filename}" has been retried as "{new_filename}" and moved to pending!', 'success')
+        db.update_task(task_id, status='pending', response=None, failure_reason=None)
+        flash(f'Task "{task["name"]}" has been reset to pending!', 'success')
     except Exception as e:
         flash(f'Error retrying task: {str(e)}', 'error')
-    
+
     return redirect(url_for('index'))
 
-@app.route('/delete/<category>/<filename>')
-def delete_task(category, filename):
+@app.route('/delete/<int:task_id>')
+def delete_task(task_id):
     """Delete a task"""
-    if category == 'pending':
-        directory = config['pending_directory']
-    elif category == 'completed':
-        directory = config['completed_directory']
-    elif category == 'failed':
-        directory = config['failed_directory']
-    else:
-        flash('Invalid category', 'error')
-        return redirect(url_for('index'))
-    
-    filepath = os.path.join(directory, filename)
-    if os.path.exists(filepath):
-        try:
-            os.remove(filepath)
-            flash(f'Task "{filename}" deleted successfully!', 'success')
-        except Exception as e:
-            flash(f'Error deleting task: {str(e)}', 'error')
-    else:
+    task = db.get_task(task_id)
+    if task is None:
         flash('Task not found', 'error')
-    
+        return redirect(url_for('index'))
+
+    try:
+        db.delete_task(task_id)
+        flash(f'Task "{task["name"]}" deleted successfully!', 'success')
+    except Exception as e:
+        flash(f'Error deleting task: {str(e)}', 'error')
+
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
