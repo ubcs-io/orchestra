@@ -10,11 +10,9 @@ API_KEY = ""  # Leave empty if local auth is disabled, otherwise add your Bearer
 DEFAULT_MODEL = "deepseek-r1:latest"
 DEFAULT_WORKSPACE = "default"
 
-# Directory Configuration
-TASKS_DIRECTORY = "./tasks"
-PENDING_DIRECTORY = "./tasks/pending"
-COMPLETED_DIRECTORY = "./tasks/completed"
-FAILED_DIRECTORY = "./tasks/failed"
+# Database Configuration
+# Tasks and their state are tracked in this SQLite database.
+DB_PATH = "./orchestra.db"
 
 # Request Configuration
 REQUEST_TIMEOUT = 300  # seconds to wait for API response

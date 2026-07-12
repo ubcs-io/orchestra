@@ -277,15 +277,12 @@
     <div class="task-header-section">
         <div class="task-header-left">
             <div class="task-filename">
-                {% set name_parts = task.filename.replace('.md', '').split('_') %}
-                <span class="task-name">{{ name_parts[0] }}</span>
-                {% if name_parts|length > 1 %}
-                <span class="task-id-short">({{ name_parts[-1] }})</span>
-                {% endif %}
+                <span class="task-name">{{ task.name }}</span>
+                <span class="task-id-short">(#{{ task.id }})</span>
             </div>
-            <div class="task-status {{ task.category }}">{{ task.category|upper }}</div>
+            <div class="task-status {{ task.category }}">{{ task.status|upper }}</div>
         </div>
-        
+
         <div class="task-header-right">
             <div class="task-metadata-grid">
                 <div class="meta-item">
@@ -294,20 +291,20 @@
                 </div>
                 <div class="meta-item">
                     <strong>Status</strong>
-                    {{ task.metadata.get('status', 'N/A')|upper }}
+                    {{ (task.status or 'N/A')|upper }}
                 </div>
                 <div class="meta-item">
                     <strong>Model</strong>
-                    {{ task.metadata.get('model', 'N/A') }}
+                    {{ task.model or 'N/A' }}
                 </div>
                 <div class="meta-item">
                     <strong>Workspace</strong>
-                    {{ task.metadata.get('workspace', 'N/A') }}
+                    {{ task.workspace or 'N/A' }}
                 </div>
-                {% if task.metadata.get('created_at') %}
+                {% if task.created_at %}
                 <div class="meta-item">
                     <strong>Created</strong>
-                    {{ task.metadata.get('created_at') }}
+                    {{ task.created_at }}
                 </div>
                 {% endif %}
             </div>
@@ -316,15 +313,31 @@
 
     <div class="content-wrapper">
         <div class="content-section frontmatter-section">
-            <div class="content-title">/// FRONTMATTER ///</div>
-            <pre>{% for key, value in task.metadata.items() %}{{ key }}: {{ value }}
-{% endfor %}</pre>
+            <div class="content-title">/// METADATA ///</div>
+            <pre>task_id: {{ task.task_id }}
+status: {{ task.status }}
+model: {{ task.model }}
+workspace: {{ task.workspace }}
+task_type: {{ task.task_type }}
+{% if task.parent_task_id %}parent_task_id: {{ task.parent_task_id }}
+{% endif %}{% if task.step_number %}step_number: {{ task.step_number }}
+{% endif %}{% if task.completion_criteria %}completion_criteria: {{ task.completion_criteria }}
+{% endif %}{% if task.failure_reason %}failure_reason: {{ task.failure_reason }}
+{% endif %}created_at: {{ task.created_at }}
+updated_at: {{ task.updated_at }}</pre>
         </div>
 
         <div class="content-section">
             <div class="content-title">/// TASK CONTENT ///</div>
             <div class="task-content">{{ task.content }}</div>
         </div>
+
+        {% if task.acceptance_criteria %}
+        <div class="content-section">
+            <div class="content-title">/// ACCEPTANCE CRITERIA ///</div>
+            <div class="task-content">{{ task.acceptance_criteria }}</div>
+        </div>
+        {% endif %}
     </div>
 
     {% if task.response %}
@@ -337,9 +350,9 @@
     <div class="action-buttons">
         <a href="{{ url_for('index') }}" class="btn">← Back to Dashboard</a>
         {% if task.category == 'failed' %}
-            <a href="{{ url_for('retry_task', filename=task.filename) }}" class="btn retry" onclick="return confirm('⚠ RETRY TASK: {{ task.filename }}?\n\nThis will create a copy in the pending queue.');">↻ Retry Task</a>
+            <a href="{{ url_for('retry_task', task_id=task.id) }}" class="btn retry" onclick="return confirm('⚠ RETRY TASK: {{ task.name }}?\n\nThis will reset it to the pending queue.');">↻ Retry Task</a>
         {% endif %}
-        <a href="{{ url_for('delete_task', category=task.category, filename=task.filename) }}" class="btn delete" onclick="return confirm('⚠ DELETE TASK: {{ task.filename }}?\n\nThis action cannot be undone!');">⚠ Delete Task</a>
+        <a href="{{ url_for('delete_task', task_id=task.id) }}" class="btn delete" onclick="return confirm('⚠ DELETE TASK: {{ task.name }}?\n\nThis action cannot be undone!');">⚠ Delete Task</a>
     </div>
 </div>
 {% endblock %}

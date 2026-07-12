@@ -3,6 +3,11 @@ config.py
 # But keep the example file
 !config.example.py
 
+# SQLite database (task state)
+orchestra.db
+*.db-journal
+*.db-wal
+
 # macOS - all directories
 **/.DS_Store
 **/.AppleDouble

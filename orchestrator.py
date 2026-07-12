@@ -1,8 +1,11 @@
 import os
 import time
+import json
 import hashlib
 import requests
 from requests.exceptions import RequestException
+
+import db
 
 # --- CONFIGURATION LOADING ---
 config = None
@@ -13,39 +16,36 @@ def load_config(config_path="config.py"):
     Returns a dictionary with configuration values.
     """
     global config
-    
+
     if not os.path.exists(config_path):
         print(f"Error: Config file '{config_path}' not found.")
         print(f"Please copy 'config.example.py' to 'config.py' and configure your settings.")
         return None
-    
+
     try:
         # Import the config module
         import importlib.util
         spec = importlib.util.spec_from_file_location("config", config_path)
         config_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(config_module)
-        
+
         # Extract configuration as dictionary
         loaded_config = {
             'api_url': getattr(config_module, 'API_URL', None),
             'api_key': getattr(config_module, 'API_KEY', ''),
-            'tasks_directory': getattr(config_module, 'TASKS_DIRECTORY', './tasks'),
-            'pending_directory': getattr(config_module, 'PENDING_DIRECTORY', './tasks/pending'),
-            'completed_directory': getattr(config_module, 'COMPLETED_DIRECTORY', './tasks/completed'),
-            'failed_directory': getattr(config_module, 'FAILED_DIRECTORY', './tasks/failed'),
+            'db_path': getattr(config_module, 'DB_PATH', './orchestra.db'),
             'request_timeout': getattr(config_module, 'REQUEST_TIMEOUT', 300),
             'default_model': getattr(config_module, 'DEFAULT_MODEL', 'llama3'),
             'default_workspace': getattr(config_module, 'DEFAULT_WORKSPACE', None),
         }
-        
+
         # Validate required configuration
-        required_keys = ['api_url', 'api_key', 'tasks_directory', 'pending_directory', 'completed_directory', 'failed_directory', 'request_timeout', 'default_model', 'default_workspace']
+        required_keys = ['api_url', 'api_key', 'db_path', 'request_timeout', 'default_model', 'default_workspace']
         for key in required_keys:
             if loaded_config.get(key) is None:
                 print(f"Error: Missing or invalid configuration for '{key}' in config.py")
                 return None
-        
+
         config = loaded_config
         return config
     except Exception as e:
@@ -62,86 +62,10 @@ def get_config():
         config = load_config()
     return config
 
-def parse_frontmatter(filepath):
-    """
-    Parses a markdown file with frontmatter.
-    Returns a tuple (metadata, content).
-    """
-    with open(filepath, 'r') as f:
-        content = f.read()
-    
-    # Check if file has frontmatter (starts with ---)
-    if not content.startswith('---'):
-        # No frontmatter, return empty metadata and full content
-        return {}, content
-    
-    # Find the end of frontmatter (second ---)
-    parts = content.split('---', 2)
-    
-    if len(parts) < 3:
-        # Invalid frontmatter format, return empty metadata
-        return {}, content
-    
-    frontmatter_text = parts[1].strip()
-    body = parts[2].strip()
-    
-    # Parse simple frontmatter
-    metadata = {}
-    try:
-        for line in frontmatter_text.split('\n'):
-            line = line.strip()
-            if ':' in line:
-                key, value = line.split(':', 1)
-                key = key.strip().lower()
-                value = value.strip()
-                # Remove quotes from values
-                if value.startswith('"') and value.endswith('"'):
-                    value = value[1:-1]
-                elif value.startswith("'") and value.endswith("'"):
-                    value = value[1:-1]
-                
-                # Try to parse as boolean or number
-                if value.lower() == 'true':
-                    value = True
-                elif value.lower() == 'false':
-                    value = False
-                elif value.isdigit():
-                    value = int(value)
-                
-                metadata[key] = value
-    except Exception as e:
-        print(f"Warning: Could not parse frontmatter in {os.path.basename(filepath)}")
-    
-    return metadata, body
-
-def write_frontmatter(filepath, metadata, content, response=None):
-    """
-    Writes a markdown file with frontmatter.
-    Optionally appends a response section at bottom.
-    """
-    # Convert metadata to frontmatter format
-    frontmatter_lines = []
-    for key, value in metadata.items():
-        if isinstance(value, str):
-            frontmatter_lines.append(f'{key}: "{value}"')
-        else:
-            frontmatter_lines.append(f'{key}: {value}')
-    
-    frontmatter_text = '\n'.join(frontmatter_lines)
-    
-    # Construct the file content
-    full_content = f"---\n{frontmatter_text}\n---\n\n{content}"
-    
-    # Append response if provided
-    if response:
-        full_content += f"\n\n---\n\n## Response\n\n{response}\n"
-    
-    with open(filepath, 'w') as f:
-        f.write(full_content)
-
 def check_completion_criteria(response_text, criteria):
     """
-    Evaluates the LLM response against the criteria defined in the markdown file.
+    Evaluates the LLM response against the criteria defined for the task.
+    `criteria` may be None, a string, or a dict (parsed from stored JSON).
     """
     if not criteria:
         # If no criteria, assume completion if we got a response
@@ -150,21 +74,41 @@ def check_completion_criteria(response_text, criteria):
     if isinstance(criteria, str):
         # Simple string match (legacy support)
         return criteria.lower() in response_text.lower()
-    
+
     if isinstance(criteria, dict):
         # Check for 'contains' string
         if 'contains' in criteria:
             if criteria['contains'].lower() not in response_text.lower():
                 return False
-        
+
         # Check for 'min_length'
         if 'min_length' in criteria:
             if len(response_text) < criteria['min_length']:
                 return False
-        
+
         return True
 
     return False
+
+def parse_completion_criteria(raw):
+    """
+    Normalizes the stored completion_criteria value into something
+    check_completion_criteria understands (None, str, or dict).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, str)) is False:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    # Stored as text — try JSON, fall back to raw string.
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
 
 def submit_to_openwebui(model, content, workspace_id=None):
     """
@@ -173,8 +117,6 @@ def submit_to_openwebui(model, content, workspace_id=None):
     - content: The response message content (or None on error)
     - log_data: Dictionary with detailed logging information (or None on success)
     """
-    import json
-    
     cfg = get_config()
     if cfg is None:
         error_log = {
@@ -184,11 +126,11 @@ def submit_to_openwebui(model, content, workspace_id=None):
         }
         print(f"Error: {error_log['error']}")
         return None, error_log
-    
+
     headers = {
         "Content-Type": "application/json"
     }
-    
+
     if cfg.get('api_key'):
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
 
@@ -212,18 +154,18 @@ def submit_to_openwebui(model, content, workspace_id=None):
         'model': model,
         'workspace': workspace_id,
         'headers': {
-            k: v if k != 'Authorization' else 'Bearer [REDACTED]' 
+            k: v if k != 'Authorization' else 'Bearer [REDACTED]'
             for k, v in headers.items()
         },
         'payload_size': len(json.dumps(payload)),
         'timeout': cfg['request_timeout']
     }
-    
+
     try:
         start_time = time.time()
         response = requests.post(cfg['api_url'], headers=headers, json=payload, timeout=cfg['request_timeout'])
         elapsed_time = time.time() - start_time
-        
+
         response_log = {
             'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
             'stage': 'API Response',
@@ -232,14 +174,14 @@ def submit_to_openwebui(model, content, workspace_id=None):
             'response_headers': dict(response.headers),
             'response_size': len(response.text)
         }
-        
+
         response.raise_for_status()
         data = response.json()
-        
+
         # Extract content from standard OpenAI format response
         content = data['choices'][0]['message']['content']
         return content, None
-        
+
     except RequestException as e:
         error_log = {
             **request_log,
@@ -267,10 +209,8 @@ def format_error_log(log_data):
     """
     Formats error log data into readable markdown text.
     """
-    import json
-    
     lines = ["## Error Log\n\n"]
-    
+
     # If log_data is a single log entry (dict), format it directly
     if isinstance(log_data, dict) and 'stage' in log_data:
         lines.append(f"### {log_data['stage']}\n")
@@ -295,7 +235,7 @@ def format_error_log(log_data):
                 else:
                     lines.append(f"**{key}:** {value}\n")
             lines.append("\n")
-    
+
     return '\n'.join(lines)
 
 def generate_task_id(timestamp):
@@ -308,39 +248,11 @@ def generate_task_id(timestamp):
     short_hash = full_hash[:6]
     return full_hash, short_hash
 
-def strip_acceptance_criteria(content):
-    """
-    Removes the Acceptance Criteria section from the content.
-    Returns the content without the acceptance criteria section.
-    """
-    lines = content.split('\n')
-    result_lines = []
-    skip_section = False
-    
-    for line in lines:
-        # Check if this is the start of Acceptance Criteria section
-        if line.strip() == '## Acceptance Criteria':
-            skip_section = True
-            continue
-        
-        # If we're skipping, continue until we hit another heading
-        if skip_section:
-            if line.startswith('## ') and not line.strip() == '## Acceptance Criteria':
-                skip_section = False
-                result_lines.append(line)
-            continue
-        
-        result_lines.append(line)
-    
-    return '\n'.join(result_lines)
-
 def parse_evaluator_response(evaluator_response):
     """
     Parses the evaluator's response to extract JSON data.
     Returns tuple: (json_data, error_message)
     """
-    import json
-    
     # Try to find JSON in the response
     # Look for JSON blocks (```json ... ```) or just raw JSON
     try:
@@ -349,7 +261,7 @@ def parse_evaluator_response(evaluator_response):
         return json_data, None
     except json.JSONDecodeError:
         pass
-    
+
     # Try to find JSON in code blocks
     json_start = evaluator_response.find('```json')
     if json_start != -1:
@@ -362,7 +274,7 @@ def parse_evaluator_response(evaluator_response):
                 return json_data, None
             except json.JSONDecodeError:
                 pass
-    
+
     # Try to find JSON between { and }
     brace_start = evaluator_response.find('{')
     if brace_start != -1:
@@ -374,300 +286,141 @@ def parse_evaluator_response(evaluator_response):
                 return json_data, None
             except json.JSONDecodeError:
                 pass
-    
+
     return None, "Could not parse JSON from evaluator response"
 
-def create_subtask(original_task_name, evaluator_response, original_metadata):
+def create_subtask(parent_task, evaluator_response):
     """
-    Creates a new subtask file with the evaluator's response.
-    Returns the filepath of the created subtask.
+    Creates a new evaluation subtask row with the evaluator's response.
+    Returns the created task dict.
     """
     cfg = get_config()
-    pending_directory = cfg['pending_directory']
-    
-    # Remove 6-digit hash from original task name if present
-    import re
-    cleaned_task_name = re.sub(r'_[a-f0-9]{6}$', '', original_task_name)
-    
-    # Generate subtask filename (without _eval suffix)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    subtask_name = f"{cleaned_task_name}_{timestamp}.md"
-    subtask_path = os.path.join(pending_directory, subtask_name)
-    
-    # Create metadata for subtask
-    subtask_metadata = {
-        'status': 'pending',
-        'model': original_metadata.get('model', cfg.get('default_model', 'llama3')),
-        'workspace': 'evaluator',
-        'original_task': original_task_name,
-        'created_at': time.strftime("%Y-%m-%d %H:%M:%S"),
-        'task_type': 'evaluation'
-    }
-    
-    # Write the subtask with evaluator response as content
-    write_frontmatter(subtask_path, subtask_metadata, evaluator_response)
-    
-    print(f"Created evaluation subtask: {subtask_name}")
-    return subtask_path
 
-def create_next_steps_subtasks(original_task_name, next_steps, original_metadata):
+    subtask = db.create_task(
+        name=f"{parent_task['name']}_eval",
+        content=evaluator_response,
+        status='pending',
+        model=parent_task.get('model') or cfg.get('default_model', 'llama3'),
+        workspace='evaluator',
+        parent_task_id=parent_task['task_id'],
+        task_type='evaluation',
+    )
+
+    print(f"Created evaluation subtask: {subtask['name']} (#{subtask['id']})")
+    return subtask
+
+def create_next_steps_subtasks(parent_task, next_steps):
     """
-    Creates subtasks for each item in the next_steps array.
-    Returns list of created filepaths.
+    Creates subtask rows for each item in the next_steps array.
+    Returns list of created task dicts.
     """
     cfg = get_config()
-    pending_directory = cfg['pending_directory']
-    created_files = []
-    
-    # Remove 6-digit hash from original task name if present
-    import re
-    cleaned_task_name = re.sub(r'_[a-f0-9]{6}$', '', original_task_name)
-    
+    created = []
+
     for i, step in enumerate(next_steps):
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        subtask_name = f"{cleaned_task_name}_step{i+1}_{timestamp}.md"
-        subtask_path = os.path.join(pending_directory, subtask_name)
-        
-        # Create metadata for subtask
-        subtask_metadata = {
-            'status': 'pending',
-            'model': original_metadata.get('model', cfg.get('default_model', 'llama3')),
-            'workspace': original_metadata.get('workspace', cfg.get('default_workspace', None)),
-            'original_task': original_task_name,
-            'created_at': time.strftime("%Y-%m-%d %H:%M:%S"),
-            'task_type': 'next_step',
-            'step_number': i + 1
-        }
-        
-        # Write the subtask with the step content
-        write_frontmatter(subtask_path, subtask_metadata, str(step))
-        
-        print(f"Created next step subtask: {subtask_name}")
-        created_files.append(subtask_path)
-    
-    return created_files
+        subtask = db.create_task(
+            name=f"{parent_task['name']}_step{i + 1}",
+            content=str(step),
+            status='pending',
+            model=parent_task.get('model') or cfg.get('default_model', 'llama3'),
+            workspace=parent_task.get('workspace') or cfg.get('default_workspace'),
+            parent_task_id=parent_task['task_id'],
+            task_type='next_step',
+            step_number=i + 1,
+        )
+        print(f"Created next step subtask: {subtask['name']} (#{subtask['id']})")
+        created.append(subtask)
 
-def process_markdown_file(filepath):
+    return created
+
+def process_task(task):
     """
-    Reads a task file, executes it if pending, and updates status.
-    Moves completed tasks to the completed directory.
-    Moves failed tasks to the failed directory.
-    After successful completion, sends response to evaluator workspace and creates subtask.
+    Executes a pending task and records its resulting state in the database.
+    Task "movement" is a status UPDATE — no files are moved.
+    After successful completion, sends the response to the evaluator
+    workspace and creates subtasks as needed.
     """
-    print(f"--- Processing {os.path.basename(filepath)} ---")
-    
-    # 1. Load the file content and frontmatter
-    try:
-        metadata, content = parse_frontmatter(filepath)
-    except Exception as e:
-        print(f"Error reading file {filepath}: {e}")
+    print(f"--- Processing #{task['id']} {task['name']} ---")
+
+    # 1. Check status
+    current_status = task.get('status', 'pending')
+
+    if current_status in ('complete', 'failed'):
+        print(f"Task already terminal ({current_status}). Skipping.")
         return
 
-    # 2. Check Status
-    current_status = metadata.get('status', 'pending')
-    
-    if current_status == 'complete':
-        print("Task already marked as complete. Moving to completed folder...")
-        move_to_completed(filepath, metadata, content)
-        return
-    
-    if current_status == 'failed':
-        print("Task already marked as failed. Moving to failed folder...")
-        move_to_failed(filepath, metadata, content)
-        return
-    
     if current_status == 'running':
         print("Skipping: Task currently marked as running (might be handled by another process).")
         return
 
-    # 3. Strip acceptance criteria from content before sending to OpenWebUI
-    content_to_send = strip_acceptance_criteria(content)
-    if content_to_send != content:
-        print("Acceptance criteria section removed from request")
-    
-    # 4. Extract Metadata (with fallback to config defaults)
+    # 2. Extract fields (with fallback to config defaults)
     cfg = get_config()
-    model = metadata.get('model', cfg.get('default_model', 'llama3'))
-    workspace = metadata.get('workspace', cfg.get('default_workspace', None))
-    criteria = metadata.get('completion_criteria')
-    
-    # 4. Update Status to 'running' immediately to prevent double execution
-    metadata['status'] = 'running'
-    metadata['last_updated'] = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    try:
-        write_frontmatter(filepath, metadata, content)
-    except Exception as e:
-        print(f"Error writing running status: {e}")
-        return
+    model = task.get('model') or cfg.get('default_model', 'llama3')
+    workspace = task.get('workspace') or cfg.get('default_workspace')
+    criteria = parse_completion_criteria(task.get('completion_criteria'))
+    content = task.get('content') or ''
 
-    # 5. Execute Task (without acceptance criteria)
+    # 3. Claim the task by marking it 'running' to prevent double execution.
+    db.update_task(task['id'], status='running')
+
+    # 4. Execute task (acceptance criteria is stored separately and never sent)
     print(f"Submitting to model '{model}' in workspace '{workspace}'...")
-    llm_response, log_data = submit_to_openwebui(model, content_to_send, workspace)
+    llm_response, log_data = submit_to_openwebui(model, content, workspace)
 
-    # 6. Evaluate Results
+    # 5. Evaluate results and record the new state.
     if llm_response:
         print("Response received. Checking criteria...")
-        is_complete = check_completion_criteria(llm_response, criteria)
-        
-        if is_complete:
+        if check_completion_criteria(llm_response, criteria):
             print("Criteria met. Marking as COMPLETE.")
-            metadata['status'] = 'complete'
-            # Optional: Store the response in the metadata or append to file
-            # metadata['response_summary'] = llm_response[:200] + "..." 
+            db.update_task(task['id'], status='complete', response=llm_response, failure_reason=None)
         else:
             print("Criteria NOT met. Marking as INCOMPLETE.")
-            metadata['status'] = 'incomplete'
-            metadata['failure_reason'] = 'Completion criteria not met'
+            db.update_task(
+                task['id'],
+                status='incomplete',
+                response=llm_response,
+                failure_reason='Completion criteria not met',
+            )
     else:
         print("No response received from API. Marking as FAILED.")
-        metadata['status'] = 'failed'
-        metadata['failure_reason'] = 'API Request Failed'
+        db.update_task(
+            task['id'],
+            status='failed',
+            response=format_error_log(log_data),
+            failure_reason='API Request Failed',
+        )
 
-    # 7. Final Write
-    metadata['last_updated'] = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Store the response in the file
-    response_to_write = None
-    if llm_response:
-        response_to_write = llm_response
-    else:
-        # On failure, store the error log as formatted text
-        import json
-        response_to_write = format_error_log(log_data)
-    
-    write_frontmatter(filepath, metadata, content, response_to_write)
-    
-    # 8. Move to appropriate folder based on status
-    if metadata.get('status') == 'complete':
-        # Before moving, send response to evaluator workspace and create subtask
+    # 6. On completion, run the evaluator pass and spawn any subtasks.
+    updated = db.get_task(task['id'])
+    if updated and updated.get('status') == 'complete':
         print("Sending response to evaluator workspace...")
-        original_task_name = os.path.splitext(os.path.basename(filepath))[0]
         evaluator_response, evaluator_log = submit_to_openwebui(model, llm_response, 'evaluator')
-        
+
         if evaluator_response:
             print("Evaluator response received. Parsing response...")
-            
-            # Parse evaluator response to look for JSON with acceptance_status
             json_data, parse_error = parse_evaluator_response(evaluator_response)
-            
+
             if json_data:
                 print("Successfully parsed evaluator response JSON")
-                
-                # Check for acceptance_status
-                acceptance_status = json_data.get('acceptance_status', '').lower()
+                acceptance_status = str(json_data.get('acceptance_status', '')).lower()
                 print(f"Acceptance status: {acceptance_status}")
-                
+
                 if acceptance_status == 'no':
-                    # Look for NEXT STEPS array
-                    next_steps = json_data.get('NEXT STEPS', json_data.get('next_steps', json_data.get('next_steps', [])))
-                    
+                    next_steps = json_data.get('NEXT STEPS', json_data.get('next_steps', []))
                     if next_steps and isinstance(next_steps, list) and len(next_steps) > 0:
                         print(f"Found {len(next_steps)} next steps. Creating subtasks...")
-                        create_next_steps_subtasks(original_task_name, next_steps, metadata)
+                        create_next_steps_subtasks(updated, next_steps)
                     else:
                         print("No next steps found in evaluator response")
-                
+
                 # Always create the evaluation subtask with full response
-                create_subtask(original_task_name, evaluator_response, metadata)
+                create_subtask(updated, evaluator_response)
             else:
                 print(f"Could not parse evaluator response as JSON: {parse_error}")
                 # Still create subtask with raw response
-                create_subtask(original_task_name, evaluator_response, metadata)
+                create_subtask(updated, evaluator_response)
         else:
             print(f"Warning: Failed to get evaluator response: {evaluator_log.get('error_message', 'Unknown error') if evaluator_log else 'No log available'}")
-        
-        move_to_completed(filepath, metadata, content, response_to_write)
-    elif metadata.get('status') == 'failed':
-        move_to_failed(filepath, metadata, content, response_to_write)
-
-def move_to_completed(filepath, metadata, content, response=None):
-    """
-    Moves a completed task file to the completed directory.
-    Adds task ID to metadata and filename.
-    """
-    cfg = get_config()
-    if cfg is None:
-        print("Error: Configuration not loaded. Cannot move file.")
-        return
-    
-    completed_directory = cfg['completed_directory']
-    
-    # Ensure the completed directory exists
-    if not os.path.exists(completed_directory):
-        try:
-            os.makedirs(completed_directory)
-            print(f"Created directory: {completed_directory}")
-        except Exception as e:
-            print(f"Error creating completed directory: {e}")
-            return
-    
-    # Add created_at timestamp and task ID to metadata
-    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    full_hash, short_hash = generate_task_id(created_at)
-    
-    metadata['created_at'] = created_at
-    metadata['task_id'] = full_hash
-    
-    # Rewrite the file with updated metadata, preserving response
-    write_frontmatter(filepath, metadata, content, response)
-    
-    # Generate new filename with short hash
-    filename = os.path.basename(filepath)
-    name_without_ext = os.path.splitext(filename)[0]
-    new_filename = f"{name_without_ext}_{short_hash}.md"
-    destination = os.path.join(completed_directory, new_filename)
-    
-    try:
-        # Move the file with new name
-        os.rename(filepath, destination)
-        print(f"Moved '{filename}' to completed folder as '{new_filename}'.")
-    except Exception as e:
-        print(f"Error moving file to completed folder: {e}")
-
-def move_to_failed(filepath, metadata, content, response=None):
-    """
-    Moves a failed task file to the failed directory.
-    Adds task ID to metadata and filename.
-    """
-    cfg = get_config()
-    if cfg is None:
-        print("Error: Configuration not loaded. Cannot move file.")
-        return
-    
-    failed_directory = cfg['failed_directory']
-    
-    # Ensure the failed directory exists
-    if not os.path.exists(failed_directory):
-        try:
-            os.makedirs(failed_directory)
-            print(f"Created directory: {failed_directory}")
-        except Exception as e:
-            print(f"Error creating failed directory: {e}")
-            return
-    
-    # Add created_at timestamp and task ID to metadata
-    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    full_hash, short_hash = generate_task_id(created_at)
-    
-    metadata['created_at'] = created_at
-    metadata['task_id'] = full_hash
-    
-    # Rewrite the file with updated metadata, preserving response
-    write_frontmatter(filepath, metadata, content, response)
-    
-    # Generate new filename with short hash
-    filename = os.path.basename(filepath)
-    name_without_ext = os.path.splitext(filename)[0]
-    new_filename = f"{name_without_ext}_{short_hash}.md"
-    destination = os.path.join(failed_directory, new_filename)
-    
-    try:
-        # Move the file with new name
-        os.rename(filepath, destination)
-        print(f"Moved '{filename}' to failed folder as '{new_filename}'.")
-    except Exception as e:
-        print(f"Error moving file to failed folder: {e}")
 
 def main():
     # Load configuration
@@ -675,45 +428,18 @@ def main():
     if cfg is None:
         print("Error: Failed to load configuration. Please create config.py from config.example.py")
         return
-    
-    pending_directory = cfg['pending_directory']
-    completed_directory = cfg['completed_directory']
-    failed_directory = cfg['failed_directory']
-    
-    if not os.path.exists(pending_directory):
-        print(f"Directory '{pending_directory}' not found.")
+
+    db.init_db()
+
+    # Get all pending tasks from the database
+    pending_tasks = db.list_tasks(status='pending')
+
+    if not pending_tasks:
+        print("No pending tasks found.")
         return
 
-    # Ensure the completed directory exists
-    if not os.path.exists(completed_directory):
-        try:
-            os.makedirs(completed_directory)
-            print(f"Created directory: {completed_directory}")
-        except Exception as e:
-            print(f"Error creating completed directory: {e}")
-            return
-    
-    # Ensure the failed directory exists
-    if not os.path.exists(failed_directory):
-        try:
-            os.makedirs(failed_directory)
-            print(f"Created directory: {failed_directory}")
-        except Exception as e:
-            print(f"Error creating failed directory: {e}")
-            return
-
-    # Get all .md files in the pending directory
-    md_files = [filename for filename in os.listdir(pending_directory) if filename.endswith(".md")]
-    
-    # Check if there are any pending tasks
-    if not md_files:
-        print("No pending tasks found in the pending directory.")
-        return
-
-    # Iterate over all .md files in the pending directory
-    for filename in md_files:
-        filepath = os.path.join(pending_directory, filename)
-        process_markdown_file(filepath)
+    for task in pending_tasks:
+        process_task(task)
 
 if __name__ == "__main__":
     main()
