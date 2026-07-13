@@ -112,7 +112,11 @@ export function TaskDetail() {
   const doDelete = async () => {
     try {
       await api.deleteTask(taskId, removePlan);
-      navigate({ to: "/" });
+      if (t?.project_id != null) {
+        navigate({ to: "/projects/$projectId", params: { projectId: String(t.project_id) } });
+      } else {
+        navigate({ to: "/" });
+      }
     } catch (e: unknown) {
       // error will show via query refetch
     }

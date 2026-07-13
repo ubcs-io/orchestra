@@ -212,7 +212,7 @@ function artifactName(task: TaskRow): string {
   const shortId = task.task_id.slice(0, 8);
   const safe = (task.name ?? "task").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 40);
   const base = safe.replace(/\.md$/i, "");
-  return `${shortId}-${base}.md`;
+  return `${base}-${shortId}.md`;
 }
 
 /** Scan every project's INTAKE folder and create tasks for new files. */

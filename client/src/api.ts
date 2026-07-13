@@ -133,8 +133,12 @@ export interface TaskDetail {
 }
 
 async function req<T>(url: string, opts?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (opts?.body !== undefined) {
+    headers["content-type"] = "application/json";
+  }
   const res = await fetch(url, {
-    headers: { "content-type": "application/json" },
+    headers,
     ...opts,
   });
   if (!res.ok) {
