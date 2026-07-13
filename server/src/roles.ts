@@ -237,6 +237,7 @@ export interface RoleSeed {
   /** Intake kinds this role is relevant to (informational; routing templates drive execution). */
   appliesTo: IntakeKind[];
   persona: string;
+  can_create_subtasks?: boolean;
 }
 
 const ALL: IntakeKind[] = [
@@ -393,6 +394,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 900,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
+    can_create_subtasks: true,
     persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. In section_md, present the tree explicitly using nested bullets labeled [epic], [story], [task] so downstream tooling can parse it. Each atomic task must be independently actionable with acceptance criteria.`,
   },
 
@@ -496,7 +498,7 @@ export function buildRoleSystemPrompt(persona: string, tools: string[] = READ_ON
  * Bump when the default personas / contract change so existing DBs re-seed the
  * global rows. Project-override rows (project_id set) are never touched.
  */
-export const ROLES_SEED_VERSION = 2;
+export const ROLES_SEED_VERSION = 3;
 
 /**
  * Seed (or refresh) the global default role catalog. Idempotent within a version:
@@ -516,6 +518,7 @@ export function seedGlobalRoles(): void {
       ordering: r.ordering,
       system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
       tools_json: JSON.stringify(r.tools),
+      can_create_subtasks: r.can_create_subtasks,
     });
   }
   setMeta("roles_seed_version", String(ROLES_SEED_VERSION));

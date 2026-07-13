@@ -50,6 +50,7 @@ export interface Role {
   system_prompt: string | null;
   tools_json: string | null;
   model: string | null;
+  can_create_subtasks: number;
 }
 
 export interface Intervention {

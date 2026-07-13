@@ -184,6 +184,8 @@ export function initDb(): void {
   addColumnIfMissing(d, "configs", "thinking_level", "thinking_level TEXT");
   // Reasoning request dialect (model family): shapes how pi asks for thinking.
   addColumnIfMissing(d, "configs", "thinking_format", "thinking_format TEXT");
+  // Whether a role can spawn child tasks via decomposition.
+  addColumnIfMissing(d, "roles", "can_create_subtasks", "can_create_subtasks INTEGER DEFAULT 0");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -222,6 +224,7 @@ export interface RoleRow {
   system_prompt: string | null;
   tools_json: string | null;
   model: string | null;
+  can_create_subtasks: number;
   created_at: string;
   updated_at: string;
 }
@@ -415,6 +418,7 @@ export function upsertRole(input: {
   system_prompt?: string | null;
   tools_json?: string | null;
   model?: string | null;
+  can_create_subtasks?: boolean;
 }): RoleRow {
   const d = getDb();
   const ts = now();
@@ -429,7 +433,7 @@ export function upsertRole(input: {
   if (existing) {
     d.prepare(
       `UPDATE roles SET title=@title, enabled=@enabled, applies_to=@applies_to, ordering=@ordering,
-        system_prompt=@system_prompt, tools_json=@tools_json, model=@model, updated_at=@ts WHERE id=@id`,
+        system_prompt=@system_prompt, tools_json=@tools_json, model=@model, can_create_subtasks=@can_create_subtasks, updated_at=@ts WHERE id=@id`,
     ).run({
       id: existing.id,
       title: input.title ?? existing.title,
@@ -439,6 +443,7 @@ export function upsertRole(input: {
       system_prompt: input.system_prompt ?? existing.system_prompt,
       tools_json: input.tools_json ?? existing.tools_json,
       model: input.model ?? existing.model,
+      can_create_subtasks: input.can_create_subtasks == null ? existing.can_create_subtasks : input.can_create_subtasks ? 1 : 0,
       ts,
     });
     return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(existing.id) as RoleRow;
@@ -446,8 +451,8 @@ export function upsertRole(input: {
 
   const info = d
     .prepare(
-      `INSERT INTO roles (project_id, key, title, enabled, applies_to, ordering, system_prompt, tools_json, model, created_at, updated_at)
-       VALUES (@project_id, @key, @title, @enabled, @applies_to, @ordering, @system_prompt, @tools_json, @model, @ts, @ts)`,
+      `INSERT INTO roles (project_id, key, title, enabled, applies_to, ordering, system_prompt, tools_json, model, can_create_subtasks, created_at, updated_at)
+       VALUES (@project_id, @key, @title, @enabled, @applies_to, @ordering, @system_prompt, @tools_json, @model, @can_create_subtasks, @ts, @ts)`,
     )
     .run({
       project_id: input.project_id,
@@ -459,6 +464,7 @@ export function upsertRole(input: {
       system_prompt: input.system_prompt ?? null,
       tools_json: input.tools_json ?? null,
       model: input.model ?? null,
+      can_create_subtasks: input.can_create_subtasks ? 1 : 0,
       ts,
     });
   return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(Number(info.lastInsertRowid)) as RoleRow;

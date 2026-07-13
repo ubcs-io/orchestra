@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CoverageItem, CriteriaResult, RoleRunResult, RoleRunner, Verdict } from "../src/agent";
-import { closeDb, createProject, getTask, listRoleRuns, listTasks, type TaskRow } from "../src/db";
+import type { CoverageItem, CriteriaResult, RoleRunResult, Verdict } from "../src/agent";
+import { closeDb, createProject, getTask, listRoleRuns, listTasks, updateTask, type TaskRow } from "../src/db";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
@@ -17,6 +17,7 @@ import {
   setRoleRunner,
   tick,
 } from "../src/orchestrator";
+import type { RoleRunner } from "../src/orchestrator";
 import { freshDb, tempGitRepo } from "./helpers";
 
 afterEach(() => {
@@ -232,6 +233,12 @@ describe("orchestrator loop (integration)", () => {
     // A clean run: producers pass, the counter-reviewer finds every criterion met
     // and mandatory concerns covered, so no loop-back occurs.
     setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: allMet("error_file") }));
+
+    // First tick: ingest → seeds plan → bumps level to epic so the recursion
+    // guard allows the decomposition role to spawn children.
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
 
     await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
 

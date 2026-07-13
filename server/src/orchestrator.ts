@@ -634,7 +634,13 @@ function applyGate(
     });
     commitArtifacts(project.repo_path, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
     if (isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec") {
-      createDecompositionChildren(task);
+      // Only [epic] and [story] nodes decompose further; [task] is the atomic leaf.
+      // The role must also have can_create_subtasks enabled (default: only decomposition).
+      const level = task.level ?? "task";
+      const roleCfg = getRole(project.id, step.role);
+      if ((level === "epic" || level === "story") && roleCfg?.can_create_subtasks) {
+        createDecompositionChildren(task, project);
+      }
     }
     publish(task.task_id, "task_update", { stage: "ready" });
     return;
@@ -660,26 +666,44 @@ export function parseDecompositionTree(md: string): Array<{ level: string; name:
   return out;
 }
 
-/** Parse the decomposition role's section and create child tasks. */
-function createDecompositionChildren(task: TaskRow): void {
+/** Parse the decomposition role's section and create child tasks as intake
+ *  so the scheduler discovers and refines them through the normal pipeline. */
+function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
   const runs = listRoleRuns(task.task_id);
   const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
   if (!decomp?.output_md) return;
+
+  const planningDir = project.planning_dir || "PLANNING";
+  const parentName = task.name ?? task.task_id.slice(0, 8);
   let step = 0;
+
   for (const node of parseDecompositionTree(decomp.output_md)) {
-    createTask({
+    // Seed content from the bullet text so the triage role has grounding.
+    const child = createTask({
       name: node.name,
-      content: null,
+      content: node.name,
       project_id: task.project_id,
-      stage: "ready",
+      stage: "intake",
       level: node.level,
       intake_kind: task.intake_kind ?? "manual",
       exit_kind: task.exit_kind ?? "spec",
       parent_task_id: task.task_id,
       task_type: "child",
       step_number: step++,
-      status: "complete",
+      status: "active",
     });
+
+    // Write a minimal intake artifact so the child follows the normal pipeline.
+    const artName = artifactName(child);
+    const relArtifact = path.join(planningDir, "REFINING", artName);
+    const absArtifact = path.join(project.repo_path, relArtifact);
+    writeArtifact(
+      absArtifact,
+      `# ${node.name}\n\n> Child of: **${parentName}** · level: \`${node.level}\`\n\n## Problem\n\n${node.name}\n`,
+    );
+    updateTask(child.task_id, { artifact_path: relArtifact });
+    commitArtifacts(project.repo_path, [relArtifact], `intake(child): ${node.name}`);
+    publish(child.task_id, "task_update", { stage: "intake" });
   }
 }
 

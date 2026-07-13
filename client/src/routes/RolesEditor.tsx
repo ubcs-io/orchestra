@@ -16,6 +16,7 @@ function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
   });
   const [model, setModel] = useState(role.model ?? "");
   const [enabled, setEnabled] = useState(role.enabled === 1);
+  const [canCreateSubtasks, setCanCreateSubtasks] = useState(role.can_create_subtasks === 1);
 
   const save = useMutation({
     mutationFn: () =>
@@ -24,6 +25,7 @@ function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
         tools_json: JSON.stringify(tools.split(",").map((s) => s.trim()).filter(Boolean)),
         model: model || undefined,
         enabled: enabled ? 1 : 0,
+        can_create_subtasks: canCreateSubtasks ? 1 : 0,
       } as Partial<Role>),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["roles", projectId] }),
   });
@@ -40,6 +42,7 @@ function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
       {open && (
         <div style={{ marginTop: 10 }}>
           <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> enabled</label>
+          <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={canCreateSubtasks} onChange={(e) => setCanCreateSubtasks(e.target.checked)} /> Can Create Subtasks</label>
           <label>Tools (comma-separated pi built-ins: read, grep, find, ls)</label>
           <input value={tools} onChange={(e) => setTools(e.target.value)} />
           <label>Model override (optional)</label>
