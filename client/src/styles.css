@@ -24,6 +24,7 @@ body {
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+a.pill:hover { text-decoration: none; }
 button {
   font: inherit;
   background: var(--panel-2);
@@ -102,3 +103,6 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .model-list { max-height: 220px; overflow: auto; margin-top: 8px; padding: 6px; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; display: flex; flex-direction: column; gap: 2px; }
 .model-list .model { display: flex; justify-content: space-between; align-items: center; padding: 3px 6px; border-radius: 3px; font-size: 12px; }
 .model-list .model:hover { background: var(--panel-2); }
+.row.collapsible { cursor: pointer; user-select: none; }
+.row.collapsible:hover { background: rgba(201, 162, 75, 0.06); border-radius: 4px; padding: 2px 4px; margin: -2px -4px; }
+.collapse-caret { font-size: 12px; color: var(--brass); width: 14px; flex-shrink: 0; }
