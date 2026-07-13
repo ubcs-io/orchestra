@@ -178,12 +178,25 @@ export function initDb(): void {
   // missing (fallback salvage), and the captured reasoning trace.
   addColumnIfMissing(d, "role_runs", "stop_reason", "stop_reason TEXT");
   addColumnIfMissing(d, "role_runs", "fallback", "fallback INTEGER DEFAULT 0");
+  // Set when the run's own text stream repeated itself (narrating a tool call
+  // instead of invoking it) and had to be aborted mid-turn — see agent.ts's
+  // stall detector. Distinct from `fallback`: a stalled run can still recover
+  // on the auto-retry and finish with a real verdict.
+  addColumnIfMissing(d, "role_runs", "stalled", "stalled INTEGER DEFAULT 0");
   addColumnIfMissing(d, "role_runs", "thinking_md", "thinking_md TEXT");
+  // Open questions from record_findings (JSON array of strings).
+  addColumnIfMissing(d, "role_runs", "open_questions_json", "open_questions_json TEXT");
+  // Orchestrator recap call — synthesized final disposition after all roles finish.
+  addColumnIfMissing(d, "tasks", "recap_md", "recap_md TEXT");
   // Reasoning-model connection settings (editable per profile).
   addColumnIfMissing(d, "configs", "reasoning", "reasoning INTEGER");
   addColumnIfMissing(d, "configs", "thinking_level", "thinking_level TEXT");
   // Reasoning request dialect (model family): shapes how pi asks for thinking.
   addColumnIfMissing(d, "configs", "thinking_format", "thinking_format TEXT");
+  // Text mode: when enabled, record_findings is NOT registered as a tool — the
+  // model is instead instructed to output findings as a JSON code block. Opt-in
+  // for models whose function-calling is unreliable (small MoE, quantized, etc.).
+  addColumnIfMissing(d, "configs", "text_mode", "text_mode INTEGER DEFAULT 0");
   // Whether a role can spawn child tasks via decomposition.
   addColumnIfMissing(d, "roles", "can_create_subtasks", "can_create_subtasks INTEGER DEFAULT 0");
 
@@ -254,6 +267,7 @@ export interface TaskRow {
   artifact_path: string | null;
   exit_state: string | null;
   review_reason: string | null;
+  recap_md: string | null;
   paused: number | null;
   created_at: string;
   updated_at: string;
@@ -280,6 +294,7 @@ export interface ConfigRow {
   reasoning: number | null;
   thinking_level: string | null;
   thinking_format: string | null;
+  text_mode: number | null;
   extra_json: string | null;
   created_at: string;
   updated_at: string;
@@ -298,7 +313,9 @@ export interface RoleRunRow {
   transcript_jsonl: string | null;
   stop_reason: string | null;
   fallback: number | null;
+  stalled: number | null;
   thinking_md: string | null;
+  open_questions_json: string | null;
   depth: number;
   model: string | null;
   tokens: number | null;
@@ -538,6 +555,7 @@ export function upsertConfig(input: {
   reasoning?: number | null;
   thinking_level?: string | null;
   thinking_format?: string | null;
+  text_mode?: number | null;
   extra_json?: string | null;
 }): ConfigRow {
   const d = getDb();
@@ -566,6 +584,7 @@ export function upsertConfig(input: {
     reasoning: keep(input.reasoning, base.reasoning),
     thinking_level: keep(input.thinking_level, base.thinking_level),
     thinking_format: keep(input.thinking_format, base.thinking_format),
+    text_mode: keep(input.text_mode, base.text_mode),
     extra_json: keep(input.extra_json, base.extra_json),
   };
 
@@ -574,7 +593,7 @@ export function upsertConfig(input: {
       `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
-        thinking_format=@thinking_format, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
+        thinking_format=@thinking_format, text_mode=@text_mode, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
   }
@@ -582,9 +601,9 @@ export function upsertConfig(input: {
   const info = d
     .prepare(
       `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
-         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, extra_json, created_at, updated_at)
+         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, extra_json, created_at, updated_at)
        VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
-         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @extra_json, @ts, @ts)`,
+         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @extra_json, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
   return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
@@ -700,6 +719,7 @@ const TASK_UPDATABLE = new Set([
   "artifact_path",
   "exit_state",
   "review_reason",
+  "recap_md",
   "paused",
 ]);
 
@@ -765,6 +785,7 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       exit_kind = NULL,
       exit_state = NULL,
       review_reason = NULL,
+      recap_md = NULL,
       paused = 0,
       response = NULL,
       failure_reason = NULL,
@@ -815,7 +836,9 @@ export function createRoleRun(input: {
   transcript_jsonl?: string | null;
   stop_reason?: string | null;
   fallback?: number | null;
+  stalled?: number | null;
   thinking_md?: string | null;
+  open_questions_json?: string | null;
   depth?: number;
   model?: string | null;
   tokens?: number | null;
@@ -825,11 +848,11 @@ export function createRoleRun(input: {
   const info = d
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
-         criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, thinking_md,
-         depth, model, tokens, created_at)
+         criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, stalled, thinking_md,
+         open_questions_json, depth, model, tokens, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
-         @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @thinking_md,
-         @depth, @model, @tokens, @ts)`,
+         @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @stalled, @thinking_md,
+         @open_questions_json, @depth, @model, @tokens, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -843,7 +866,9 @@ export function createRoleRun(input: {
       transcript_jsonl: input.transcript_jsonl ?? null,
       stop_reason: input.stop_reason ?? null,
       fallback: input.fallback ?? 0,
+      stalled: input.stalled ?? 0,
       thinking_md: input.thinking_md ?? null,
+      open_questions_json: input.open_questions_json ?? null,
       depth: input.depth ?? 1,
       model: input.model ?? null,
       tokens: input.tokens ?? null,

@@ -73,6 +73,9 @@ export interface RoleRunResult {
   model: string;
   /** True when the role never called record_findings and we synthesized a fallback. */
   fallback: boolean;
+  /** True if the run narrated a tool call instead of invoking it and had to be aborted
+   *  mid-turn (see createStallDetector) — even if the auto-retry then recovered. */
+  stalled: boolean;
   /** The LLM stop reason ("stop" | "length" | "toolUse" | ...); "length" == truncated. */
   stopReason?: string;
   /** The model's reasoning trace (native reasoning channel + any inline <think>). */
@@ -92,6 +95,10 @@ export interface RunRoleParams {
   context: string;
   /** Thinking level for reasoning models (omitted → pi default; ignored when model.reasoning is false). */
   thinkingLevel?: ThinkingLevel;
+  /** When true, record_findings is NOT registered as a tool — the model must output
+   *  findings as a ```json block in the answer text instead. Opt-in for models whose
+   *  native function-calling is unreliable. */
+  textMode?: boolean;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -184,6 +191,154 @@ function textResult(text: string) {
 const THINK_OPEN = "<think>";
 const THINK_CLOSE = "</think>";
 
+// A sentence repeated this many times (verbatim, case/space-insensitive) marks the
+// turn as stalled — the model is narrating an action instead of taking it. This is
+// a known failure mode on self-hosted endpoints whose chat template doesn't reliably
+// surface tool calls as structured deltas: the model just talks about calling the
+// tool (e.g. "Let me call record_findings now") forever, burning the token budget.
+const STALL_REPEAT_THRESHOLD = 3;
+const STALL_MIN_SENTENCE_LEN = 20;
+
+const TOOL_CALL_DISCIPLINE =
+  "\n\nWhen you are ready to use a tool, invoke it directly as a function call — never describe or " +
+  'narrate the call in plain text (e.g. do not write "Let me call record_findings now" or similar). ' +
+  "Plain text should contain your analysis, not announcements of tool use.";
+
+const STALL_NUDGE =
+  "You just described calling a tool in plain text, repeatedly, without actually invoking it. Stop " +
+  "narrating and invoke the tool directly as a function call right now, using your best current " +
+  "assessment. If you genuinely need more information first, use the available read-only tools to " +
+  "get it, then call record_findings — do not write about your intentions.";
+
+// ---- Text-mode support (for models that can't reliably do native function calling) ----
+
+/**
+ * Regex patterns that indicate the model is talking about calling/invoking a tool
+ * in plain text instead of actually doing so. Matched case-insensitively against
+ * streamed answer text. Used by the narration-pattern stall detector (universal)
+ * and also checked during fallback extraction for diagnostic hints.
+ */
+const NARRATION_PATTERNS = [
+  /\b(let me|i will|i'll|i need to|going to|i can|i should|i must)\s+(call|invoke|use|run|trigger|execute|make)\s+/i,
+  /\b(call|invoking|invoke)\s+(the\s+)?record_findings/i,
+  /\b(i have|i've)\s+(all\s+the\s+information|everything\s+i\s+need)\b/i,
+  /\b(let me|i will|i'll|i am going to)\s+(finalize|finish|wrap|conclude|do that)\b/i,
+  /\bnow\s+(i|let me)\s+(will|call|invoke|record|finalize)\b/i,
+];
+
+/** Check whether a piece of text matches any narration pattern. */
+function hasNarrationPattern(text: string): boolean {
+  for (const re of NARRATION_PATTERNS) {
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Instruction appended to the system prompt when textMode is on. The model is told
+ * to output its findings as a JSON code block instead of using record_findings.
+ */
+const TEXT_MODE_INSTRUCTION = `
+## How to finish (text mode)
+
+You do NOT have a record_findings tool. Instead, when you are done with your analysis,
+output your findings as a single JSON code block using EXACTLY this format:
+
+\`\`\`json
+{
+  "verdict": "pass",
+  "summary": "One or two sentences capturing your key takeaway.",
+  "open_questions": [],
+  "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}],
+  "section_md": "## My Role\\n\\nFindings with concrete file references..."
+}
+\`\`\`
+
+- **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
+- **summary**: brief key takeaway
+- **open_questions**: array of strings (empty if none)
+- **coverage**: array of { concern, status, note } — status is "considered", "skipped", or "out_of_scope". Draw concerns from: correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs. Be honest about what you did NOT examine.
+- **section_md**: a markdown section (start with "## Your Role" heading) with concrete file references. This will be appended to the task's planning artifact.
+
+If you are a counter-reviewer with acceptance criteria to verify, also include:
+- **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
+
+Output ONLY the JSON block as the last thing in your response. Do not write anything after the closing \`\`\`.
+`.trim();
+
+// ---- Stall detection (purely stream-driven helpers) ----
+
+/**
+ * Flags a turn as "stalled" once the same substantial sentence recurs across the
+ * streamed text — the signature of a model narrating a tool call instead of making
+ * one. Buffers partial sentences across streamed deltas so a sentence split across
+ * chunk boundaries is still matched whole. Exported for unit testing.
+ *
+ * Also detects varied "narration patterns" — sentences that talk about calling a
+ * tool without actually doing so, even if the wording differs each time. This
+ * catches the more common case where the model cycles through different phrasings
+ * of the same intent (e.g. "Let me call record_findings", "I will invoke it now",
+ * "Let me finalize").
+ */
+export function createStallDetector(
+  repThreshold = STALL_REPEAT_THRESHOLD,
+  narrationThreshold = STALL_REPEAT_THRESHOLD,
+) {
+  let buffer = "";
+  const seen = new Map<string, number>();
+  let narrationCount = 0;
+  let stalled = false;
+  const SENTENCE_END = /[.!?\n]/;
+
+  function extractSentences(): string[] {
+    const out: string[] = [];
+    for (;;) {
+      const m = SENTENCE_END.exec(buffer);
+      if (!m) break;
+      out.push(buffer.slice(0, m.index + 1));
+      buffer = buffer.slice(m.index + 1);
+    }
+    return out;
+  }
+
+  return {
+    /** Feed the next streamed chunk; returns true once/if this turn is stalled. */
+    push(delta: string): boolean {
+      if (stalled || !delta) return stalled;
+      buffer += delta;
+      for (const raw of extractSentences()) {
+        const norm = raw.trim().toLowerCase().replace(/\s+/g, " ");
+
+        // Repetition check: exact same sentence appears N times.
+        if (norm.length >= STALL_MIN_SENTENCE_LEN) {
+          const count = (seen.get(norm) ?? 0) + 1;
+          seen.set(norm, count);
+          if (count >= repThreshold) {
+            stalled = true;
+            break;
+          }
+        }
+
+        // Narration pattern check: the model is talking about calling a tool.
+        if (hasNarrationPattern(raw)) {
+          narrationCount += 1;
+          if (narrationCount >= narrationThreshold) {
+            stalled = true;
+            break;
+          }
+        }
+      }
+      return stalled;
+    },
+    reset(): void {
+      buffer = "";
+      seen.clear();
+      narrationCount = 0;
+      stalled = false;
+    },
+  };
+}
+
 /** Longest suffix of `s` that is a proper prefix of `marker` (for partial-tag carry). */
 function partialSuffix(s: string, marker: string): number {
   const max = Math.min(marker.length - 1, s.length);
@@ -237,13 +392,100 @@ export function createThinkSplitter() {
   };
 }
 
+// ---- JSON extraction for text-mode and fallback recovery ----
+
+/**
+ * Try to extract a RoleFindings object from a JSON code fence in the answer text.
+ * Handles models (including markdown-fenced) and raw JSON. Returns the parsed
+ * findings on success, or null if no valid JSON block is found.
+ */
+function extractFindingsFromText(text: string): RoleFindings | null {
+  if (!text) return null;
+
+  // Try ```json ... ``` fence first (most common for text-mode output).
+  const fence = /```(?:json)?\s*\n([\s\S]*?)```/g;
+  let m: RegExpExecArray | null;
+  // Find the LAST fence — models often put the JSON at the end.
+  let lastFence: string | null = null;
+  while ((m = fence.exec(text)) !== null) {
+    lastFence = m[1]!.trim();
+  }
+
+  if (lastFence) {
+    const parsed = tryParseFindings(lastFence);
+    if (parsed) return parsed;
+  }
+
+  // Fallback: try parsing the entire text as raw JSON (unlikely but possible).
+  return tryParseFindings(text.trim());
+}
+
+/** Parse a JSON string as RoleFindings, validating required fields. */
+function tryParseFindings(json: string): RoleFindings | null {
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    // Must have at least verdict, summary, section_md.
+    if (
+      typeof obj.verdict !== "string" ||
+      typeof obj.summary !== "string" ||
+      typeof obj.section_md !== "string"
+    ) {
+      return null;
+    }
+    const verdict = obj.verdict as Verdict;
+    if (!["pass", "needs_more", "blocker", "needs_human"].includes(verdict)) return null;
+
+    return {
+      verdict,
+      summary: obj.summary,
+      open_questions: Array.isArray(obj.open_questions)
+        ? obj.open_questions.filter((q): q is string => typeof q === "string")
+        : [],
+      coverage: Array.isArray(obj.coverage)
+        ? (obj.coverage as CoverageItem[])
+        : [],
+      section_md: obj.section_md,
+      criteria_results: Array.isArray(obj.criteria_results)
+        ? (obj.criteria_results as CriteriaResult[])
+        : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---- Main role runner ----
+
+/**
+ * Number of answer-text characters without a tool call before we pre-emptively
+ * inject the stall nudge (token-budget guard). This fires before the model runs
+ * out of tokens, giving the retry room to work.
+ *
+ * In text_mode, reasoning models spend most of their output on <think> analysis
+ * before producing the JSON block — a higher threshold gives them room to think.
+ */
+const PREEMPTIVE_NUDGE_CHARS = 2000;
+const PREEMPTIVE_NUDGE_CHARS_TEXT_MODE = 6000;
+
 export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
+  const textMode = params.textMode === true;
   const emit = params.onEvent ?? (() => {});
   const transcript: string[] = [];
   const toolCalls: ToolCallRecord[] = [];
   let tokens = 0;
   let captured: RoleFindings | undefined;
   let stopReason: string | undefined;
+
+  // Stall detection: flags a turn that's narrating a tool call instead of making one.
+  const stallDetector = createStallDetector();
+  let stalled = false;
+  let stallEverDetected = false;
+  let stallRetried = false;
+
+  // Pre-emptive nudge tracking: if the model emits a lot of text without ever
+  // calling a tool, inject the nudge early.
+  let answerTextLenSinceLastTool = 0;
+  let preemptiveNudged = false;
 
   // Text vs. reasoning accumulators. `answerText` is the clean answer (inline
   // <think> stripped); `thinkingText` is the reasoning trace.
@@ -312,12 +554,16 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     },
   });
 
+  // System prompt: append text-mode finish instruction when textMode is on,
+  // otherwise use the normal tool-call discipline.
+  const disciplineSuffix = textMode ? TEXT_MODE_INSTRUCTION : TOOL_CALL_DISCIPLINE;
+
   const settingsManager = SettingsManager.inMemory();
   const loader = new DefaultResourceLoader({
     cwd: params.repoPath,
     agentDir: getAgentDir(),
     settingsManager,
-    systemPrompt: params.systemPrompt,
+    systemPrompt: params.systemPrompt + disciplineSuffix,
     noExtensions: true,
     noSkills: true,
     noPromptTemplates: true,
@@ -332,9 +578,12 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   // allowlist and register it as a custom tool only for roles that opt in.
   const wantsGit = params.tools.includes(GIT_HISTORY_TOOL);
   const builtinTools = params.tools.filter((t) => t !== GIT_HISTORY_TOOL);
-  const customTools = wantsGit
-    ? [recordFindings, writeArtifact, gitHistory]
-    : [recordFindings, writeArtifact];
+
+  // In text mode, strip record_findings from custom tools — the model must output
+  // JSON in text instead. write_artifact and git_history remain available.
+  const customTools: ReturnType<typeof defineTool>[] = [writeArtifact];
+  if (!textMode) customTools.unshift(recordFindings);
+  if (wantsGit) customTools.push(gitHistory);
 
   const { session } = await createAgentSession({
     cwd: params.repoPath,
@@ -348,6 +597,19 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     thinkingLevel: params.thinkingLevel,
   });
 
+  // Feed streamed text (either channel — narration can land in the answer or the
+  // reasoning trace) to the stall detector; abort the turn the moment it fires
+  // instead of waiting for the token budget to run out.
+  const checkStall = (s: string) => {
+    if (!s || stalled || captured) return;
+    if (stallDetector.push(s)) {
+      stalled = true;
+      stallEverDetected = true;
+      record({ type: "status", message: "detected repeated/narration stall — aborting this turn" });
+      void session.abort();
+    }
+  };
+
   const unsubscribe = session.subscribe((ev) => {
     switch (ev.type) {
       case "message_update": {
@@ -357,14 +619,44 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           const { text, thinking } = splitter.push(ame.delta ?? ame.text ?? "");
           emitText(text);
           emitThinking(thinking);
+          // In text_mode, only the answer text (not reasoning) feeds stall
+          // detection — the model is supposed to "narrate" in <think> blocks.
+          checkStall(text);
+          if (!textMode) checkStall(thinking);
+
+          // Track answer text length since last tool call for pre-emptive nudge.
+          if (text.length > 0) {
+            answerTextLenSinceLastTool += text.length;
+            const nudgeThreshold = textMode
+              ? PREEMPTIVE_NUDGE_CHARS_TEXT_MODE
+              : PREEMPTIVE_NUDGE_CHARS;
+            if (
+              !preemptiveNudged &&
+              !captured &&
+              !stalled &&
+              answerTextLenSinceLastTool >= nudgeThreshold
+            ) {
+              preemptiveNudged = true;
+              record({
+                type: "status",
+                message:
+                  "pre-emptive nudge: model has produced significant text without a tool call — requesting action",
+              });
+              void session.abort();
+            }
+          }
         } else if (ame?.type === "thinking_delta") {
           // Native reasoning channel (endpoints that emit reasoning_content).
-          emitThinking(ame.delta ?? "");
+          const d = ame.delta ?? "";
+          emitThinking(d);
+          if (!textMode) checkStall(d);
         }
         break;
       }
       case "tool_execution_start":
         record({ type: "tool_start", tool: ev.toolName, args: ev.args });
+        // Reset pre-emptive nudge tracking on any tool call.
+        answerTextLenSinceLastTool = 0;
         break;
       case "tool_execution_end":
         toolCalls.push({ tool: ev.toolName, args: undefined, isError: ev.isError });
@@ -385,8 +677,38 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     if (params.signal) {
       params.signal.addEventListener("abort", () => void session.abort(), { once: true });
     }
-    emit({ type: "status", message: "running" });
-    await session.prompt(params.context);
+    emit({ type: "status", message: textMode ? "running (text mode)" : "running" });
+    try {
+      await session.prompt(params.context);
+    } catch (err) {
+      // Only swallow the abort we triggered ourselves via checkStall / preemptive
+      // nudge — a real external cancellation (params.signal) must still propagate
+      // so the orchestrator's existing abort handling (needs_human escalation) applies.
+      const selfAbort = stalled || preemptiveNudged;
+      if (!selfAbort || params.signal?.aborted) throw err;
+    }
+
+    // Retry logic for stall/preemptive-nudge: if the model was narrating without
+    // acting, inject the nudge and give it one more chance.
+    if ((stalled || preemptiveNudged) && !captured && !stallRetried) {
+      stallRetried = true;
+      stalled = false;
+      preemptiveNudged = false;
+      stallDetector.reset();
+      answerTextLenSinceLastTool = 0;
+      const nudgeMsg = preemptiveNudged
+        ? STALL_NUDGE
+        : stalled
+          ? STALL_NUDGE
+          : STALL_NUDGE;
+      record({ type: "status", message: "retrying: call the tool directly instead of narrating it" });
+      try {
+        await session.prompt(nudgeMsg);
+      } catch (err) {
+        const selfAbort = stalled || preemptiveNudged;
+        if (!selfAbort || params.signal?.aborted) throw err;
+      }
+    }
   } finally {
     unsubscribe();
   }
@@ -398,26 +720,46 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   let fallback = false;
   if (!captured) {
-    // The model finished without the required tool call — salvage the (think-stripped)
-    // answer text; never surface raw reasoning as the output.
-    fallback = true;
-    captured = {
-      verdict: "needs_more",
-      summary:
-        stopReason === "length"
-          ? "Output was truncated (hit the token limit) before the role recorded a verdict."
-          : "Role finished without a structured verdict; captured raw output.",
-      open_questions: [],
-      coverage: [],
-      section_md: answerText.trim() || "_(model produced only reasoning — see the reasoning trace)_",
-      criteria_results: [],
-    };
+    // The model finished without the required tool call. First, try to extract
+    // structured findings from the answer text (text-mode path or accidental JSON).
+    const extracted = extractFindingsFromText(answerText);
+    if (extracted) {
+      captured = extracted;
+      // Not a fallback — the model did produce structured output, just via text.
+      fallback = false;
+    } else {
+      // True fallback: salvage the (think-stripped) answer text.
+      fallback = true;
+      const stallReason = stallEverDetected
+        ? `Role repeated itself / narrated tool use without invoking it${
+            stallRetried ? " (even after a direct nudge)" : ""
+          }; captured raw output.`
+        : preemptiveNudged && !stallEverDetected
+          ? "Model produced substantial text without any tool call; captured raw output."
+          : stopReason === "length"
+            ? "Output was truncated (hit the token limit) before the role recorded a verdict."
+            : "Role finished without a structured verdict; captured raw output.";
+
+      const narrationNote = hasNarrationPattern(answerText)
+        ? " (model was still narrating intent to call tools at end of run)"
+        : "";
+
+      captured = {
+        verdict: "needs_more",
+        summary: stallReason + narrationNote,
+        open_questions: [],
+        coverage: [],
+        section_md: answerText.trim() || "_(model produced only reasoning — see the reasoning trace)_",
+        criteria_results: [],
+      };
+    }
   }
 
-  if (fallback || stopReason === "length") {
+  if (fallback || stopReason === "length" || stallEverDetected) {
     console.warn(
-      `[agent] degraded role run: model=${params.modelId} stop=${stopReason ?? "?"} ` +
-        `fallback=${fallback} tokens=${tokens} answer_chars=${answerText.length} thinking_chars=${thinkingText.length}`,
+      `[agent] role run: model=${params.modelId} stop=${stopReason ?? "?"} ` +
+        `fallback=${fallback} stalled=${stallEverDetected} retried=${stallRetried} textMode=${textMode} ` +
+        `tokens=${tokens} answer_chars=${answerText.length} thinking_chars=${thinkingText.length}`,
     );
   }
 
@@ -430,6 +772,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     tokens,
     model: params.modelId,
     fallback,
+    stalled: stallEverDetected,
     stopReason,
     thinkingText,
   };

@@ -65,6 +65,7 @@ function taskDetail(taskId: string) {
   const flow = flowForIntake((task.intake_kind as IntakeKind) || "manual");
   return {
     task,
+    recap_md: task.recap_md ?? null,
     plan,
     coverage,
     runs,
@@ -146,6 +147,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         reasoning: resolved.reasoning,
         thinkingLevel: resolved.thinkingLevel,
         thinkingFormat: resolved.thinkingFormat,
+        textMode: resolved.textMode,
         has_api_key: !!resolved.apiKey,
       },
       env_overrides: {
@@ -167,6 +169,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       reasoning?: boolean;
       thinking_level?: string;
       thinking_format?: string;
+      text_mode?: boolean;
     };
     if (
       body.thinking_format !== undefined &&
@@ -191,6 +194,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       reasoning: body.reasoning === undefined ? undefined : body.reasoning ? 1 : 0,
       thinking_level: body.thinking_level,
       thinking_format: body.thinking_format,
+      text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
     });
     // Return the same redacted shape as GET.
     const row = getGlobalConfig();
@@ -328,6 +332,27 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
+  // Edit a task's name / content while it is in intake stage.
+  app.patch("/api/tasks/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "task not found");
+    if (task.stage !== "intake") {
+      return bad(reply, 400, "Only intake tasks can be edited. Reset the task to intake first.");
+    }
+    const body = (req.body ?? {}) as { name?: string; content?: string };
+    if (body.name === undefined && body.content === undefined) {
+      return bad(reply, 400, "name or content is required");
+    }
+    const updates: Partial<import("../db.js").TaskRow> = {};
+    if (body.name !== undefined) updates.name = body.name;
+    if (body.content !== undefined) updates.content = body.content;
+    const updated = updateTask(taskId, updates);
+    if (!updated) return bad(reply, 500, "update failed");
+    // Refresh the full detail view
+    return taskDetail(taskId);
+  });
+
   // Reset a task to intake state — clears all history, moves back to intake.
   app.post("/api/tasks/:id/reset", async (req: FastifyRequest, reply: FastifyReply) => {
     const taskId = (req.params as { id: string }).id;
@@ -380,6 +405,27 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       intake_kind: body.intake_kind ?? "manual",
     });
     return { task };
+  });
+
+  // ---- Subtasks (create child tasks from next-step actions) ----
+  app.post("/api/tasks/:id/subtasks", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const parent = getTask(taskId);
+    if (!parent) return bad(reply, 404, "task not found");
+    const body = (req.body ?? {}) as { name?: string; content?: string };
+    if (!body.name) return bad(reply, 400, "name is required");
+    const child = createTask({
+      name: body.name,
+      content: body.content ?? body.name,
+      project_id: parent.project_id,
+      stage: "intake",
+      level: "task",
+      intake_kind: parent.intake_kind ?? "manual",
+      exit_kind: parent.exit_kind ?? "spec",
+      parent_task_id: parent.task_id,
+      task_type: "child",
+    });
+    return { task: child };
   });
 
   // ---- Interventions (steering) ----

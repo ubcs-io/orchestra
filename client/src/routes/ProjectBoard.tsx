@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, STAGES, type Plan, type Task } from "../api";
@@ -39,6 +39,16 @@ export function ProjectBoard() {
   const [content, setContent] = useState("");
   const [name, setName] = useState("");
   const [kind, setKind] = useState("manual");
+
+  // Scheduler state for the intake column banner
+  const [schedulerRunning, setSchedulerRunning] = useState(true);
+  useEffect(() => {
+    api.scheduler().then((s) => setSchedulerRunning(s.running)).catch(() => {});
+    const iv = setInterval(() => {
+      api.scheduler().then((s) => setSchedulerRunning(s.running)).catch(() => {});
+    }, 5000);
+    return () => clearInterval(iv);
+  }, []);
 
   const submit = useMutation({
     mutationFn: () => api.intake(pid, { name: name || "intake", content, intake_kind: kind }),
@@ -89,7 +99,14 @@ export function ProjectBoard() {
       <div className="kanban">
         {STAGES.map((stage) => (
           <div className="col" key={stage}>
-            <h3>{stage} ({byStage(stage).length})</h3>
+            <h3>
+              {stage} ({byStage(stage).length})
+              {stage === "intake" && !schedulerRunning && (
+                <span className="banner stopped" style={{ display: "block", marginTop: 4, fontSize: 12, fontWeight: 400, color: "var(--brass)" }}>
+                  ⏸ Stopped
+                </span>
+              )}
+            </h3>
             <div className="cards">
               {byStage(stage).map((t) => <TaskCard key={t.task_id} task={t} />)}
             </div>

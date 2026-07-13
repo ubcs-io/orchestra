@@ -47,11 +47,11 @@ export function Settings() {
         <ConnectionCard data={data} />
       )}
 
-      <SafetyDashboard />
-
       <button className="ghost" disabled title="Multiple connections are coming — the layout is already built for them.">
         + Add connection (coming soon)
       </button>
+
+      <SafetyDashboard />
     </div>
   );
 }
@@ -75,6 +75,9 @@ function ConnectionCard({ data }: { data: ConfigResponse }) {
   const [thinkingFormat, setThinkingFormat] = useState(
     cfg.thinking_format ?? data.resolved.thinkingFormat,
   );
+  const [textMode, setTextMode] = useState(
+    cfg.text_mode == null ? data.resolved.textMode : cfg.text_mode === 1,
+  );
   const [advanced, setAdvanced] = useState(false);
 
   // The API key is write-only from the client's view: we know only whether one
@@ -94,6 +97,7 @@ function ConnectionCard({ data }: { data: ConfigResponse }) {
         reasoning,
         thinking_level: thinkingLevel,
         thinking_format: thinkingFormat,
+        text_mode: textMode,
         // Only send the key when the user actually typed into the field.
         ...(apiKeyTouched ? { api_key: apiKey } : {}),
       }),
@@ -162,12 +166,12 @@ function ConnectionCard({ data }: { data: ConfigResponse }) {
       <label>Default model</label>
       <input value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} placeholder="llama-serve" />
 
-      <label style={{ marginTop: 10 }}>
+      <label style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
         <input
           type="checkbox"
           checked={reasoning}
           onChange={(e) => setReasoning(e.target.checked)}
-          style={{ marginRight: 6 }}
+          style={{ width: "auto", margin: 0 }}
         />
         Reasoning model (DeepSeek-R1 / QwQ style)
       </label>
@@ -197,6 +201,21 @@ function ConnectionCard({ data }: { data: ConfigResponse }) {
           </p>
         </>
       )}
+
+      <label style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
+        <input
+          type="checkbox"
+          checked={textMode}
+          onChange={(e) => setTextMode(e.target.checked)}
+          style={{ width: "auto", margin: 0 }}
+        />
+        Text mode — no native function calling
+      </label>
+      <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
+        When enabled, the model outputs findings as a JSON code block in plain text instead of using{" "}
+        <code>record_findings</code> as a function call. Use this for models whose function-calling is
+        unreliable (e.g. small MoE models, heavy quantization, or older llama.cpp builds).
+      </p>
 
       <button className="small" style={{ marginTop: 10 }} onClick={() => setAdvanced((a) => !a)}>
         {advanced ? "▾" : "▸"} Advanced (context window, max tokens, timeout)
@@ -326,20 +345,24 @@ function SafetyDashboard() {
         suggestions.
       </p>
 
-      {/* A: Agent Tool Boundaries */}
-      <ToolBoundaries data={data} />
+      <div className="safety-grid">
+        {/* A: Agent Tool Boundaries */}
+        <ToolBoundaries data={data} />
 
-      {/* B: Configurable Limits */}
-      <LimitsCard data={data} />
+        {/* B: Configurable Limits */}
+        <LimitsCard data={data} />
 
-      {/* C: Gate & Review Controls */}
-      <GatesCard data={data} />
+        {/* C: Gate & Review Controls */}
+        <GatesCard data={data} />
 
-      {/* D: Role Summary */}
-      <RolesSummary data={data} />
+        {/* D: Role Summary */}
+        <RolesSummary data={data} />
 
-      {/* E: Security Posture */}
-      <SecurityPosture data={data} />
+        {/* E: Security Posture */}
+        <div className="full-width">
+          <SecurityPosture data={data} />
+        </div>
+      </div>
     </div>
   );
 }
@@ -355,7 +378,7 @@ function ToolBoundaries({ data }: { data: SafetyResponse }) {
   ];
 
   return (
-    <div className="panel" style={{ marginBottom: 12 }}>
+    <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Agent Tool Boundaries</strong>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {items.map((it) => (
@@ -385,7 +408,7 @@ function LimitsCard({ data }: { data: SafetyResponse }) {
   });
 
   return (
-    <div className="panel" style={{ marginBottom: 12 }}>
+    <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Configurable Limits</strong>
 
       <div className="field-grid" style={{ marginBottom: 10 }}>
@@ -432,7 +455,7 @@ function GatesCard({ data }: { data: SafetyResponse }) {
   if (!entries.length) return null;
 
   return (
-    <div className="panel" style={{ marginBottom: 12 }}>
+    <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Gate & Review Controls</strong>
       <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
         Counter-reviewers verify prior role output against acceptance criteria. Unmet "must" criteria trigger
@@ -472,7 +495,7 @@ function GatesCard({ data }: { data: SafetyResponse }) {
 function RolesSummary({ data }: { data: SafetyResponse }) {
   const s = data.roles_summary;
   return (
-    <div className="panel" style={{ marginBottom: 12 }}>
+    <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Role Summary</strong>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
         <SummaryBadge label="Total roles" value={s.total_roles} />
@@ -510,7 +533,7 @@ function SecurityPosture({ data }: { data: SafetyResponse }) {
   const st = data.storage;
 
   return (
-    <div className="panel" style={{ marginBottom: 12 }}>
+    <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Security Posture</strong>
       <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
         <div className="row" style={{ justifyContent: "flex-start", gap: 8 }}>
