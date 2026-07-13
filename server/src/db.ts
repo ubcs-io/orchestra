@@ -28,6 +28,14 @@ export function getDb(): DB {
   return db;
 }
 
+/** Close and drop the cached connection. Mainly for tests (fresh temp DBs). */
+export function closeDb(): void {
+  if (db) {
+    db.close();
+    db = undefined;
+  }
+}
+
 function now(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
@@ -98,6 +106,23 @@ export function initDb(): void {
       updated_at    TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS configs (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id         INTEGER,
+      key                TEXT NOT NULL DEFAULT 'default',
+      name               TEXT,
+      base_url           TEXT,
+      api_key            TEXT,
+      api                TEXT,
+      default_model      TEXT,
+      context_window     INTEGER,
+      max_tokens         INTEGER,
+      request_timeout_ms INTEGER,
+      extra_json         TEXT,
+      created_at         TEXT,
+      updated_at         TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS role_runs (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       task_id         TEXT,
@@ -142,12 +167,16 @@ export function initDb(): void {
   ];
   for (const [col, ddl] of taskCols) addColumnIfMissing(d, "tasks", col, ddl);
 
+  // Counter-reviewer output: per-criterion { id, status, note } judgements.
+  addColumnIfMissing(d, "role_runs", "criteria_results_json", "criteria_results_json TEXT");
+
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_stage   ON tasks(stage);
     CREATE INDEX IF NOT EXISTS idx_role_runs_task ON role_runs(task_id);
     CREATE INDEX IF NOT EXISTS idx_interventions_task ON interventions(task_id);
     CREATE INDEX IF NOT EXISTS idx_roles_project ON roles(project_id);
+    CREATE INDEX IF NOT EXISTS idx_configs_project ON configs(project_id);
   `);
 }
 
@@ -212,6 +241,29 @@ export interface TaskRow {
   updated_at: string;
 }
 
+/**
+ * A named connection/provider profile. `project_id IS NULL, key='default'` is the
+ * global template; project rows (same key) override it. Endpoint + auth + model
+ * params live here so they can be edited at runtime and inherited per project,
+ * mirroring how `roles` layers globals under project overrides.
+ */
+export interface ConfigRow {
+  id: number;
+  project_id: number | null;
+  key: string;
+  name: string | null;
+  base_url: string | null;
+  api_key: string | null;
+  api: string | null;
+  default_model: string | null;
+  context_window: number | null;
+  max_tokens: number | null;
+  request_timeout_ms: number | null;
+  extra_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface RoleRunRow {
   id: number;
   task_id: string;
@@ -220,6 +272,7 @@ export interface RoleRunRow {
   summary: string | null;
   output_md: string | null;
   coverage_json: string | null;
+  criteria_results_json: string | null;
   tool_calls_json: string | null;
   transcript_jsonl: string | null;
   depth: number;
@@ -402,6 +455,88 @@ export function countGlobalRoles(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Configs (connection / provider profiles)
+// ---------------------------------------------------------------------------
+
+/** The global default profile (`project_id IS NULL, key='default'`), if seeded. */
+export function getGlobalConfig(): ConfigRow | undefined {
+  return getDb()
+    .prepare(`SELECT * FROM configs WHERE project_id IS NULL AND key = 'default'`)
+    .get() as ConfigRow | undefined;
+}
+
+/** A project's override profile for `key` (default 'default'), if any. */
+export function getProjectConfig(projectId: number, key = "default"): ConfigRow | undefined {
+  return getDb()
+    .prepare(`SELECT * FROM configs WHERE project_id = ? AND key = ?`)
+    .get(projectId, key) as ConfigRow | undefined;
+}
+
+/**
+ * Insert or update a config profile identified by (project_id, key). Only the
+ * fields present in `input` are written; omitted fields keep their prior value,
+ * so a PATCH of just base_url/api_key leaves the model params untouched.
+ */
+export function upsertConfig(input: {
+  project_id: number | null;
+  key?: string;
+  name?: string | null;
+  base_url?: string | null;
+  api_key?: string | null;
+  api?: string | null;
+  default_model?: string | null;
+  context_window?: number | null;
+  max_tokens?: number | null;
+  request_timeout_ms?: number | null;
+  extra_json?: string | null;
+}): ConfigRow {
+  const d = getDb();
+  const ts = now();
+  const key = input.key ?? "default";
+  const existing = d
+    .prepare(
+      `SELECT * FROM configs WHERE key = ? AND ${input.project_id == null ? "project_id IS NULL" : "project_id = ?"}`,
+    )
+    .get(...(input.project_id == null ? [key] : [key, input.project_id])) as ConfigRow | undefined;
+
+  // PATCH semantics: `undefined` field = keep prior value, explicit `null` =
+  // clear it. (Plain `??` can't tell the two apart, which matters for api_key.)
+  const base: Partial<ConfigRow> = existing ?? {};
+  const keep = <T>(next: T | null | undefined, prior: T | null | undefined): T | null =>
+    next !== undefined ? (next as T | null) : (prior ?? null);
+  const merged = {
+    name: keep(input.name, base.name),
+    base_url: keep(input.base_url, base.base_url),
+    api_key: keep(input.api_key, base.api_key),
+    api: keep(input.api, base.api),
+    default_model: keep(input.default_model, base.default_model),
+    context_window: keep(input.context_window, base.context_window),
+    max_tokens: keep(input.max_tokens, base.max_tokens),
+    request_timeout_ms: keep(input.request_timeout_ms, base.request_timeout_ms),
+    extra_json: keep(input.extra_json, base.extra_json),
+  };
+
+  if (existing) {
+    d.prepare(
+      `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
+        default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
+        request_timeout_ms=@request_timeout_ms, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
+    ).run({ ...merged, id: existing.id, ts });
+    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
+  }
+
+  const info = d
+    .prepare(
+      `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
+         context_window, max_tokens, request_timeout_ms, extra_json, created_at, updated_at)
+       VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
+         @context_window, @max_tokens, @request_timeout_ms, @extra_json, @ts, @ts)`,
+    )
+    .run({ ...merged, project_id: input.project_id, key, ts });
+  return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
+}
+
+// ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
 
@@ -550,6 +685,7 @@ export function createRoleRun(input: {
   summary?: string | null;
   output_md?: string | null;
   coverage_json?: string | null;
+  criteria_results_json?: string | null;
   tool_calls_json?: string | null;
   transcript_jsonl?: string | null;
   depth?: number;
@@ -561,9 +697,9 @@ export function createRoleRun(input: {
   const info = d
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
-         tool_calls_json, transcript_jsonl, depth, model, tokens, created_at)
+         criteria_results_json, tool_calls_json, transcript_jsonl, depth, model, tokens, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
-         @tool_calls_json, @transcript_jsonl, @depth, @model, @tokens, @ts)`,
+         @criteria_results_json, @tool_calls_json, @transcript_jsonl, @depth, @model, @tokens, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -572,6 +708,7 @@ export function createRoleRun(input: {
       summary: input.summary ?? null,
       output_md: input.output_md ?? null,
       coverage_json: input.coverage_json ?? null,
+      criteria_results_json: input.criteria_results_json ?? null,
       tool_calls_json: input.tool_calls_json ?? null,
       transcript_jsonl: input.transcript_jsonl ?? null,
       depth: input.depth ?? 1,

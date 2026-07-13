@@ -58,6 +58,46 @@ export interface Intervention {
   created_at: string;
 }
 
+/** A connection/provider profile. The API key is never sent to the client. */
+export interface ConnectionConfig {
+  id: number;
+  project_id: number | null;
+  key: string;
+  name: string | null;
+  base_url: string | null;
+  api: string | null;
+  default_model: string | null;
+  context_window: number | null;
+  max_tokens: number | null;
+  request_timeout_ms: number | null;
+  has_api_key: boolean;
+}
+
+export interface ConfigResponse {
+  config: ConnectionConfig;
+  resolved: {
+    baseUrl: string;
+    api: string;
+    defaultModelId: string;
+    contextWindow: number;
+    maxTokens: number;
+    requestTimeoutMs: number;
+    has_api_key: boolean;
+  };
+  env_overrides: { base_url: boolean; api_key: boolean };
+}
+
+/** Fields a PATCH may set. `api_key: ""` clears the stored key; omit to keep it. */
+export interface ConfigPatch {
+  name?: string;
+  base_url?: string;
+  api_key?: string;
+  default_model?: string;
+  context_window?: number;
+  max_tokens?: number;
+  request_timeout_ms?: number;
+}
+
 export type CoverageMap = Record<string, { status: string; note?: string }>;
 
 export interface PlanStep {
@@ -94,6 +134,10 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
 export const api = {
   health: () => req<{ ok: boolean }>("/api/health"),
   models: () => req<{ models: string[] }>("/api/models"),
+
+  config: () => req<ConfigResponse>("/api/config"),
+  saveConfig: (body: ConfigPatch) =>
+    req<{ config: ConnectionConfig }>("/api/config", { method: "PATCH", body: JSON.stringify(body) }),
 
   scheduler: () => req<{ running: boolean }>("/api/scheduler"),
   startScheduler: () => req<{ running: boolean }>("/api/scheduler/start", { method: "POST" }),

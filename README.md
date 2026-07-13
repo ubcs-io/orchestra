@@ -44,6 +44,8 @@ State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirro
 
 Requires **Node 20+** and a git repo to point at. An OpenAI-compatible LLM endpoint (Ollama, LM Studio, vLLM, OpenWebUI, …) is needed for roles to actually run.
 
+The repo path you provide when registering a project must be an **absolute path** to a git repository. You can give the repository root, any subdirectory inside it, or even the `.git` directory itself — Orchestra resolves it to the canonical working-tree root automatically.
+
 ```bash
 npm install                          # installs the server + client workspaces
 cp config.example.json config.json   # then set providerBaseUrl / apiKey / defaultModelId

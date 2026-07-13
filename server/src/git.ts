@@ -6,23 +6,94 @@
  * All writes are sandboxed to `<repo>/<planningDir>`.
  */
 
-import { execFileSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
 export const STAGE_DIRS = ["INTAKE", "REFINING", "READY", "REVIEW", "epics"] as const;
 export type StageDir = (typeof STAGE_DIRS)[number];
 
+/**
+ * Run a git command. Uses `execSync` (shell) instead of `execFileSync` so
+ * PATH resolution works correctly regardless of the Node process's execution
+ * context (e.g. macOS IDE-launched processes with sanitized environments).
+ */
 function git(repoPath: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: repoPath, encoding: "utf8" }).trim();
+  const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const cmd = `cd ${q(repoPath)} && git ${args.map(q).join(" ")}`;
+  return execSync(cmd, { encoding: "utf8" }).trim();
 }
 
-export function isGitRepo(repoPath: string): boolean {
+export interface GitRepoResult {
+  canonicalRoot: string;
+}
+
+/**
+ * Check whether `repoPath` is inside a git work tree and return the canonical
+ * repository root (from `git rev-parse --show-toplevel`).  Works from any path
+ * within the repo — the root, a subdirectory, a tracked file, or even inside
+ * `.git` itself.
+ *
+ * Throws with a message that names the specific failure — the path does not
+ * exist, git is not on PATH, or the path is not tracked by git — rather than
+ * collapsing every case into a raw `git rev-parse` error, so callers can tell
+ * a typo apart from a missing git binary.
+ */
+export function isGitRepo(repoPath: string): GitRepoResult {
+  // Confirm the path exists before shelling out; otherwise git's own error
+  // ("cd: no such file or directory") masks a simple typo or bad path.
+  let stat: fs.Stats;
   try {
-    return git(repoPath, ["rev-parse", "--is-inside-work-tree"]) === "true";
-  } catch {
-    return false;
+    stat = fs.statSync(repoPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new Error(
+        `permission denied reading "${repoPath}" (${code}) — the server process cannot access this path`,
+      );
+    }
+    // ENOENT (and anything else): the server can't see this path. Include the
+    // errno so a container/remote/wrong-user mismatch is diagnosable rather
+    // than looking like a plain typo.
+    throw new Error(
+      `path not found by the server: "${repoPath}" (${code ?? "unknown error"}) — ` +
+        `supply an absolute path to the repository root as the SERVER sees it. ` +
+        `If the server runs in a container, over SSH, or on a different host/user than the repo, that path may not exist there.`,
+    );
   }
+  // Accept a file (e.g. a path into .git/) by starting from its directory.
+  const start = stat.isDirectory() ? repoPath : path.dirname(repoPath);
+
+  let lastErr: unknown;
+  // Strategy 1: --show-toplevel (works from root or any subdirectory).
+  try {
+    return { canonicalRoot: git(start, ["rev-parse", "--show-toplevel"]) };
+  } catch (err) {
+    lastErr = err;
+  }
+  // Strategy 2: --show-toplevel fails when CWD is .git/ itself.
+  // Resolve the work tree by going up from the git dir.
+  try {
+    const gitDir = git(start, ["rev-parse", "--git-dir"]);
+    const resolvedGitDir = path.resolve(start, gitDir);
+    const workTree = path.dirname(resolvedGitDir);
+    return { canonicalRoot: git(workTree, ["rev-parse", "--show-toplevel"]) };
+  } catch (err) {
+    lastErr = err;
+  }
+
+  // Both strategies failed. Distinguish "git binary missing" (common when the
+  // server is launched from an IDE with a sanitized PATH) from "valid path,
+  // just not a git repo".
+  const detail = (lastErr as Error).message ?? "";
+  if (/(?:git:?\s*)?command not found|\bENOENT\b/i.test(detail) && !/not a git repository/i.test(detail)) {
+    throw new Error(
+      `git executable not found on PATH — install git or make it available to the server process`,
+    );
+  }
+  throw new Error(
+    `not a git repository: "${repoPath}" — point at a folder tracked by git (the repo root, a subdirectory, or its .git directory)`,
+  );
 }
 
 export function planningRoot(repoPath: string, planningDir = "PLANNING"): string {

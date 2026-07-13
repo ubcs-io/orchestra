@@ -93,3 +93,12 @@ header.topbar .spacer { flex: 1; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 .empty { color: var(--ink-dim); padding: 20px; text-align: center; }
+
+/* Settings */
+.settings { max-width: 760px; }
+.settings code { background: #0f1216; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+.field-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 14px; }
+button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
+.model-list { max-height: 220px; overflow: auto; margin-top: 8px; padding: 6px; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; display: flex; flex-direction: column; gap: 2px; }
+.model-list .model { display: flex; justify-content: space-between; align-items: center; padding: 3px 6px; border-radius: 3px; font-size: 12px; }
+.model-list .model:hover { background: var(--panel-2); }

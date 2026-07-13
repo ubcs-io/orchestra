@@ -10,6 +10,7 @@
 
 import path from "node:path";
 import {
+  createIntervention,
   createRoleRun,
   createTask,
   getProject,
@@ -42,25 +43,57 @@ import {
 import {
   CONCERN_TAXONOMY,
   EXIT_KIND_BY_INTAKE,
-  ROUTING_TEMPLATES,
+  flowForIntake,
   TERMINAL_ROLE,
   type ExitKind,
+  type FlowTemplate,
   type IntakeKind,
 } from "./roles.js";
-import { runRole, type CoverageItem, type CoverageStatus } from "./agent.js";
+import {
+  runRole as defaultRunRole,
+  type CoverageItem,
+  type CoverageStatus,
+  type CriteriaResult,
+  type RoleRunResult,
+  type RunRoleParams,
+} from "./agent.js";
 import { getConfig } from "./config.js";
+import { resolveConnection } from "./settings.js";
+
+// ---------------------------------------------------------------------------
+// Role runner seam — injectable so the loop can be tested without a live LLM.
+// ---------------------------------------------------------------------------
+
+export type RoleRunner = (params: RunRoleParams) => Promise<RoleRunResult>;
+let roleRunner: RoleRunner = defaultRunRole;
+
+/** Override the role runner (tests inject a deterministic fake). */
+export function setRoleRunner(fn: RoleRunner): void {
+  roleRunner = fn;
+}
+/** Restore the real pi-backed runner. */
+export function resetRoleRunner(): void {
+  roleRunner = defaultRunRole;
+}
 
 // ---------------------------------------------------------------------------
 // Plan representation (stored in tasks.refinement_plan_json)
 // ---------------------------------------------------------------------------
 
-interface PlanStep {
+export interface PlanStep {
   role: string;
   status: "pending" | "done" | "skipped";
   depth: number;
+  /** Loop-back attempts spent on this step (reviewer steps only). */
+  attempts?: number;
 }
-interface RefinementPlan {
+export interface RefinementPlan {
   steps: PlanStep[];
+}
+
+/** Resolve the flow template for a task from its intake kind. */
+function flowForTask(task: TaskRow): FlowTemplate {
+  return flowForIntake((task.intake_kind as IntakeKind) || "manual");
 }
 
 function readPlan(task: TaskRow): RefinementPlan | null {
@@ -72,13 +105,44 @@ function readPlan(task: TaskRow): RefinementPlan | null {
   }
 }
 
-function planFromTemplate(kind: IntakeKind): RefinementPlan {
-  const roles = ROUTING_TEMPLATES[kind] ?? ROUTING_TEMPLATES.manual;
+export function planFromTemplate(kind: IntakeKind): RefinementPlan {
+  const roles = flowForIntake(kind).steps;
   return { steps: roles.map((role) => ({ role, status: "pending", depth: 1 })) };
 }
 
-function nextPending(plan: RefinementPlan): PlanStep | undefined {
+export function nextPending(plan: RefinementPlan): PlanStep | undefined {
   return plan.steps.find((s) => s.status === "pending");
+}
+
+/** Pure plan mutation for inject/rerun/deepen interventions (no DB). */
+export function applyPlanMutation(
+  plan: RefinementPlan,
+  kind: string,
+  payload: { role?: string; after?: string },
+  isTerminal: (role: string) => boolean,
+): RefinementPlan {
+  const role = payload.role;
+  if (!role) return plan;
+  if (kind === "inject_role") {
+    const idx = payload.after ? plan.steps.findIndex((s) => s.role === payload.after) : -1;
+    const step: PlanStep = { role, status: "pending", depth: 1 };
+    if (idx >= 0) {
+      plan.steps.splice(idx + 1, 0, step);
+    } else {
+      const termIdx = plan.steps.findIndex((s) => isTerminal(s.role));
+      if (termIdx >= 0) plan.steps.splice(termIdx, 0, step);
+      else plan.steps.push(step);
+    }
+  } else if (kind === "rerun_role" || kind === "deepen") {
+    const last = [...plan.steps].reverse().find((s) => s.role === role);
+    if (last) {
+      last.status = "pending";
+      if (kind === "deepen") last.depth += 1;
+    } else {
+      plan.steps.push({ role, status: "pending", depth: kind === "deepen" ? 2 : 1 });
+    }
+  }
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,17 +160,11 @@ export interface CoverageMap {
   [concern: string]: { status: CoverageStatus | "never"; note?: string };
 }
 
-function rollupCoverage(taskId: string): CoverageMap {
+/** Pure coverage merge with precedence considered > skipped > out_of_scope > never. */
+export function mergeCoverageItems(itemsPerRun: CoverageItem[][]): CoverageMap {
   const map: CoverageMap = {};
   for (const concern of CONCERN_TAXONOMY) map[concern] = { status: "never" };
-  for (const run of listRoleRuns(taskId)) {
-    if (!run.coverage_json) continue;
-    let items: CoverageItem[] = [];
-    try {
-      items = JSON.parse(run.coverage_json) as CoverageItem[];
-    } catch {
-      continue;
-    }
+  for (const items of itemsPerRun) {
     for (const it of items) {
       const key = it.concern.toLowerCase();
       const current = map[key]?.status ?? "never";
@@ -118,12 +176,31 @@ function rollupCoverage(taskId: string): CoverageMap {
   return map;
 }
 
+function rollupCoverage(taskId: string): CoverageMap {
+  const itemsPerRun: CoverageItem[][] = [];
+  for (const run of listRoleRuns(taskId)) {
+    if (!run.coverage_json) continue;
+    try {
+      itemsPerRun.push(JSON.parse(run.coverage_json) as CoverageItem[]);
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return mergeCoverageItems(itemsPerRun);
+}
+
 // ---------------------------------------------------------------------------
 // Ingest
 // ---------------------------------------------------------------------------
 
-function inferIntakeKind(fileName: string, content: string): IntakeKind {
+export function inferIntakeKind(fileName: string, content: string): IntakeKind {
   const lower = fileName.toLowerCase();
+  const looksSecurity =
+    /(^|[^a-z])security([^a-z]|$)/i.test(lower) ||
+    /\b(vulnerabilit(y|ies)|CVE-\d{4}|exploit|XSS|CSRF|SSRF|\bRCE\b|SQL injection|auth(entication|orization)? bypass|security advisory)\b/i.test(
+      content,
+    );
+  if (looksSecurity) return "security";
   const looksLikeTrace =
     /\.log$/.test(lower) ||
     /traceback|exception|stack trace|\bat .+\(.+:\d+\)|Error:/i.test(content);
@@ -211,29 +288,9 @@ function consumeInterventions(task: TaskRow, plan: RefinementPlan): { plan: Refi
         updateTask(task.task_id, { paused: 0 });
         break;
       case "inject_role":
-        if (p.role) {
-          const idx = p.after ? plan.steps.findIndex((s) => s.role === p.after) : -1;
-          const step: PlanStep = { role: p.role, status: "pending", depth: 1 };
-          if (idx >= 0) plan.steps.splice(idx + 1, 0, step);
-          else {
-            // insert before the terminal role if present, else append
-            const termIdx = plan.steps.findIndex((s) => isTerminalRole(task, s.role));
-            if (termIdx >= 0) plan.steps.splice(termIdx, 0, step);
-            else plan.steps.push(step);
-          }
-        }
-        break;
       case "rerun_role":
       case "deepen":
-        if (p.role) {
-          const last = [...plan.steps].reverse().find((s) => s.role === p.role);
-          if (last) {
-            last.status = "pending";
-            if (iv.kind === "deepen") last.depth += 1;
-          } else {
-            plan.steps.push({ role: p.role, status: "pending", depth: iv.kind === "deepen" ? 2 : 1 });
-          }
-        }
+        applyPlanMutation(plan, iv.kind, p, (r) => isTerminalRole(task, r));
         break;
       case "promote_role":
         if (p.role && task.project_id != null) promoteRole(task, p.role);
@@ -320,6 +377,20 @@ function buildRoleContext(task: TaskRow, roleKey: string): string {
     for (const n of notes) parts.push(`- ${n}`);
   }
 
+  // Counter-reviewer: hand it the acceptance checklist it must verify.
+  const flow = flowForTask(task);
+  if (roleKey === flow.reviewerRole && flow.criteria.length) {
+    parts.push(
+      `\n## Acceptance criteria to verify\nVerify each criterion against the findings above and the real code, then return one \`criteria_results\` entry per id (status met/partial/unmet). Set verdict "needs_more" if any **must** criterion is not fully met.`,
+    );
+    for (const c of flow.criteria) {
+      parts.push(`- [${c.severity}] \`${c.id}\` — ${c.text}`);
+    }
+    if (flow.mandatoryConcerns.length) {
+      parts.push(`\nThese concerns MUST be covered before this is ready: ${flow.mandatoryConcerns.join(", ")}.`);
+    }
+  }
+
   parts.push(
     `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, and finish by calling record_findings.`,
   );
@@ -331,7 +402,7 @@ function buildRoleContext(task: TaskRow, roleKey: string): string {
 // ---------------------------------------------------------------------------
 
 async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, plan: RefinementPlan): Promise<void> {
-  const cfg = getConfig();
+  const conn = resolveConnection(project.id);
   const planningDir = project.planning_dir || "PLANNING";
   const role = getRole(project.id, step.role) ?? getRole(null, step.role);
   if (!role || !role.system_prompt) {
@@ -342,7 +413,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   }
 
   const tools: string[] = role.tools_json ? (JSON.parse(role.tools_json) as string[]) : [];
-  const modelId = role.model || task.model || project.default_model || cfg.defaultModelId;
+  const modelId = role.model || task.model || project.default_model || conn.defaultModelId;
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const absArtifact = path.join(project.repo_path, relArtifact);
 
@@ -350,7 +421,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   let result;
   try {
-    result = await runRole({
+    result = await roleRunner({
       repoPath: project.repo_path,
       planningDir,
       artifactAbsPath: absArtifact,
@@ -393,6 +464,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     summary: findings.summary,
     output_md: findings.section_md,
     coverage_json: JSON.stringify(findings.coverage),
+    criteria_results_json: JSON.stringify(findings.criteria_results ?? []),
     tool_calls_json: JSON.stringify(result.toolCalls),
     transcript_jsonl: result.transcriptJsonl,
     depth: step.depth,
@@ -415,7 +487,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   publish(task.task_id, "role_end", { role: step.role, verdict: findings.verdict });
 
   // Gate.
-  applyGate(task, project, plan, step, findings.verdict, coverage);
+  applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? []);
 }
 
 function applyGate(
@@ -425,6 +497,7 @@ function applyGate(
   step: PlanStep,
   verdict: string,
   coverage: CoverageMap,
+  criteriaResults: CriteriaResult[] = [],
 ): void {
   const planningDir = project.planning_dir || "PLANNING";
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
@@ -453,6 +526,69 @@ function applyGate(
   if (verdict === "blocker") {
     escalate(`Role ${step.role} reported a blocker.`);
     return;
+  }
+
+  // Counter-reviewer gate: verify prior output against the flow's acceptance
+  // criteria. On failure, re-route (bounded loop-back) to the responsible roles;
+  // once loop-backs are exhausted, escalate to a human.
+  const flow = flowForTask(task);
+  if (step.role === flow.reviewerRole) {
+    const statusById = new Map(criteriaResults.map((r) => [r.id, r.status]));
+    const unmetMust = flow.criteria.filter(
+      (c) => c.severity === "must" && (statusById.get(c.id) ?? "unmet") !== "met",
+    );
+    const missingConcerns = flow.mandatoryConcerns.filter(
+      (cc) => (coverage[cc]?.status ?? "never") !== "considered",
+    );
+    const failed = verdict === "needs_more" || unmetMust.length > 0 || missingConcerns.length > 0;
+
+    if (failed) {
+      const attempts = step.attempts ?? 0;
+      if (attempts < flow.maxLoopbacks) {
+        // Re-open the owners of the unmet criteria (or every producer the reviewer
+        // gates, if the reviewer gave no per-criterion detail) plus the reviewer.
+        const owners = unmetMust.length
+          ? new Set(unmetMust.map((c) => c.ownerRole))
+          : new Set(flow.criteria.map((c) => c.ownerRole));
+        for (const s of plan.steps) {
+          if (owners.has(s.role)) s.status = "pending";
+        }
+        step.status = "pending";
+        step.attempts = attempts + 1;
+
+        // Feed the specific gaps back to the re-run roles via the steering channel.
+        const gaps = [
+          ...unmetMust.map((c) => `Unmet (${c.id}): ${c.text}`),
+          ...missingConcerns.map((cc) => `Concern not yet covered: ${cc}`),
+        ];
+        if (gaps.length) {
+          createIntervention({
+            task_id: task.task_id,
+            kind: "steer_note",
+            payload_json: JSON.stringify({
+              text: `[${flow.reviewerRole} · attempt ${attempts + 1}] Address before re-review:\n- ${gaps.join("\n- ")}`,
+            }),
+            created_by: "orchestrator",
+          });
+        }
+
+        updateTask(task.task_id, {
+          refinement_plan_json: JSON.stringify(plan),
+          coverage_json: coverageJson,
+          stage: "refining",
+        });
+        publish(task.task_id, "task_update", { stage: "refining", loopback: attempts + 1 });
+        return;
+      }
+      // Loop-backs exhausted → human review.
+      const reason =
+        `Acceptance review incomplete after ${flow.maxLoopbacks} loop-back(s).` +
+        (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => c.id).join(", ")}.` : "") +
+        (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
+      escalate(reason);
+      return;
+    }
+    // Review passed → fall through to the forward/terminal logic below.
   }
 
   // Terminal role finished cleanly → ready.
@@ -484,23 +620,30 @@ function applyGate(
   publish(task.task_id, "task_update", { stage: "refining" });
 }
 
-/** Parse the decomposition role's section for [epic]/[story]/[task] and create child tasks. */
+/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets. */
+export function parseDecompositionTree(md: string): Array<{ level: string; name: string }> {
+  const re = /\[(epic|story|task)\]\s*(.+)/gi;
+  const out: Array<{ level: string; name: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(md)) !== null) {
+    out.push({ level: m[1]!.toLowerCase(), name: m[2]!.trim().slice(0, 120) });
+  }
+  return out;
+}
+
+/** Parse the decomposition role's section and create child tasks. */
 function createDecompositionChildren(task: TaskRow): void {
   const runs = listRoleRuns(task.task_id);
   const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
   if (!decomp?.output_md) return;
-  const re = /\[(epic|story|task)\]\s*(.+)/gi;
-  let m: RegExpExecArray | null;
   let step = 0;
-  while ((m = re.exec(decomp.output_md)) !== null) {
-    const level = m[1]!.toLowerCase();
-    const name = m[2]!.trim().slice(0, 120);
+  for (const node of parseDecompositionTree(decomp.output_md)) {
     createTask({
-      name,
+      name: node.name,
       content: null,
       project_id: task.project_id,
       stage: "ready",
-      level,
+      level: node.level,
       intake_kind: task.intake_kind ?? "manual",
       exit_kind: task.exit_kind ?? "spec",
       parent_task_id: task.task_id,
