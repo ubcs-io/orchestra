@@ -284,6 +284,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       system_prompt: body.system_prompt as string | undefined,
       tools_json: body.tools_json as string | undefined,
       model: body.model as string | undefined,
+      can_create_subtasks: body.can_create_subtasks as boolean | undefined,
     });
     return { role };
   });
