@@ -62,6 +62,7 @@ export function TaskDetail() {
   const [roleInput, setRoleInput] = useState("");
   const [afterInput, setAfterInput] = useState("");
   const [noteInput, setNoteInput] = useState("");
+  const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
 
   const intervene = useMutation({
     mutationFn: ({ kind, payload }: { kind: string; payload?: unknown }) => api.intervene(taskId, kind, payload),
@@ -106,28 +107,91 @@ export function TaskDetail() {
             <h2>Refinement plan</h2>
             <div className="row">
               {d.plan?.steps.map((s, i) => (
-                <span key={i} className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}>
+                <a
+                  key={i}
+                  href={`#run-${s.role}`}
+                  className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    const el = document.getElementById(`run-${s.role}`);
+                    if (el) {
+                      el.scrollIntoView({ behavior: "smooth", block: "start" });
+                      setCollapsedRuns((prev) => {
+                        const run = d.runs.find((r) => r.role_key === s.role);
+                        if (run && prev.has(run.id)) {
+                          const next = new Set(prev);
+                          next.delete(run.id);
+                          return next;
+                        }
+                        return prev;
+                      });
+                    }
+                  }}
+                >
                   {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
-                </span>
+                </a>
               )) ?? <span className="muted">Not planned yet.</span>}
             </div>
           </div>
 
-          {d.runs.map((r) => (
-            <div className="panel" key={r.id}>
-              <div className="row">
-                <h2 style={{ margin: 0 }}>{r.role_key}</h2>
-                <span className={`pill ${verdictClass(r.verdict)}`}>{r.verdict ?? "?"}</span>
-                {r.tokens != null && <span className="muted">{r.tokens} tok</span>}
-                {r.depth > 1 && <span className="pill dim">depth {r.depth}</span>}
-                <div style={{ flex: 1 }} />
-                <button className="small" onClick={() => intervene.mutate({ kind: "rerun_role", payload: { role: r.role_key } })}>re-run</button>
-                <button className="small" onClick={() => intervene.mutate({ kind: "deepen", payload: { role: r.role_key } })}>deepen</button>
-              </div>
-              {r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
-              {r.output_md && <div className="section-md">{r.output_md}</div>}
+          {d.runs.length > 0 && (
+            <div className="row" style={{ marginBottom: 8 }}>
+              <button
+                className="small"
+                onClick={() => {
+                  if (collapsedRuns.size === d.runs.length) {
+                    setCollapsedRuns(new Set());
+                  } else {
+                    setCollapsedRuns(new Set(d.runs.map((r) => r.id)));
+                  }
+                }}
+              >
+                {collapsedRuns.size === d.runs.length ? "expand all" : "collapse all"}
+              </button>
             </div>
-          ))}
+          )}
+          {d.runs.map((r) => {
+            const isCollapsed = collapsedRuns.has(r.id);
+            const toggle = () =>
+              setCollapsedRuns((prev) => {
+                const next = new Set(prev);
+                if (next.has(r.id)) next.delete(r.id);
+                else next.add(r.id);
+                return next;
+              });
+            return (
+              <div className="panel" key={r.id} id={`run-${r.role_key}`}>
+                <div className="row collapsible" onClick={toggle}>
+                  <span className="collapse-caret">{isCollapsed ? "▸" : "▾"}</span>
+                  <h2 style={{ margin: 0, cursor: "pointer" }}>{r.role_key}</h2>
+                  <span className={`pill ${verdictClass(r.verdict)}`}>{r.verdict ?? "?"}</span>
+                  {r.tokens != null && <span className="muted">{r.tokens} tok</span>}
+                  {r.depth > 1 && <span className="pill dim">depth {r.depth}</span>}
+                  <div style={{ flex: 1 }} />
+                  <button
+                    className="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      intervene.mutate({ kind: "rerun_role", payload: { role: r.role_key } });
+                    }}
+                  >
+                    re-run
+                  </button>
+                  <button
+                    className="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      intervene.mutate({ kind: "deepen", payload: { role: r.role_key } });
+                    }}
+                  >
+                    deepen
+                  </button>
+                </div>
+                {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
+                {!isCollapsed && r.output_md && <div className="section-md">{r.output_md}</div>}
+              </div>
+            );
+          })}
 
           {d.children.length > 0 && (
             <div className="panel">
