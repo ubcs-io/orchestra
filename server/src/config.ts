@@ -30,6 +30,18 @@ export interface Config {
   /** Per-request timeout (ms) for LLM calls. */
   requestTimeoutMs: number;
 
+  /**
+   * Whether the model is a reasoning model. When true, pi enables a thinking
+   * level and (for `thinkingFormat: "deepseek"`) requests native reasoning — the
+   * endpoint's `reasoning_content` then streams on a separate channel. Leave true
+   * for DeepSeek-R1 / QwQ-style models; set false for plain instruct models.
+   */
+  reasoning: boolean;
+  /** Thinking level passed to pi when `reasoning` is true (off is implied by reasoning:false). */
+  thinkingLevel: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  /** pi reasoning request shape for the OpenAI-compatible endpoint (advanced; config/env only). */
+  thinkingFormat: string;
+
   /** SQLite file (reuses the existing orchestra.db by default). */
   dbPath: string;
 
@@ -52,8 +64,11 @@ const DEFAULTS: Config = {
   apiKey: "",
   defaultModelId: "deepseek-r1:latest",
   contextWindow: 128_000,
-  maxTokens: 8_192,
+  maxTokens: 16_384,
   requestTimeoutMs: 300_000,
+  reasoning: true,
+  thinkingLevel: "medium",
+  thinkingFormat: "deepseek",
   dbPath: path.join(REPO_ROOT, "orchestra.db"),
   schedulerIdleMs: 3_000,
   roleToolBudget: 40,
@@ -82,6 +97,10 @@ function readEnv(): Partial<Config> {
   if (e.ORCHESTRA_DB_PATH) out.dbPath = e.ORCHESTRA_DB_PATH;
   if (e.ORCHESTRA_REQUEST_TIMEOUT_MS) out.requestTimeoutMs = Number(e.ORCHESTRA_REQUEST_TIMEOUT_MS);
   if (e.ORCHESTRA_SCHEDULER_IDLE_MS) out.schedulerIdleMs = Number(e.ORCHESTRA_SCHEDULER_IDLE_MS);
+  if (e.ORCHESTRA_MAX_TOKENS) out.maxTokens = Number(e.ORCHESTRA_MAX_TOKENS);
+  if (e.ORCHESTRA_REASONING) out.reasoning = e.ORCHESTRA_REASONING !== "0" && e.ORCHESTRA_REASONING !== "false";
+  if (e.ORCHESTRA_THINKING_LEVEL) out.thinkingLevel = e.ORCHESTRA_THINKING_LEVEL as Config["thinkingLevel"];
+  if (e.ORCHESTRA_THINKING_FORMAT) out.thinkingFormat = e.ORCHESTRA_THINKING_FORMAT;
   return out;
 }
 

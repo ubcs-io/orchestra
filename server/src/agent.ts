@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { Type, type Static } from "@sinclair/typebox";
+import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { appendArtifactSection, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
 
@@ -59,6 +60,7 @@ export interface ToolCallRecord {
 /** Normalized stream event forwarded to the SSE layer. */
 export type RoleStreamEvent =
   | { type: "text"; delta: string }
+  | { type: "thinking"; delta: string }
   | { type: "tool_start"; tool: string; args: unknown }
   | { type: "tool_end"; tool: string; isError: boolean }
   | { type: "status"; message: string };
@@ -71,6 +73,10 @@ export interface RoleRunResult {
   model: string;
   /** True when the role never called record_findings and we synthesized a fallback. */
   fallback: boolean;
+  /** The LLM stop reason ("stop" | "length" | "toolUse" | ...); "length" == truncated. */
+  stopReason?: string;
+  /** The model's reasoning trace (native reasoning channel + any inline <think>). */
+  thinkingText: string;
 }
 
 export interface RunRoleParams {
@@ -84,6 +90,8 @@ export interface RunRoleParams {
   tools: string[];
   /** Fully composed user message (task + accumulated findings + steering). */
   context: string;
+  /** Thinking level for reasoning models (omitted → pi default; ignored when model.reasoning is false). */
+  thinkingLevel?: ThinkingLevel;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -173,20 +181,60 @@ function textResult(text: string) {
   return { content: [{ type: "text" as const, text }], details: {} };
 }
 
-/**
- * Extract the concatenated text of the last assistant message, used only as a
- * fallback when the model never calls record_findings.
- */
-function lastAssistantText(messages: Array<{ role?: string; content?: unknown }>): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
-    const parts = (m.content as Array<{ type?: string; text?: string }>)
-      .filter((c) => c.type === "text" && typeof c.text === "string")
-      .map((c) => c.text as string);
-    if (parts.length) return parts.join("");
+const THINK_OPEN = "<think>";
+const THINK_CLOSE = "</think>";
+
+/** Longest suffix of `s` that is a proper prefix of `marker` (for partial-tag carry). */
+function partialSuffix(s: string, marker: string): number {
+  const max = Math.min(marker.length - 1, s.length);
+  for (let k = max; k > 0; k--) {
+    if (s.slice(s.length - k) === marker.slice(0, k)) return k;
   }
-  return "";
+  return 0;
+}
+
+/**
+ * Incremental splitter that separates inline `<think>…</think>` reasoning from the
+ * answer text across streamed deltas. Some local reasoning models (DeepSeek-R1 /
+ * QwQ) emit chain-of-thought as literal `<think>` tags in the content stream rather
+ * than on pi's native reasoning channel; this routes that text to a thinking channel
+ * so it never pollutes the answer or the fallback salvage. Handles tags split across
+ * chunk boundaries. Exported for unit testing.
+ */
+export function createThinkSplitter() {
+  let buffer = "";
+  let inside = false;
+
+  const process = (final: boolean): { text: string; thinking: string } => {
+    let text = "";
+    let thinking = "";
+    for (;;) {
+      const marker = inside ? THINK_CLOSE : THINK_OPEN;
+      const idx = buffer.indexOf(marker);
+      if (idx === -1) break;
+      const seg = buffer.slice(0, idx);
+      if (inside) thinking += seg;
+      else text += seg;
+      buffer = buffer.slice(idx + marker.length);
+      inside = !inside;
+    }
+    // No complete current marker remains. Retain a trailing partial of the marker we
+    // are scanning for so we never emit half a tag (unless this is the final flush).
+    const keep = final ? 0 : partialSuffix(buffer, inside ? THINK_CLOSE : THINK_OPEN);
+    const flushable = buffer.slice(0, buffer.length - keep);
+    buffer = buffer.slice(buffer.length - keep);
+    if (inside) thinking += flushable;
+    else text += flushable;
+    return { text, thinking };
+  };
+
+  return {
+    push: (delta: string) => {
+      buffer += delta;
+      return process(false);
+    },
+    flush: () => process(true),
+  };
 }
 
 export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
@@ -195,10 +243,27 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const toolCalls: ToolCallRecord[] = [];
   let tokens = 0;
   let captured: RoleFindings | undefined;
+  let stopReason: string | undefined;
+
+  // Text vs. reasoning accumulators. `answerText` is the clean answer (inline
+  // <think> stripped); `thinkingText` is the reasoning trace.
+  const splitter = createThinkSplitter();
+  let answerText = "";
+  let thinkingText = "";
 
   const record = (ev: RoleStreamEvent) => {
     transcript.push(JSON.stringify(ev));
     emit(ev);
+  };
+  const emitText = (s: string) => {
+    if (!s) return;
+    answerText += s;
+    record({ type: "text", delta: s });
+  };
+  const emitThinking = (s: string) => {
+    if (!s) return;
+    thinkingText += s;
+    record({ type: "thinking", delta: s });
   };
 
   const recordFindings = defineTool({
@@ -280,14 +345,22 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     sessionManager: SessionManager.inMemory(),
     tools: builtinTools,
     customTools,
+    thinkingLevel: params.thinkingLevel,
   });
 
   const unsubscribe = session.subscribe((ev) => {
     switch (ev.type) {
       case "message_update": {
         const ame = ev.assistantMessageEvent as { type?: string; delta?: string; text?: string };
-        const delta = ame?.type === "text_delta" ? (ame.delta ?? ame.text ?? "") : "";
-        if (delta) record({ type: "text", delta });
+        if (ame?.type === "text_delta") {
+          // Route through the splitter: inline <think> goes to the reasoning channel.
+          const { text, thinking } = splitter.push(ame.delta ?? ame.text ?? "");
+          emitText(text);
+          emitThinking(thinking);
+        } else if (ame?.type === "thinking_delta") {
+          // Native reasoning channel (endpoints that emit reasoning_content).
+          emitThinking(ame.delta ?? "");
+        }
         break;
       }
       case "tool_execution_start":
@@ -298,8 +371,9 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
         record({ type: "tool_end", tool: ev.toolName, isError: ev.isError });
         break;
       case "message_end": {
-        const usage = (ev.message as { usage?: { input?: number; output?: number } }).usage;
-        if (usage) tokens += (usage.input ?? 0) + (usage.output ?? 0);
+        const msg = ev.message as { usage?: { input?: number; output?: number }; stopReason?: string };
+        if (msg.usage) tokens += (msg.usage.input ?? 0) + (msg.usage.output ?? 0);
+        if (msg.stopReason) stopReason = msg.stopReason;
         break;
       }
       default:
@@ -317,19 +391,34 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     unsubscribe();
   }
 
+  // Flush any trailing text held back for partial-tag detection.
+  const tail = splitter.flush();
+  emitText(tail.text);
+  emitThinking(tail.thinking);
+
   let fallback = false;
   if (!captured) {
-    // The model finished without the required tool call — salvage its prose.
+    // The model finished without the required tool call — salvage the (think-stripped)
+    // answer text; never surface raw reasoning as the output.
     fallback = true;
-    const text = lastAssistantText(session.messages as Array<{ role?: string; content?: unknown }>);
     captured = {
       verdict: "needs_more",
-      summary: "Role finished without a structured verdict; captured raw output.",
+      summary:
+        stopReason === "length"
+          ? "Output was truncated (hit the token limit) before the role recorded a verdict."
+          : "Role finished without a structured verdict; captured raw output.",
       open_questions: [],
       coverage: [],
-      section_md: text || "_(no output produced)_",
+      section_md: answerText.trim() || "_(model produced only reasoning — see the reasoning trace)_",
       criteria_results: [],
     };
+  }
+
+  if (fallback || stopReason === "length") {
+    console.warn(
+      `[agent] degraded role run: model=${params.modelId} stop=${stopReason ?? "?"} ` +
+        `fallback=${fallback} tokens=${tokens} answer_chars=${answerText.length} thinking_chars=${thinkingText.length}`,
+    );
   }
 
   session.dispose();
@@ -341,5 +430,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     tokens,
     model: params.modelId,
     fallback,
+    stopReason,
+    thinkingText,
   };
 }

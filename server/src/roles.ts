@@ -6,7 +6,7 @@
  * routing templates; users can override per task (§5.5 steering).
  */
 
-import { countGlobalRoles, upsertRole } from "./db.js";
+import { countGlobalRoles, getMeta, setMeta, upsertRole } from "./db.js";
 
 /** Read-only pi built-in tools given to code-inspecting roles. */
 export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -243,17 +243,30 @@ const ALL: IntakeKind[] = [
   "manual", "error_file", "feature", "bug", "security", "chore", "spike", "research", "ux", "question",
 ];
 
-/**
- * Shared output contract appended to every role's system prompt. Every role MUST
- * finish by calling `record_findings` exactly once — that structured call is how
- * the Orchestrator captures verdict + coverage without fragile text parsing.
- */
-export const OUTPUT_CONTRACT = `
+/** "How to work" preamble for roles that HAVE file-inspection tools. */
+const HOW_TO_WORK_WITH_TOOLS = `
 ## How to work
 You are one step in a multi-role refinement loop operating on a real git repository.
 Ground every claim in the actual code: use your tools (read, grep, find, ls) to inspect
 files before asserting anything. Do not invent file names, symbols, or behavior.
+Your output budget is limited: investigate briefly, then finish. Do NOT narrate a plan to
+explore ("Let me start by exploring…") — just inspect what you need and record your findings.`.trim();
 
+/** "How to work" preamble for light roles that reason over context alone (no tools). */
+const HOW_TO_WORK_NO_TOOLS = `
+## How to work
+You are one step in a multi-role refinement loop. You do NOT have file-inspection tools.
+Reason over the original intake and the findings from earlier roles provided in your context —
+do NOT attempt to explore the repository or claim to read files. Work from what you are given.
+Your output budget is limited: be decisive and finish promptly. Do NOT narrate a plan to explore.`.trim();
+
+/**
+ * Shared output contract appended to every role's system prompt. Every role MUST
+ * finish by calling `record_findings` exactly once — that structured call is how
+ * the Orchestrator captures verdict + coverage without fragile text parsing.
+ * (The tool-aware "How to work" preamble is prepended by `buildRoleSystemPrompt`.)
+ */
+export const OUTPUT_CONTRACT = `
 ## How to finish (required)
 When done, call the \`record_findings\` tool EXACTLY ONCE with:
 - verdict: one of "pass" (your concern is adequately addressed), "needs_more"
@@ -470,14 +483,29 @@ export const DEFAULT_ROLES: RoleSeed[] = [
   },
 ];
 
-/** Build the full system prompt for a role (persona + shared contract). */
-export function buildRoleSystemPrompt(persona: string): string {
-  return `${persona}\n\n${OUTPUT_CONTRACT}`;
+/**
+ * Build the full system prompt for a role: persona + a tool-aware "How to work"
+ * preamble (light roles are told they have no tools) + the shared finish contract.
+ */
+export function buildRoleSystemPrompt(persona: string, tools: string[] = READ_ONLY_TOOLS.slice()): string {
+  const work = tools.length > 0 ? HOW_TO_WORK_WITH_TOOLS : HOW_TO_WORK_NO_TOOLS;
+  return `${persona}\n\n${work}\n\n${OUTPUT_CONTRACT}`;
 }
 
-/** Seed the global default role catalog once (no-op if already seeded). */
+/**
+ * Bump when the default personas / contract change so existing DBs re-seed the
+ * global rows. Project-override rows (project_id set) are never touched.
+ */
+export const ROLES_SEED_VERSION = 2;
+
+/**
+ * Seed (or refresh) the global default role catalog. Idempotent within a version:
+ * runs on first boot, and again when ROLES_SEED_VERSION increases so prompt fixes
+ * propagate to existing databases. Only global (project_id NULL) rows are upserted.
+ */
 export function seedGlobalRoles(): void {
-  if (countGlobalRoles() > 0) return;
+  const stored = Number(getMeta("roles_seed_version") ?? "0");
+  if (countGlobalRoles() > 0 && stored >= ROLES_SEED_VERSION) return;
   for (const r of DEFAULT_ROLES) {
     upsertRole({
       project_id: null,
@@ -486,9 +514,10 @@ export function seedGlobalRoles(): void {
       enabled: true,
       applies_to: JSON.stringify(r.appliesTo),
       ordering: r.ordering,
-      system_prompt: buildRoleSystemPrompt(r.persona),
+      system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
       tools_json: JSON.stringify(r.tools),
     });
   }
-  console.log(`[roles] seeded ${DEFAULT_ROLES.length} global roles`);
+  setMeta("roles_seed_version", String(ROLES_SEED_VERSION));
+  console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (v${ROLES_SEED_VERSION})`);
 }

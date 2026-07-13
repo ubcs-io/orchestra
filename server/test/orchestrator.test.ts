@@ -145,6 +145,7 @@ function fakeRunner(
     tokens: 3,
     model: "fake",
     fallback: false,
+    thinkingText: "",
   });
 }
 
@@ -195,6 +196,7 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
       tokens: 1,
       model: "fake",
       fallback: false,
+      thinkingText: "",
     };
   };
 }
@@ -322,5 +324,36 @@ describe("orchestrator loop (integration)", () => {
     const t = rootTask(projectId)!;
     expect(t.stage).toBe("review");
     expect(t.review_reason).toContain("tests");
+  });
+
+  it("persists stop_reason / fallback / thinking_md from a degraded run", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // A truncated run: no verdict recorded (fallback), hit the token limit, has reasoning.
+    setRoleRunner(async () => ({
+      findings: {
+        verdict: "needs_more",
+        summary: "truncated",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: "partial answer",
+        criteria_results: [],
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 42,
+      model: "fake",
+      fallback: true,
+      stopReason: "length",
+      thinkingText: "the model was thinking hard",
+    }));
+
+    await drainTicks(projectId, () => listRoleRuns(rootTask(projectId)!.task_id).length > 0, 5);
+
+    const runs = listRoleRuns(rootTask(projectId)!.task_id);
+    const first = runs[0]!;
+    expect(first.fallback).toBe(1);
+    expect(first.stop_reason).toBe("length");
+    expect(first.thinking_md).toBe("the model was thinking hard");
   });
 });

@@ -31,7 +31,13 @@ function modelEntry(id: string, conn: Connection) {
     id,
     name: id,
     api: OPENAI_COMPAT,
-    reasoning: false,
+    // Reasoning models (DeepSeek-R1 / QwQ) MUST be registered with reasoning:true,
+    // otherwise pi clamps the thinking level to "off" and the model emits its
+    // chain-of-thought as inline <think> text that eats the output budget.
+    reasoning: conn.reasoning,
+    // thinkingFormat shapes the reasoning REQUEST; the response only splits onto a
+    // separate channel if the endpoint emits `reasoning_content`.
+    compat: { thinkingFormat: conn.thinkingFormat } as Model<Api>["compat"],
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: conn.contextWindow,
@@ -49,7 +55,7 @@ function modelEntry(id: string, conn: Connection) {
 export function ensureModel(modelId: string): Model<Api> {
   const conn = resolveConnection();
   const reg = ensureRegistry();
-  const sig = `${conn.baseUrl}|${conn.apiKey}|${conn.contextWindow}|${conn.maxTokens}`;
+  const sig = `${conn.baseUrl}|${conn.apiKey}|${conn.contextWindow}|${conn.maxTokens}|${conn.reasoning}|${conn.thinkingFormat}`;
   if (!registeredModelIds.has(modelId) || sig !== lastProviderSig) {
     registeredModelIds.add(modelId);
     // Always include the default so a role/task override never drops it.

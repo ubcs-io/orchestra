@@ -12,6 +12,7 @@ export interface TaskEvent {
     | "role_start"
     | "role_end"
     | "text"
+    | "thinking"
     | "tool_start"
     | "tool_end"
     | "status"

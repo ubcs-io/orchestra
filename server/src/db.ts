@@ -139,6 +139,11 @@ export function initDb(): void {
       created_at      TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS interventions (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       task_id      TEXT,
@@ -169,6 +174,16 @@ export function initDb(): void {
 
   // Counter-reviewer output: per-criterion { id, status, note } judgements.
   addColumnIfMissing(d, "role_runs", "criteria_results_json", "criteria_results_json TEXT");
+  // Run diagnostics: LLM stop reason, whether the required record_findings call was
+  // missing (fallback salvage), and the captured reasoning trace.
+  addColumnIfMissing(d, "role_runs", "stop_reason", "stop_reason TEXT");
+  addColumnIfMissing(d, "role_runs", "fallback", "fallback INTEGER DEFAULT 0");
+  addColumnIfMissing(d, "role_runs", "thinking_md", "thinking_md TEXT");
+  // Reasoning-model connection settings (editable per profile).
+  addColumnIfMissing(d, "configs", "reasoning", "reasoning INTEGER");
+  addColumnIfMissing(d, "configs", "thinking_level", "thinking_level TEXT");
+  // Reasoning request dialect (model family): shapes how pi asks for thinking.
+  addColumnIfMissing(d, "configs", "thinking_format", "thinking_format TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -259,6 +274,9 @@ export interface ConfigRow {
   context_window: number | null;
   max_tokens: number | null;
   request_timeout_ms: number | null;
+  reasoning: number | null;
+  thinking_level: string | null;
+  thinking_format: string | null;
   extra_json: string | null;
   created_at: string;
   updated_at: string;
@@ -275,6 +293,9 @@ export interface RoleRunRow {
   criteria_results_json: string | null;
   tool_calls_json: string | null;
   transcript_jsonl: string | null;
+  stop_reason: string | null;
+  fallback: number | null;
+  thinking_md: string | null;
   depth: number;
   model: string | null;
   tokens: number | null;
@@ -455,6 +476,26 @@ export function countGlobalRoles(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Meta (small key/value store for migration/versioning flags)
+// ---------------------------------------------------------------------------
+
+export function getMeta(key: string): string | undefined {
+  const row = getDb().prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as
+    | { value: string | null }
+    | undefined;
+  return row?.value ?? undefined;
+}
+
+export function setMeta(key: string, value: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .run(key, value);
+}
+
+// ---------------------------------------------------------------------------
 // Configs (connection / provider profiles)
 // ---------------------------------------------------------------------------
 
@@ -488,6 +529,9 @@ export function upsertConfig(input: {
   context_window?: number | null;
   max_tokens?: number | null;
   request_timeout_ms?: number | null;
+  reasoning?: number | null;
+  thinking_level?: string | null;
+  thinking_format?: string | null;
   extra_json?: string | null;
 }): ConfigRow {
   const d = getDb();
@@ -513,6 +557,9 @@ export function upsertConfig(input: {
     context_window: keep(input.context_window, base.context_window),
     max_tokens: keep(input.max_tokens, base.max_tokens),
     request_timeout_ms: keep(input.request_timeout_ms, base.request_timeout_ms),
+    reasoning: keep(input.reasoning, base.reasoning),
+    thinking_level: keep(input.thinking_level, base.thinking_level),
+    thinking_format: keep(input.thinking_format, base.thinking_format),
     extra_json: keep(input.extra_json, base.extra_json),
   };
 
@@ -520,7 +567,8 @@ export function upsertConfig(input: {
     d.prepare(
       `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
-        request_timeout_ms=@request_timeout_ms, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
+        request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
+        thinking_format=@thinking_format, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
   }
@@ -528,9 +576,9 @@ export function upsertConfig(input: {
   const info = d
     .prepare(
       `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
-         context_window, max_tokens, request_timeout_ms, extra_json, created_at, updated_at)
+         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, extra_json, created_at, updated_at)
        VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
-         @context_window, @max_tokens, @request_timeout_ms, @extra_json, @ts, @ts)`,
+         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @extra_json, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
   return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
@@ -668,10 +716,81 @@ export function updateTask(
 }
 
 export function deleteTask(identifier: number | string): void {
+  const d = getDb();
+  const task = getTask(identifier);
+  if (!task) return;
+
+  // Cascade-clean related rows before removing the task itself.
+  d.prepare(`DELETE FROM role_runs WHERE task_id = ?`).run(task.task_id);
+  d.prepare(`DELETE FROM interventions WHERE task_id = ?`).run(task.task_id);
+
   const isNumeric = typeof identifier === "number" || /^\d+$/.test(String(identifier));
   const keyCol = isNumeric ? "id" : "task_id";
   const keyVal = isNumeric ? Number(identifier) : String(identifier);
-  getDb().prepare(`DELETE FROM tasks WHERE ${keyCol} = ?`).run(keyVal);
+  d.prepare(`DELETE FROM tasks WHERE ${keyCol} = ?`).run(keyVal);
+}
+
+/**
+ * Reset a task to intake state: clears all run/intervention history, log
+ * metadata, and output artifacts. Preserves the task's name, content, project
+ * association, and intake_kind so it is equivalent to a freshly-created task
+ * with the same intake.
+ */
+export function resetTask(identifier: number | string): TaskRow | undefined {
+  const d = getDb();
+  const task = getTask(identifier);
+  if (!task) return undefined;
+
+  // Wipe all history and steering records.
+  d.prepare(`DELETE FROM role_runs WHERE task_id = ?`).run(task.task_id);
+  d.prepare(`DELETE FROM interventions WHERE task_id = ?`).run(task.task_id);
+
+  // Reset to intake defaults — keep name, content, project_id, intake_kind.
+  const ts = now();
+  const isNumeric = typeof identifier === "number" || /^\d+$/.test(String(identifier));
+  const keyCol = isNumeric ? "id" : "task_id";
+  const keyVal = isNumeric ? Number(identifier) : String(identifier);
+
+  d.prepare(`
+    UPDATE tasks SET
+      status = 'pending',
+      stage = 'intake',
+      level = 'task',
+      exit_kind = NULL,
+      exit_state = NULL,
+      review_reason = NULL,
+      paused = 0,
+      response = NULL,
+      failure_reason = NULL,
+      acceptance_criteria = NULL,
+      completion_criteria = NULL,
+      refinement_plan_json = NULL,
+      coverage_json = NULL,
+      artifact_path = NULL,
+      workspace = NULL,
+      parent_task_id = NULL,
+      task_type = 'root',
+      step_number = NULL,
+      model = NULL,
+      updated_at = @ts
+    WHERE ${keyCol} = @keyVal
+  `).run({ ts, keyVal });
+
+  return getTask(identifier);
+}
+
+/**
+ * Check whether a task has an artifact_path pointing to a file that exists
+ * on disk under the project's planning tree. Returns the absolute path if so,
+ * or null.
+ */
+export function taskArtifactPath(identifier: number | string): string | null {
+  const task = getTask(identifier);
+  if (!task || !task.artifact_path) return null;
+  // artifact_path is always relative to the project repo via the planning dir.
+  // For safety, only return it if it looks like a .md file.
+  if (!/\.md$/i.test(task.artifact_path)) return null;
+  return task.artifact_path;
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +807,9 @@ export function createRoleRun(input: {
   criteria_results_json?: string | null;
   tool_calls_json?: string | null;
   transcript_jsonl?: string | null;
+  stop_reason?: string | null;
+  fallback?: number | null;
+  thinking_md?: string | null;
   depth?: number;
   model?: string | null;
   tokens?: number | null;
@@ -697,9 +819,11 @@ export function createRoleRun(input: {
   const info = d
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
-         criteria_results_json, tool_calls_json, transcript_jsonl, depth, model, tokens, created_at)
+         criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, thinking_md,
+         depth, model, tokens, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
-         @criteria_results_json, @tool_calls_json, @transcript_jsonl, @depth, @model, @tokens, @ts)`,
+         @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @thinking_md,
+         @depth, @model, @tokens, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -711,6 +835,9 @@ export function createRoleRun(input: {
       criteria_results_json: input.criteria_results_json ?? null,
       tool_calls_json: input.tool_calls_json ?? null,
       transcript_jsonl: input.transcript_jsonl ?? null,
+      stop_reason: input.stop_reason ?? null,
+      fallback: input.fallback ?? 0,
+      thinking_md: input.thinking_md ?? null,
       depth: input.depth ?? 1,
       model: input.model ?? null,
       tokens: input.tokens ?? null,
