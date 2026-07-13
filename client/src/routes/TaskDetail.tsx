@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { marked } from "marked";
 import { api, verdictClass, type TaskDetail as TD } from "../api";
 
 function useTaskStream(taskId: string, onActivity: () => void) {
   const [lines, setLines] = useState<string[]>([]);
   const bufRef = useRef("");
+  const thinkRef = useRef("");
   useEffect(() => {
     setLines([]);
     bufRef.current = "";
+    thinkRef.current = "";
     const es = new EventSource(`/api/tasks/${taskId}/stream`);
     const push = (s: string) => setLines((prev) => [...prev.slice(-400), s]);
 
@@ -16,19 +19,31 @@ function useTaskStream(taskId: string, onActivity: () => void) {
       const d = JSON.parse((e as MessageEvent).data).data;
       push(`\n▶ ROLE ${d.role} (depth ${d.depth})`);
       bufRef.current = "";
+      thinkRef.current = "";
     });
     es.addEventListener("text", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       bufRef.current += d.delta ?? "";
+      thinkRef.current = ""; // answer resumed → start a fresh reasoning line next time
       setLines((prev) => {
         const rest = prev[prev.length - 1]?.startsWith("  ") ? prev.slice(0, -1) : prev;
         return [...rest, "  " + bufRef.current.slice(-1200)];
+      });
+    });
+    es.addEventListener("thinking", (e) => {
+      const d = JSON.parse((e as MessageEvent).data).data;
+      thinkRef.current += d.delta ?? "";
+      bufRef.current = "";
+      setLines((prev) => {
+        const rest = prev[prev.length - 1]?.startsWith("💭") ? prev.slice(0, -1) : prev;
+        return [...rest, "💭 " + thinkRef.current.slice(-1200)];
       });
     });
     es.addEventListener("tool_start", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       push(`  ⚙ ${d.tool}(${JSON.stringify(d.args).slice(0, 80)})`);
       bufRef.current = "";
+      thinkRef.current = "";
     });
     es.addEventListener("tool_end", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
@@ -36,7 +51,11 @@ function useTaskStream(taskId: string, onActivity: () => void) {
     });
     es.addEventListener("role_end", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
-      push(`■ ${d.role} → ${d.verdict ?? (d.error ? "error" : "done")}`);
+      const flags = [
+        d.fallback ? "no verdict" : "",
+        d.stopReason === "length" ? "TRUNCATED" : "",
+      ].filter(Boolean).join(", ");
+      push(`■ ${d.role} → ${d.verdict ?? (d.error ? "error" : "done")}${flags ? ` [${flags}]` : ""}`);
       onActivity();
     });
     es.addEventListener("task_update", () => onActivity());
@@ -55,9 +74,24 @@ export function TaskDetail() {
   const refresh = () => qc.invalidateQueries({ queryKey: ["task", taskId] });
   const lines = useTaskStream(taskId, refresh);
   const liveRef = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(true);
+
+  // Auto-scroll when pinned; detect when user scrolls away
   useEffect(() => {
+    if (pinned) liveRef.current?.scrollTo(0, liveRef.current.scrollHeight);
+  }, [lines, pinned]);
+
+  const handleLiveScroll = () => {
+    const el = liveRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    setPinned(atBottom);
+  };
+
+  const jumpToLive = () => {
     liveRef.current?.scrollTo(0, liveRef.current.scrollHeight);
-  }, [lines]);
+    setPinned(true);
+  };
 
   const [roleInput, setRoleInput] = useState("");
   const [afterInput, setAfterInput] = useState("");
@@ -96,12 +130,51 @@ export function TaskDetail() {
 
       <div className="detail-grid">
         <div>
-          <div className="panel">
-            <h2>Live activity</h2>
-            <div className="live" ref={liveRef}>
-              {lines.length ? lines.join("\n") : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
+          {t.stage === "ready" || t.stage === "review" ? (
+            <div className="panel">
+              <h2>Final Status</h2>
+              {d.runs.some((r) => r.output_md) ? (
+                d.runs.map((r) =>
+                  r.output_md ? (
+                    <div
+                      key={r.id}
+                      className="section-md rendered-md"
+                      style={{ marginBottom: 12 }}
+                      dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }}
+                    />
+                  ) : null,
+                )
+              ) : (
+                <p className="muted">No role runs recorded.</p>
+              )}
+              <div className="row" style={{ marginTop: 8 }}>
+                {t.stage === "review" && (
+                  <>
+                    <span className="pill human">needs review</span>
+                    <span className="muted">{t.review_reason ?? "Task requires human judgement."}</span>
+                  </>
+                )}
+                {t.stage === "ready" && (
+                  <>
+                    <span className="pill ok">{t.exit_state ?? "complete"}</span>
+                    <span className="muted">Task is ready for implementation.</span>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="panel">
+              <h2>Live activity</h2>
+              <div className="live" ref={liveRef} onScroll={handleLiveScroll}>
+                {lines.length ? lines.join("\n") : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
+                {!pinned && (
+                  <button className="live-jump" onClick={jumpToLive}>
+                    ↓ latest
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="panel">
             <h2>Refinement plan</h2>
@@ -165,6 +238,8 @@ export function TaskDetail() {
                   <span className="collapse-caret">{isCollapsed ? "▸" : "▾"}</span>
                   <h2 style={{ margin: 0, cursor: "pointer" }}>{r.role_key}</h2>
                   <span className={`pill ${verdictClass(r.verdict)}`}>{r.verdict ?? "?"}</span>
+                  {r.fallback === 1 && <span className="pill warn" title="Model never called record_findings — output was salvaged">no verdict</span>}
+                  {r.stop_reason === "length" && <span className="pill bad" title="Output hit the token limit before finishing">truncated</span>}
                   {r.tokens != null && <span className="muted">{r.tokens} tok</span>}
                   {r.depth > 1 && <span className="pill dim">depth {r.depth}</span>}
                   <div style={{ flex: 1 }} />
@@ -188,7 +263,15 @@ export function TaskDetail() {
                   </button>
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
-                {!isCollapsed && r.output_md && <div className="section-md">{r.output_md}</div>}
+                {!isCollapsed && r.output_md && (
+                  <div className="section-md rendered-md" dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }} />
+                )}
+                {!isCollapsed && r.thinking_md && (
+                  <details className="reasoning-trace" style={{ marginTop: 8 }}>
+                    <summary className="muted" style={{ cursor: "pointer" }}>💭 Reasoning trace ({r.thinking_md.length.toLocaleString()} chars)</summary>
+                    <pre className="reasoning-body muted" style={{ whiteSpace: "pre-wrap", fontSize: 12, marginTop: 6 }}>{r.thinking_md}</pre>
+                  </details>
+                )}
               </div>
             );
           })}
@@ -238,6 +321,49 @@ export function TaskDetail() {
               <input value={noteInput} onChange={(e) => setNoteInput(e.target.value)} placeholder="focus on token handling…" />
               <button className="small" disabled={!noteInput} onClick={() => { intervene.mutate({ kind: "steer_note", payload: { text: noteInput } }); setNoteInput(""); }}>add</button>
             </div>
+
+            {d.interventions.length > 0 && (
+              <div style={{ marginTop: 14 }}>
+                <h2 style={{ marginBottom: 6 }}>Steering log</h2>
+                <div className="steering-log">
+                  {[...d.interventions].reverse().map((iv) => {
+                    let payload: Record<string, unknown> = {};
+                    try { payload = iv.payload_json ? JSON.parse(iv.payload_json) : {}; } catch { /* skip */ }
+
+                    const kindLabel = {
+                      steer_note: "NOTE",
+                      pin_question: "PIN",
+                      inject_role: "INJECT",
+                      rerun_role: "RERUN",
+                      deepen: "DEEPEN",
+                      promote_role: "PROMOTE",
+                      pause: "PAUSE",
+                      resume: "RESUME",
+                      run_now: "RUN NOW",
+                    }[iv.kind] ?? iv.kind.toUpperCase();
+
+                    const detail =
+                      iv.kind === "steer_note" || iv.kind === "pin_question"
+                        ? (payload.text as string ?? "")
+                        : iv.kind === "inject_role"
+                          ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
+                          : iv.kind === "rerun_role" || iv.kind === "deepen" || iv.kind === "promote_role"
+                            ? (payload.role as string ?? "?")
+                            : "";
+
+                    const isConsumed = iv.consumed_at != null;
+
+                    return (
+                      <div key={iv.id} className={`steering-entry ${isConsumed ? "consumed" : "pending"}`}>
+                        <span className={`pill ${isConsumed ? "dim" : "warn"}`}>{kindLabel}</span>
+                        {detail && <span className={isConsumed ? "muted" : ""}>{detail}</span>}
+                        <span className="muted" style={{ fontSize: 11 }}>{iv.created_at.replace("T", " ").slice(0, 16)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="panel">

@@ -31,6 +31,9 @@ export interface RoleRun {
   verdict: string | null;
   summary: string | null;
   output_md: string | null;
+  thinking_md: string | null;
+  stop_reason: string | null;
+  fallback: number | null;
   tokens: number | null;
   depth: number;
   model: string | null;
@@ -70,6 +73,9 @@ export interface ConnectionConfig {
   context_window: number | null;
   max_tokens: number | null;
   request_timeout_ms: number | null;
+  reasoning: number | null;
+  thinking_level: string | null;
+  thinking_format: string | null;
   has_api_key: boolean;
 }
 
@@ -82,6 +88,9 @@ export interface ConfigResponse {
     contextWindow: number;
     maxTokens: number;
     requestTimeoutMs: number;
+    reasoning: boolean;
+    thinkingLevel: string;
+    thinkingFormat: string;
     has_api_key: boolean;
   };
   env_overrides: { base_url: boolean; api_key: boolean };
@@ -96,6 +105,9 @@ export interface ConfigPatch {
   context_window?: number;
   max_tokens?: number;
   request_timeout_ms?: number;
+  reasoning?: boolean;
+  thinking_level?: string;
+  thinking_format?: string;
 }
 
 export type CoverageMap = Record<string, { status: string; note?: string }>;
@@ -131,6 +143,48 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** GET /api/safety response shape. */
+export interface SafetyResponse {
+  agent_tools: {
+    mode: string;
+    write_scope: string;
+    shell_access: boolean;
+    cross_repo_access: boolean;
+    source_code_writes: boolean;
+    git_history_available: boolean;
+  };
+  limits: {
+    role_tool_budget: number;
+    request_timeout_ms: number;
+    max_tokens: number;
+    context_window: number;
+  };
+  gates: Record<string, { maxLoopbacks: number; reviewerRole: string; rigor: string }>;
+  roles_summary: {
+    total_roles: number;
+    read_only_count: number;
+    git_history_count: number;
+    context_only_count: number;
+    disabled_count: number;
+  };
+  server: {
+    bind_address: string;
+    port: number;
+    auth_enabled: boolean;
+    trust_boundary: string;
+  };
+  storage: {
+    db_path: string;
+    api_key_in_db: boolean;
+    api_key_in_env: boolean;
+  };
+  concerns: string[];
+}
+
+export interface SafetyPatch {
+  role_tool_budget?: number;
+}
+
 export const api = {
   health: () => req<{ ok: boolean }>("/api/health"),
   models: () => req<{ models: string[] }>("/api/models"),
@@ -139,9 +193,13 @@ export const api = {
   saveConfig: (body: ConfigPatch) =>
     req<{ config: ConnectionConfig }>("/api/config", { method: "PATCH", body: JSON.stringify(body) }),
 
-  scheduler: () => req<{ running: boolean }>("/api/scheduler"),
-  startScheduler: () => req<{ running: boolean }>("/api/scheduler/start", { method: "POST" }),
-  stopScheduler: () => req<{ running: boolean }>("/api/scheduler/stop", { method: "POST" }),
+  safety: () => req<SafetyResponse>("/api/safety"),
+  saveSafety: (body: SafetyPatch) =>
+    req<{ ok: boolean; changes: string[] }>("/api/safety", { method: "PATCH", body: JSON.stringify(body) }),
+
+  scheduler: () => req<{ running: boolean; stopping: boolean }>("/api/scheduler"),
+  startScheduler: () => req<{ running: boolean; stopping: boolean }>("/api/scheduler/start", { method: "POST" }),
+  stopScheduler: () => req<{ running: boolean; stopping: boolean }>("/api/scheduler/stop", { method: "POST" }),
   tick: () => req<{ worked: boolean }>("/api/tick", { method: "POST" }),
 
   projects: () => req<{ projects: Project[] }>("/api/projects"),
@@ -159,7 +217,10 @@ export const api = {
   tasks: (projectId?: number) =>
     req<{ tasks: Task[] }>(`/api/tasks${projectId ? `?projectId=${projectId}` : ""}`),
   task: (taskId: string) => req<TaskDetail>(`/api/tasks/${taskId}`),
-  deleteTask: (taskId: string) => req<{ ok: boolean }>(`/api/tasks/${taskId}`, { method: "DELETE" }),
+  deleteTask: (taskId: string, removePlan?: boolean) =>
+    req<{ ok: boolean }>(`/api/tasks/${taskId}${removePlan ? "?removePlan=true" : ""}`, { method: "DELETE" }),
+
+  resetTask: (taskId: string) => req<{ task: Task }>(`/api/tasks/${taskId}/reset`, { method: "POST" }),
 
   intake: (projectId: number, body: { name: string; content: string; intake_kind?: string }) =>
     req<{ accepted: boolean; path: string }>(`/api/projects/${projectId}/intake`, {

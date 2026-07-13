@@ -22,17 +22,19 @@ import {
   listRoles,
   listRoleRuns,
   listTasks,
+  resetTask,
   updateProject,
   updateTask,
   upsertConfig,
   upsertRole,
 } from "../db.js";
-import { isGitRepo, scaffoldPlanning, writeArtifact } from "../git.js";
+import { isGitRepo, removeFile, scaffoldPlanning, writeArtifact } from "../git.js";
 import { discoverModels } from "../providers.js";
-import { resolveConnection } from "../settings.js";
+import { resolveConnection, THINKING_FORMATS } from "../settings.js";
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   isSchedulerRunning,
+  isSchedulerStopping,
   startScheduler,
   stopScheduler,
   tick,
@@ -141,6 +143,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         contextWindow: resolved.contextWindow,
         maxTokens: resolved.maxTokens,
         requestTimeoutMs: resolved.requestTimeoutMs,
+        reasoning: resolved.reasoning,
+        thinkingLevel: resolved.thinkingLevel,
+        thinkingFormat: resolved.thinkingFormat,
         has_api_key: !!resolved.apiKey,
       },
       env_overrides: {
@@ -150,7 +155,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  app.patch("/api/config", async (req: FastifyRequest) => {
+  app.patch("/api/config", async (req: FastifyRequest, reply: FastifyReply) => {
     const body = (req.body ?? {}) as {
       name?: string;
       base_url?: string;
@@ -159,7 +164,16 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       context_window?: number;
       max_tokens?: number;
       request_timeout_ms?: number;
+      reasoning?: boolean;
+      thinking_level?: string;
+      thinking_format?: string;
     };
+    if (
+      body.thinking_format !== undefined &&
+      !(THINKING_FORMATS as readonly string[]).includes(body.thinking_format)
+    ) {
+      return bad(reply, 400, `unknown thinking_format '${body.thinking_format}'`);
+    }
     // An explicit empty api_key clears the stored token (fall back to env/none);
     // omitting the field leaves the existing token untouched.
     const api_key =
@@ -174,6 +188,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       context_window: body.context_window,
       max_tokens: body.max_tokens,
       request_timeout_ms: body.request_timeout_ms,
+      reasoning: body.reasoning === undefined ? undefined : body.reasoning ? 1 : 0,
+      thinking_level: body.thinking_level,
+      thinking_format: body.thinking_format,
     });
     // Return the same redacted shape as GET.
     const row = getGlobalConfig();
@@ -182,14 +199,14 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ---- Scheduler ----
-  app.get("/api/scheduler", async () => ({ running: isSchedulerRunning() }));
+  app.get("/api/scheduler", async () => ({ running: isSchedulerRunning(), stopping: isSchedulerStopping() }));
   app.post("/api/scheduler/start", async () => {
     startScheduler();
     return { running: true };
   });
-  app.post("/api/scheduler/stop", async () => {
-    await stopScheduler();
-    return { running: false };
+  app.post("/api/scheduler/stop", () => {
+    stopScheduler();
+    return { running: false, stopping: isSchedulerStopping() };
   });
   app.post("/api/tick", async () => ({ worked: await tick() }));
 
@@ -289,8 +306,44 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.delete("/api/tasks/:id", async (req: FastifyRequest) => {
-    deleteTask((req.params as { id: string }).id);
+    const taskId = (req.params as { id: string }).id;
+    const q = req.query as { removePlan?: string };
+
+    // Resolve artifact path before deletion so we know what to delete on disk.
+    const task = getTask(taskId);
+    const artifactRel = task?.artifact_path ?? null;
+
+    deleteTask(taskId);
+
+    // Optionally remove the .md plan/output file from disk.
+    if (q.removePlan === "true" && artifactRel && task?.project_id) {
+      const project = getProject(task.project_id);
+      if (project) {
+        const absPath = path.join(project.repo_path, artifactRel);
+        removeFile(absPath);
+      }
+    }
+
     return { ok: true };
+  });
+
+  // Reset a task to intake state — clears all history, moves back to intake.
+  app.post("/api/tasks/:id/reset", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "task not found");
+
+    // Remove the output .md file from disk if one exists.
+    if (task.artifact_path && task.project_id) {
+      const project = getProject(task.project_id);
+      if (project) {
+        removeFile(path.join(project.repo_path, task.artifact_path));
+      }
+    }
+
+    const updated = resetTask(taskId);
+    if (!updated) return bad(reply, 500, "reset failed");
+    return { task: updated };
   });
 
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.

@@ -18,6 +18,26 @@
 import { getConfig } from "./config.js";
 import { getGlobalConfig, getProjectConfig, upsertConfig, type ConfigRow } from "./db.js";
 
+/**
+ * Valid pi `thinkingFormat` dialects (one per model family / reasoning API shape).
+ * Mirrors the enum in @earendil-works/pi-ai's OpenAICompletionsCompat; the server
+ * validates PATCH /api/config against this set and the client dropdown labels them.
+ */
+export const THINKING_FORMATS = [
+  "qwen-chat-template",
+  "qwen",
+  "deepseek",
+  "zai",
+  "openai",
+  "openrouter",
+  "together",
+  "string-thinking",
+  "chat-template",
+  "ant-ling",
+] as const;
+
+export type ThinkingFormat = (typeof THINKING_FORMATS)[number];
+
 /** Fully resolved connection settings for a single model call. */
 export interface Connection {
   baseUrl: string;
@@ -27,6 +47,12 @@ export interface Connection {
   contextWindow: number;
   maxTokens: number;
   requestTimeoutMs: number;
+  /** Whether pi should treat the model as a reasoning model (enables a thinking level). */
+  reasoning: boolean;
+  /** Thinking level for pi when reasoning is enabled. */
+  thinkingLevel: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  /** pi reasoning request dialect (model family): deepseek | qwen | qwen-chat-template | … */
+  thinkingFormat: string;
 }
 
 /**
@@ -48,6 +74,9 @@ export function seedGlobalConfig(): void {
     context_window: cfg.contextWindow,
     max_tokens: cfg.maxTokens,
     request_timeout_ms: cfg.requestTimeoutMs,
+    reasoning: cfg.reasoning ? 1 : 0,
+    thinking_level: cfg.thinkingLevel,
+    thinking_format: cfg.thinkingFormat,
   });
   console.log("[config] seeded global default connection profile");
 }
@@ -55,6 +84,11 @@ export function seedGlobalConfig(): void {
 function pick<T>(...vals: (T | null | undefined)[]): T | undefined {
   for (const v of vals) if (v != null) return v as T;
   return undefined;
+}
+
+/** A nullable 0/1 DB flag → boolean, or undefined when unset (so `pick` falls through). */
+function boolFromDb(v: number | null | undefined): boolean | undefined {
+  return v == null ? undefined : v !== 0;
 }
 
 /**
@@ -79,5 +113,9 @@ export function resolveConnection(projectId?: number | null): Connection {
     contextWindow: pick(project?.context_window, global?.context_window, cfg.contextWindow)!,
     maxTokens: pick(project?.max_tokens, global?.max_tokens, cfg.maxTokens)!,
     requestTimeoutMs: pick(project?.request_timeout_ms, global?.request_timeout_ms, cfg.requestTimeoutMs)!,
+    // reasoning/thinking_level are stored as 0/1 and text; NULL falls back to bootstrap config.
+    reasoning: pick(boolFromDb(project?.reasoning), boolFromDb(global?.reasoning), cfg.reasoning)!,
+    thinkingLevel: pick(project?.thinking_level, global?.thinking_level, cfg.thinkingLevel)! as Connection["thinkingLevel"],
+    thinkingFormat: pick(project?.thinking_format, global?.thinking_format, cfg.thinkingFormat)!,
   };
 }

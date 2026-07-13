@@ -23,11 +23,20 @@ function SchedulerToggle() {
   const start = useMutation({ mutationFn: api.startScheduler, onSuccess: () => qc.invalidateQueries({ queryKey: ["scheduler"] }) });
   const stop = useMutation({ mutationFn: api.stopScheduler, onSuccess: () => qc.invalidateQueries({ queryKey: ["scheduler"] }) });
   const running = data?.running ?? false;
+  const stopping = data?.stopping ?? false;
   return (
     <div className="row">
-      <span className={`pill ${running ? "ok" : "dim"}`}>{running ? "● running" : "○ stopped"}</span>
-      {running ? (
-        <button className="small" onClick={() => stop.mutate()}>Stop loop</button>
+      {stopping ? (
+        <span className="pill warn">◉ stopping…</span>
+      ) : (
+        <span className={`pill ${running ? "ok" : "dim"}`}>{running ? "● running" : "○ stopped"}</span>
+      )}
+      {running && !stopping ? (
+        <button className="small" disabled={stop.isPending} onClick={() => stop.mutate()}>
+          {stop.isPending ? "stopping…" : "Stop loop"}
+        </button>
+      ) : stopping ? (
+        <button className="small" disabled>stopping…</button>
       ) : (
         <button className="small primary" onClick={() => start.mutate()}>Start loop</button>
       )}

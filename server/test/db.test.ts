@@ -12,6 +12,7 @@ import {
   createRoleRun,
   createTask,
   getDb,
+  getGlobalConfig,
   getProject,
   getTask,
   initDb,
@@ -22,8 +23,10 @@ import {
   markInterventionConsumed,
   updateProject,
   updateTask,
+  upsertConfig,
   upsertRole,
 } from "../src/db";
+import { resolveConnection } from "../src/settings";
 import { freshDb } from "./helpers";
 
 afterEach(() => closeDb());
@@ -124,6 +127,34 @@ describe("role_runs + interventions", () => {
     expect(listUnconsumedInterventions(t.task_id).length).toBe(1);
     markInterventionConsumed(iv.id);
     expect(listUnconsumedInterventions(t.task_id).length).toBe(0);
+  });
+});
+
+describe("configs / connection resolution", () => {
+  it("round-trips thinking_format through upsertConfig", () => {
+    freshDb();
+    upsertConfig({ project_id: null, key: "default", thinking_format: "qwen-chat-template" });
+    expect(getGlobalConfig()?.thinking_format).toBe("qwen-chat-template");
+    // A later PATCH that omits it keeps the prior value.
+    upsertConfig({ project_id: null, key: "default", max_tokens: 20000 });
+    expect(getGlobalConfig()?.thinking_format).toBe("qwen-chat-template");
+  });
+
+  it("resolves thinkingFormat project → global → bootstrap default", () => {
+    freshDb();
+    // No rows yet: falls back to the bootstrap config default ("deepseek").
+    expect(resolveConnection().thinkingFormat).toBe("deepseek");
+
+    // Global row wins over the bootstrap default.
+    upsertConfig({ project_id: null, key: "default", thinking_format: "qwen" });
+    expect(resolveConnection().thinkingFormat).toBe("qwen");
+
+    // Project override wins over the global row.
+    const p = createProject({ name: "svc", repo_path: "/tmp/svc" });
+    upsertConfig({ project_id: p.id, key: "default", thinking_format: "deepseek" });
+    expect(resolveConnection(p.id).thinkingFormat).toBe("deepseek");
+    // ...but the global still applies to other (or no) projects.
+    expect(resolveConnection().thinkingFormat).toBe("qwen");
   });
 });
 

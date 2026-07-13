@@ -211,7 +211,8 @@ export function inferIntakeKind(fileName: string, content: string): IntakeKind {
 function artifactName(task: TaskRow): string {
   const shortId = task.task_id.slice(0, 8);
   const safe = (task.name ?? "task").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 40);
-  return `${shortId}-${safe}.md`;
+  const base = safe.replace(/\.md$/i, "");
+  return `${shortId}-${base}.md`;
 }
 
 /** Scan every project's INTAKE folder and create tasks for new files. */
@@ -420,6 +421,8 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   publish(task.task_id, "role_start", { role: step.role, depth: step.depth });
 
   let result;
+  const ac = new AbortController();
+  activeAbort = ac;
   try {
     result = await roleRunner({
       repoPath: project.repo_path,
@@ -429,16 +432,22 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       systemPrompt: role.system_prompt,
       tools,
       context: buildRoleContext(task, step.role),
+      thinkingLevel: conn.reasoning ? conn.thinkingLevel : undefined,
       onEvent: (ev) => publish(task.task_id, ev.type as never, ev),
+      signal: ac.signal,
     });
   } catch (err) {
     // A role failure must not crash the daemon; record it and escalate to review.
-    publish(task.task_id, "role_end", { role: step.role, error: true });
+    const msg = (err as Error).message;
+    const aborted = ac.signal.aborted || msg === "AbortError" || msg.includes("aborted");
+    publish(task.task_id, "role_end", { role: step.role, error: true, aborted });
     createRoleRun({
       task_id: task.task_id,
       role_key: step.role,
-      verdict: "blocker",
-      summary: `Role execution failed: ${(err as Error).message}`,
+      verdict: aborted ? "needs_human" : "blocker",
+      summary: aborted
+        ? `Role ${step.role} was aborted by user.`
+        : `Role execution failed: ${msg}`,
       depth: step.depth,
       model: modelId,
     });
@@ -447,14 +456,26 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       refinement_plan_json: JSON.stringify(plan),
       stage: "review",
       exit_state: "needs_review",
-      review_reason: `Role ${step.role} failed: ${(err as Error).message}`,
+      review_reason: aborted
+        ? `Role ${step.role} was aborted by user — task needs human judgement.`
+        : `Role ${step.role} failed: ${msg}`,
       status: "failed",
     });
     publish(task.task_id, "task_update", { stage: "review" });
     return;
+  } finally {
+    activeAbort = null;
   }
 
   const { findings } = result;
+
+  // Surface degraded runs (missing verdict / truncated output) in the logs.
+  if (result.fallback || result.stopReason === "length") {
+    console.warn(
+      `[orchestrator] degraded run: task=${task.task_id.slice(0, 8)} role=${step.role} ` +
+        `stop=${result.stopReason ?? "?"} fallback=${result.fallback} tokens=${result.tokens}`,
+    );
+  }
 
   // Persist the run.
   createRoleRun({
@@ -467,6 +488,9 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     criteria_results_json: JSON.stringify(findings.criteria_results ?? []),
     tool_calls_json: JSON.stringify(result.toolCalls),
     transcript_jsonl: result.transcriptJsonl,
+    stop_reason: result.stopReason ?? null,
+    fallback: result.fallback ? 1 : 0,
+    thinking_md: result.thinkingText || null,
     depth: step.depth,
     model: result.model,
     tokens: result.tokens,
@@ -484,7 +508,12 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   const coverage = rollupCoverage(task.task_id);
   step.status = "done";
 
-  publish(task.task_id, "role_end", { role: step.role, verdict: findings.verdict });
+  publish(task.task_id, "role_end", {
+    role: step.role,
+    verdict: findings.verdict,
+    fallback: result.fallback,
+    stopReason: result.stopReason,
+  });
 
   // Gate.
   applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? []);
@@ -748,12 +777,16 @@ function withPromotedRoles(project: ProjectRow, task: TaskRow, plan: RefinementP
 }
 
 let stopped = true;
+let stopping = false;
 let loopHandle: Promise<void> | undefined;
+/** Abort controller for the in-progress tick — set by stopScheduler() to hard-cut a stuck agent. */
+let activeAbort: AbortController | null = null;
 
 /** Start the daemon heartbeat. Idempotent. tick() is self-serializing. */
 export function startScheduler(): void {
   if (!stopped) return;
   stopped = false;
+  stopping = false;
   const cfg = getConfig();
   loopHandle = (async () => {
     while (!stopped) {
@@ -765,18 +798,29 @@ export function startScheduler(): void {
       }
       await sleep(didWork ? 50 : cfg.schedulerIdleMs);
     }
+    stopping = false;
+    console.log("[orchestrator] scheduler stopped");
   })();
   console.log("[orchestrator] scheduler started");
 }
 
-export async function stopScheduler(): Promise<void> {
+/** Signal the loop to stop and abort the in-progress tick. Non-blocking:
+ *  sets the stop flags immediately and fires the abort controller. The
+ *  current tick unwinds naturally (agent session is cancelled), then the
+ *  loop exits on the next `while (!stopped)` check. */
+export function stopScheduler(): void {
+  if (stopped) return;
   stopped = true;
-  await loopHandle;
-  console.log("[orchestrator] scheduler stopped");
+  stopping = true;
+  activeAbort?.abort();
 }
 
 export function isSchedulerRunning(): boolean {
-  return !stopped;
+  return !stopped && !stopping;
+}
+
+export function isSchedulerStopping(): boolean {
+  return stopping;
 }
 
 function sleep(ms: number): Promise<void> {

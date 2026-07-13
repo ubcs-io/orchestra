@@ -15,6 +15,7 @@ import { getDb, initDb } from "./db.js";
 import { seedGlobalRoles } from "./roles.js";
 import { seedGlobalConfig } from "./settings.js";
 import { apiRoutes } from "./routes/api.js";
+import { safetyRoutes } from "./routes/safety.js";
 import { sseRoutes } from "./routes/sse.js";
 import { startScheduler, stopScheduler } from "./orchestrator.js";
 
@@ -28,6 +29,7 @@ async function main(): Promise<void> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 8 * 1024 * 1024 });
 
   await app.register(apiRoutes);
+  await app.register(safetyRoutes);
   await app.register(sseRoutes);
 
   // Serve the built SPA if present, with a client-side-routing fallback.
