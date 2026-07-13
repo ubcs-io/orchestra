@@ -31,7 +31,7 @@ export function Projects() {
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-service" />
           </div>
           <div>
-            <label>Absolute repo path (must be a git repo)</label>
+            <label>Absolute path to the repo root (a subdirectory or .git also works)</label>
             <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="/Users/me/code/my-service" />
           </div>
         </div>

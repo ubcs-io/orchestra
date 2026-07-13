@@ -4,7 +4,9 @@
  * orchestrator and db modules.
  */
 
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   createIntervention,
@@ -12,6 +14,7 @@ import {
   createTask,
   deleteProject,
   deleteTask,
+  getGlobalConfig,
   getProject,
   getTask,
   listInterventions,
@@ -21,11 +24,13 @@ import {
   listTasks,
   updateProject,
   updateTask,
+  upsertConfig,
   upsertRole,
 } from "../db.js";
 import { isGitRepo, scaffoldPlanning, writeArtifact } from "../git.js";
 import { discoverModels } from "../providers.js";
-import { CONCERN_TAXONOMY } from "../roles.js";
+import { resolveConnection } from "../settings.js";
+import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   isSchedulerRunning,
   startScheduler,
@@ -55,7 +60,57 @@ function taskDetail(taskId: string) {
   } catch {
     plan = null;
   }
-  return { task, plan, coverage, runs, interventions, children, taxonomy: CONCERN_TAXONOMY };
+  const flow = flowForIntake((task.intake_kind as IntakeKind) || "manual");
+  return {
+    task,
+    plan,
+    coverage,
+    runs,
+    interventions,
+    children,
+    taxonomy: CONCERN_TAXONOMY,
+    flow: {
+      key: flow.key,
+      rigor: flow.rigor,
+      reviewerRole: flow.reviewerRole,
+      criteria: flow.criteria,
+      mandatoryConcerns: flow.mandatoryConcerns,
+      maxLoopbacks: flow.maxLoopbacks,
+    },
+  };
+}
+
+/**
+ * Normalize a user-supplied repository path into an absolute filesystem path.
+ * Tolerates the common ways a path arrives mangled from a browser field:
+ * surrounding whitespace/quotes, a `file://` URL (as produced by dragging a
+ * folder from Finder), percent-encoded spaces, and a leading `~`.
+ */
+export function normalizeRepoPath(input: string): string {
+  let raw = input.trim();
+  // Strip a single pair of surrounding quotes (from copy/paste or shell habit).
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
+  }
+  // A dragged folder arrives as file:///Users/me/proj with %20-encoded spaces.
+  if (raw.startsWith("file://")) {
+    try {
+      raw = fileURLToPath(raw);
+    } catch {
+      // Fall back to manual stripping if the URL is slightly malformed.
+      raw = decodeURIComponent(raw.replace(/^file:\/\//, ""));
+    }
+  } else if (raw.includes("%")) {
+    // Percent-encoding without a scheme (e.g. a copied encoded path).
+    try {
+      raw = decodeURIComponent(raw);
+    } catch {
+      /* leave as-is if not valid encoding */
+    }
+  }
+  // Expand a leading `~` to the server user's home directory.
+  if (raw === "~" || raw.startsWith("~/")) raw = path.join(os.homedir(), raw.slice(1));
+  return path.isAbsolute(raw) ? path.resolve(raw) : raw;
 }
 
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
@@ -64,6 +119,67 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/models", async () => ({ models: await discoverModels() }));
 
   app.get("/api/concerns", async () => ({ concerns: CONCERN_TAXONOMY }));
+
+  app.get("/api/flows", async () => ({ flows: FLOW_TEMPLATES }));
+
+  // ---- Connection config (global 'default' profile) ----
+  // The API key is never sent back to the client — only whether one is set, and
+  // whether an ORCHESTRA_* env var is overriding the stored value (env wins).
+  app.get("/api/config", async () => {
+    const row = getGlobalConfig();
+    const resolved = resolveConnection();
+    const { api_key, ...safe } = row ?? {};
+    return {
+      config: {
+        ...safe,
+        has_api_key: !!(api_key && api_key.length),
+      },
+      resolved: {
+        baseUrl: resolved.baseUrl,
+        api: resolved.api,
+        defaultModelId: resolved.defaultModelId,
+        contextWindow: resolved.contextWindow,
+        maxTokens: resolved.maxTokens,
+        requestTimeoutMs: resolved.requestTimeoutMs,
+        has_api_key: !!resolved.apiKey,
+      },
+      env_overrides: {
+        base_url: !!process.env.ORCHESTRA_BASE_URL,
+        api_key: !!process.env.ORCHESTRA_API_KEY,
+      },
+    };
+  });
+
+  app.patch("/api/config", async (req: FastifyRequest) => {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      base_url?: string;
+      api_key?: string;
+      default_model?: string;
+      context_window?: number;
+      max_tokens?: number;
+      request_timeout_ms?: number;
+    };
+    // An explicit empty api_key clears the stored token (fall back to env/none);
+    // omitting the field leaves the existing token untouched.
+    const api_key =
+      body.api_key === undefined ? undefined : body.api_key.trim() === "" ? null : body.api_key.trim();
+    upsertConfig({
+      project_id: null,
+      key: "default",
+      name: body.name,
+      base_url: body.base_url?.trim(),
+      api_key,
+      default_model: body.default_model?.trim(),
+      context_window: body.context_window,
+      max_tokens: body.max_tokens,
+      request_timeout_ms: body.request_timeout_ms,
+    });
+    // Return the same redacted shape as GET.
+    const row = getGlobalConfig();
+    const { api_key: _k, ...safe } = row ?? {};
+    return { config: { ...safe, has_api_key: !!(_k && _k.length) } };
+  });
 
   // ---- Scheduler ----
   app.get("/api/scheduler", async () => ({ running: isSchedulerRunning() }));
@@ -88,11 +204,24 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       default_model?: string;
     };
     if (!body.name || !body.repo_path) return bad(reply, 400, "name and repo_path are required");
-    const repoPath = path.resolve(body.repo_path);
-    if (!isGitRepo(repoPath)) return bad(reply, 400, `not a git repository: ${repoPath}`);
+    const repoPath = normalizeRepoPath(body.repo_path);
+    if (!path.isAbsolute(repoPath)) {
+      return bad(reply, 400, `repo_path must be an absolute path to the repository root (got "${repoPath}")`);
+    }
+    // JSON.stringify the raw value so any hidden characters (zero-width spaces,
+    // control chars, stray unicode from a paste) show up as escapes in the log.
+    console.log(`[api] POST /projects — raw repo_path=${JSON.stringify(body.repo_path)} → resolved=${JSON.stringify(repoPath)}`);
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = isGitRepo(repoPath).canonicalRoot;
+    } catch (err) {
+      console.error(`[api] isGitRepo failed for "${repoPath}": ${(err as Error).message}`);
+      return bad(reply, 400, (err as Error).message);
+    }
+    console.log(`[api] canonical repo root: "${canonicalRoot}"`);
     const project = createProject({
       name: body.name,
-      repo_path: repoPath,
+      repo_path: canonicalRoot,
       planning_dir: body.planning_dir,
       default_model: body.default_model ?? null,
     });

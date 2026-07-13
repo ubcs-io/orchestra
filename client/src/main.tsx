@@ -13,6 +13,7 @@ import { api } from "./api";
 import { Projects } from "./routes/Projects";
 import { ProjectBoard } from "./routes/ProjectBoard";
 import { RolesEditor } from "./routes/RolesEditor";
+import { Settings } from "./routes/Settings";
 import { TaskDetail } from "./routes/TaskDetail";
 import "./styles.css";
 
@@ -41,6 +42,7 @@ function Root() {
         <h1>◆ ORCHESTRA</h1>
         <nav>
           <Link to="/">Projects</Link>
+          <Link to="/settings">Settings</Link>
         </nav>
         <div className="spacer" />
         <SchedulerToggle />
@@ -57,8 +59,9 @@ const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/", com
 const boardRoute = createRoute({ getParentRoute: () => rootRoute, path: "/projects/$projectId", component: ProjectBoard });
 const rolesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/projects/$projectId/roles", component: RolesEditor });
 const taskRoute = createRoute({ getParentRoute: () => rootRoute, path: "/tasks/$taskId", component: TaskDetail });
+const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings", component: Settings });
 
-const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute]);
+const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute, settingsRoute]);
 const router = createRouter({ routeTree });
 
 declare module "@tanstack/react-router" {

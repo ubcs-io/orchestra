@@ -16,6 +16,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { Type, type Static } from "@sinclair/typebox";
 import { appendArtifactSection, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
@@ -29,12 +30,24 @@ export interface CoverageItem {
   note?: string;
 }
 
+/** Whether a counter-reviewer judged an acceptance criterion satisfied. */
+export type CritStatus = "met" | "partial" | "unmet";
+
+/** A counter-reviewer's judgement of one acceptance criterion (by id). */
+export interface CriteriaResult {
+  id: string;
+  status: CritStatus;
+  note?: string;
+}
+
 export interface RoleFindings {
   verdict: Verdict;
   summary: string;
   open_questions: string[];
   coverage: CoverageItem[];
   section_md: string;
+  /** Present only for counter-reviewer roles; one entry per acceptance criterion. */
+  criteria_results?: CriteriaResult[];
 }
 
 export interface ToolCallRecord {
@@ -87,6 +100,16 @@ const CoverageSchema = Type.Object({
   note: Type.Optional(Type.String()),
 });
 
+const CriteriaResultSchema = Type.Object({
+  id: Type.String(),
+  status: Type.Union([
+    Type.Literal("met"),
+    Type.Literal("partial"),
+    Type.Literal("unmet"),
+  ]),
+  note: Type.Optional(Type.String()),
+});
+
 const RecordFindingsSchema = Type.Object({
   verdict: Type.Union([
     Type.Literal("pass"),
@@ -98,6 +121,7 @@ const RecordFindingsSchema = Type.Object({
   open_questions: Type.Array(Type.String()),
   coverage: Type.Array(CoverageSchema),
   section_md: Type.String(),
+  criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
 });
 
 const WriteArtifactSchema = Type.Object({
@@ -106,6 +130,44 @@ const WriteArtifactSchema = Type.Object({
   }),
   content: Type.String(),
 });
+
+/** Custom tool name that opts a role into the read-only git history tool. */
+export const GIT_HISTORY_TOOL = "git_history";
+
+const GitHistorySchema = Type.Object({
+  path: Type.Optional(
+    Type.String({ description: "Limit history to this repo-relative file or directory." }),
+  ),
+  grep: Type.Optional(
+    Type.String({ description: "Find commits that added or removed this exact string (git log -S)." }),
+  ),
+  since_days: Type.Optional(
+    Type.Number({ description: "Only include commits from the last N days." }),
+  ),
+  max_commits: Type.Optional(
+    Type.Number({ description: "Maximum commits to return (default 20)." }),
+  ),
+});
+
+/** Read-only `git log` over the repo, used to see what recently changed near a bug. */
+function runGitHistory(repoPath: string, p: Static<typeof GitHistorySchema>): string {
+  const max = Math.max(1, Math.min(p.max_commits ?? 20, 100));
+  const args = ["log", "--format=%h %ad %an %s", "--date=short", "-n", String(max)];
+  if (p.since_days && p.since_days > 0) args.push(`--since=${p.since_days} days ago`);
+  if (p.grep) args.push("-S", p.grep);
+  if (p.path) args.push("--", p.path);
+  try {
+    const out = execFileSync("git", args, {
+      cwd: repoPath,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      timeout: 15_000,
+    });
+    return out.trim() || "(no matching commits)";
+  } catch (err) {
+    return `git error: ${(err as Error).message}`;
+  }
+}
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }], details: {} };
@@ -152,9 +214,20 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
         open_questions: p.open_questions ?? [],
         coverage: (p.coverage ?? []) as CoverageItem[],
         section_md: p.section_md,
+        criteria_results: (p.criteria_results ?? []) as CriteriaResult[],
       };
       return { ...textResult("findings recorded"), terminate: true };
     },
+  });
+
+  const gitHistory = defineTool({
+    name: GIT_HISTORY_TOOL,
+    label: "Git history",
+    description:
+      "Read-only git log over the repository. Use to see what recently changed near the failing code — pass `path` to scope to a file/dir, `grep` to find commits that touched a string, `since_days` to bound the window.",
+    parameters: GitHistorySchema,
+    execute: async (_id: string, p: Static<typeof GitHistorySchema>) =>
+      textResult(runGitHistory(params.repoPath, p)),
   });
 
   const writeArtifact = defineTool({
@@ -190,6 +263,14 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   const model = ensureModel(params.modelId);
 
+  // `git_history` is a custom tool, not a pi builtin — pull it out of the builtin
+  // allowlist and register it as a custom tool only for roles that opt in.
+  const wantsGit = params.tools.includes(GIT_HISTORY_TOOL);
+  const builtinTools = params.tools.filter((t) => t !== GIT_HISTORY_TOOL);
+  const customTools = wantsGit
+    ? [recordFindings, writeArtifact, gitHistory]
+    : [recordFindings, writeArtifact];
+
   const { session } = await createAgentSession({
     cwd: params.repoPath,
     model,
@@ -197,8 +278,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     settingsManager,
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(),
-    tools: params.tools,
-    customTools: [recordFindings, writeArtifact],
+    tools: builtinTools,
+    customTools,
   });
 
   const unsubscribe = session.subscribe((ev) => {
@@ -247,6 +328,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       open_questions: [],
       coverage: [],
       section_md: text || "_(no output produced)_",
+      criteria_results: [],
     };
   }
 
