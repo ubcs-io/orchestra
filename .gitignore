@@ -1,14 +1,20 @@
-# Configuration files (contain sensitive information)
-config.py
-# But keep the example file
-!config.example.py
+# Local configuration (contains secrets)
+config.json
+!config.example.json
 
 # SQLite database (task state)
 orchestra.db
 *.db-journal
 *.db-wal
 
-# macOS - all directories
+# Node / TypeScript
+node_modules/
+server/dist/
+server/public/
+client/dist/
+*.tsbuildinfo
+
+# macOS
 **/.DS_Store
 **/.AppleDouble
 **/.LSOverride
@@ -18,22 +24,6 @@ orchestra.db
 **/ehthumbs.db
 **/Desktop.ini
 
-# Linux
-**/*~
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-*.egg-info/
-dist/
-build/
-
 # IDE
 .vscode/
 .idea/
@@ -41,22 +31,8 @@ build/
 *.swo
 *~
 
-# Logs
+# Logs / temp
 **/*.log
-
-# Temporary files
 **/*.tmp
 **/*.bak
 **/*.cache
-
-# Task folders contents
-tasks/pending/*
-tasks/completed/*
-tasks/failed/*
-# Examples folder contents - these are tracked
-# tasks/examples/*
-# But keep the directories themselves
-!tasks/pending/.gitkeep
-!tasks/completed/.gitkeep
-!tasks/failed/.gitkeep
-!tasks/examples/.gitkeep
