@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { marked } from "marked";
 import { api, verdictClass, type TaskDetail as TD } from "../api";
@@ -98,10 +98,35 @@ export function TaskDetail() {
   const [noteInput, setNoteInput] = useState("");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
 
+  // Modal states
+  const navigate = useNavigate();
+  const [deleteModal, setDeleteModal] = useState(false);
+  const [resetModal, setResetModal] = useState(false);
+  const [removePlan, setRemovePlan] = useState(false);
+
   const intervene = useMutation({
     mutationFn: ({ kind, payload }: { kind: string; payload?: unknown }) => api.intervene(taskId, kind, payload),
     onSuccess: refresh,
   });
+
+  const doDelete = async () => {
+    try {
+      await api.deleteTask(taskId, removePlan);
+      navigate({ to: "/" });
+    } catch (e: unknown) {
+      // error will show via query refetch
+    }
+  };
+
+  const doReset = async () => {
+    try {
+      await api.resetTask(taskId);
+      refresh();
+      setResetModal(false);
+    } catch (e: unknown) {
+      // error will show via query refetch
+    }
+  };
 
   if (q.isLoading) return <p className="muted">Loading…</p>;
   if (q.isError || !q.data) return <p className="pill bad">Task not found.</p>;
@@ -110,6 +135,44 @@ export function TaskDetail() {
 
   return (
     <div>
+      {/* Delete confirmation modal */}
+      {deleteModal && (
+        <div className="modal-overlay" onClick={() => setDeleteModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Delete Task</h3>
+            <p className="muted" style={{ margin: "12px 0" }}>
+              This permanently deletes the task and all associated role runs and interventions.
+              This cannot be undone.
+            </p>
+            <label className="modal-check">
+              <input type="checkbox" checked={removePlan} onChange={(e) => setRemovePlan(e.target.checked)} />
+              Also delete associated .md plan file from disk
+            </label>
+            <div className="modal-actions">
+              <button className="small" onClick={() => { setDeleteModal(false); setRemovePlan(false); }}>Cancel</button>
+              <button className="small danger" onClick={doDelete}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset confirmation modal */}
+      {resetModal && (
+        <div className="modal-overlay" onClick={() => setResetModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Reset Task</h3>
+            <p className="muted" style={{ margin: "12px 0" }}>
+              This clears all run history, interventions, and output files, moving the task
+              back to intake status. The task's name and content are preserved.
+            </p>
+            <div className="modal-actions">
+              <button className="small" onClick={() => setResetModal(false)}>Cancel</button>
+              <button className="small warn" onClick={doReset}>Reset</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="row" style={{ marginBottom: 12 }}>
         {t.project_id != null && (
           <Link to="/projects/$projectId" params={{ projectId: String(t.project_id) }}>← board</Link>
@@ -119,6 +182,13 @@ export function TaskDetail() {
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
+        <div style={{ flex: 1 }} />
+        <button className="small" onClick={() => setResetModal(true)} title="Reset to intake">
+          🔄 Reset
+        </button>
+        <button className="small danger" onClick={() => { setRemovePlan(false); setDeleteModal(true); }} title="Delete task">
+          🗑
+        </button>
       </div>
 
       {t.review_reason && (
