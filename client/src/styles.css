@@ -133,3 +133,66 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .steering-entry { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; font-size: 12px; }
 .steering-entry.consumed { opacity: 0.55; }
 .steering-entry.pending { background: rgba(209, 145, 60, 0.08); border: 1px solid rgba(209, 145, 60, 0.2); }
+
+/* ---- Modal ---- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(3px);
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px 24px;
+  max-width: 420px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.modal h3 {
+  color: var(--brass);
+  font-size: 15px;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.modal-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-dim);
+  margin: 14px 0;
+  cursor: pointer;
+}
+.modal-check input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--brass);
+}
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+.modal-actions button.danger {
+  background: rgba(204, 91, 91, 0.15);
+  border-color: var(--bad);
+  color: var(--bad);
+}
+.modal-actions button.danger:hover {
+  background: rgba(204, 91, 91, 0.3);
+}
+.modal-actions button.warn {
+  background: rgba(209, 145, 60, 0.15);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.modal-actions button.warn:hover {
+  background: rgba(209, 145, 60, 0.3);
+}
