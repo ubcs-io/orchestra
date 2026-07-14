@@ -1,8 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { marked } from "marked";
-import { api, verdictClass, type TaskDetail as TD, type RoleRun, type CoverageMap } from "../api";
+import {
+  ReactFlow,
+  Background,
+  MiniMap,
+  BackgroundVariant,
+  type Node,
+  type Edge,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { api, verdictClass, type TaskDetail as TD, type RoleRun, type CoverageMap, type AgentNetworkGraph } from "../api";
+import { NetworkNodeCard } from "../components/NetworkNodeCard";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -147,6 +157,8 @@ export interface ActivityState {
   roleEndTime: number | null;
   /** Completed role stats — persist across role_start so the TPS / timing stay visible. */
   lastRole: { role: string; tokens: number; elapsedSec: number } | null;
+  /** TPS values from all completed runs so far, for min/max display. */
+  tpsHistory: number[];
 }
 
 function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }) {
@@ -157,6 +169,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     roleStartTime: null,
     roleEndTime: null,
     lastRole: null,
+    tpsHistory: [],
   });
   const bufRef = useRef("");
   const thinkRef = useRef("");
@@ -164,7 +177,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
   const repeatRef = useRef(0);
   useEffect(() => {
     setLines([]);
-    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null });
+    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: [] });
     // Mid-run recovery: if we connected after role_start was published but data is
     // already streaming, recover the active role from the plan.
     const role = nextRoleRef.current;
@@ -189,7 +202,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       bufRef.current = "";
       thinkRef.current = "";
       flushRepeat();
-      setActivity((a) => ({ currentRole: d.role, disposition: "reading", roleStartTime: Date.now(), roleEndTime: null, lastRole: a.lastRole }));
+      setActivity((a) => ({ ...a, currentRole: d.role, disposition: "reading", roleStartTime: Date.now(), roleEndTime: null, lastRole: a.lastRole }));
     });
     es.addEventListener("text", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
@@ -253,14 +266,18 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       setActivity((a) => {
         const endTime = Date.now();
         const elapsed = a.roleStartTime ? (endTime - a.roleStartTime) / 1000 : 0;
+        const lastRole = d.tokens != null && elapsed > 0
+          ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed }
+          : a.lastRole;
+        const tps = lastRole ? lastRole.tokens / lastRole.elapsedSec : null;
+        const tpsHistory = tps != null ? [...a.tpsHistory, tps] : a.tpsHistory;
         return {
           currentRole: d.role,
           disposition: "done",
           roleStartTime: a.roleStartTime,
           roleEndTime: endTime,
-          lastRole: d.tokens != null && elapsed > 0
-            ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed }
-            : a.lastRole,
+          lastRole,
+          tpsHistory,
         };
       });
     });
@@ -271,6 +288,155 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId]);
   return { lines, activity };
+}
+
+function TaskNetworkGraph({
+  networkId,
+  runs,
+  plan,
+  currentRole,
+}: {
+  networkId: string;
+  runs: RoleRun[];
+  plan: { steps: { role: string; status: string; depth: number }[] } | null;
+  currentRole: string | null;
+}) {
+  const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
+  const networkQ = useQuery({
+    queryKey: ["network", networkId],
+    queryFn: () => api.network(networkId),
+  });
+
+  const parsedGraph = useMemo<AgentNetworkGraph | null>(() => {
+    if (!networkQ.data?.network?.graph_json) return null;
+    try {
+      return JSON.parse(networkQ.data.network.graph_json) as AgentNetworkGraph;
+    } catch {
+      return null;
+    }
+  }, [networkQ.data]);
+
+  const nodeTypes = useMemo(() => ({ networkNode: NetworkNodeCard }), []);
+
+  const graphNodes: Node[] = useMemo(() => {
+    if (!parsedGraph?.nodes) return [];
+    return parsedGraph.nodes.map((n) => {
+      const roleTitle = rolesQ.data?.roles.find((r) => r.key === n.roleKey)?.title ?? n.roleKey;
+      const planStep = plan?.steps.find((s) => s.role === n.roleKey);
+      const isActive = currentRole === n.roleKey;
+      const status = isActive ? "active" : (planStep?.status ?? "pending");
+
+      return {
+        id: n.id,
+        type: "networkNode",
+        position: { x: n.position.x, y: n.position.y },
+        data: {
+          label: roleTitle,
+          roleKey: n.roleKey,
+          criteriaCount: n.criteria?.length ?? 0,
+          depth: n.overrides?.depth,
+        },
+        className: isActive
+          ? "task-network-node--active"
+          : status === "done"
+            ? "task-network-node--done"
+            : status === "skipped"
+              ? "task-network-node--skipped"
+              : "",
+      };
+    });
+  }, [parsedGraph, rolesQ.data, plan, runs, currentRole]);
+
+  const graphEdges: Edge[] = useMemo(() => {
+    if (!parsedGraph?.edges) return [];
+    return parsedGraph.edges.map((e) => ({
+      id: e.id,
+      source: e.sourceNodeId,
+      target: e.targetNodeId,
+      label: e.label,
+      type: "smoothstep" as const,
+      animated: !!e.condition,
+    }));
+  }, [parsedGraph]);
+
+  const handleNodeClick = (_event: React.MouseEvent, node: Node) => {
+    const roleKey = (node.data as { roleKey?: string }).roleKey;
+    if (!roleKey) return;
+    const run = runs.find((r) => r.role_key === roleKey);
+    if (run) {
+      const el = document.getElementById(`run-${roleKey}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+  };
+
+  if (networkQ.isLoading || rolesQ.isLoading || !parsedGraph) {
+    return null;
+  }
+
+  return (
+    <div className="task-network-graph">
+      <ReactFlow
+        nodes={graphNodes}
+        edges={graphEdges}
+        nodeTypes={nodeTypes}
+        fitView
+        nodesDraggable={false}
+        nodesConnectable={false}
+        elementsSelectable={false}
+        panOnDrag={false}
+        zoomOnScroll={false}
+        onNodeClick={handleNodeClick}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+        <MiniMap
+          nodeColor={(n) => {
+            if (n.className?.includes("--active")) return "var(--warn)";
+            if (n.className?.includes("--done")) return "var(--ok)";
+            if (n.className?.includes("--skipped")) return "var(--ink-dim)";
+            return "var(--panel-2)";
+          }}
+        />
+      </ReactFlow>
+    </div>
+  );
+}
+
+function NetworkSelector({ taskId, projectId, intakeKind, onChanged }: { taskId: string; projectId: number; intakeKind: string | null; onChanged: () => void }) {
+  const networksQ = useQuery({ queryKey: ["networks", projectId], queryFn: () => api.networks(projectId) });
+  const setNetwork = useMutation({
+    mutationFn: (networkId: string | null) =>
+      api.updateTask(taskId, { network_id: networkId } as Record<string, unknown>),
+    onSuccess: () => {
+      onChanged();
+    },
+  });
+
+  const networks = networksQ.data?.networks ?? [];
+  const kind = intakeKind ?? "manual";
+
+  // Filter networks matching this intake kind, plus all custom networks
+  const matchingNetworks = networks.filter(
+    (n) => !n.intake_kind || n.intake_kind === kind,
+  );
+
+  return (
+    <select
+      className="network-select"
+      style={{ width: "auto", fontSize: 12, padding: "2px 6px" }}
+      onChange={(e) => setNetwork.mutate(e.target.value || null)}
+      defaultValue=""
+    >
+      <option value="">network: built-in</option>
+      {matchingNetworks.map((n) => (
+        <option key={n.network_id} value={n.network_id}>
+          {n.name} {n.is_system ? "" : "✦"}
+        </option>
+      ))}
+    </select>
+  );
 }
 
 export function TaskDetail() {
@@ -314,6 +480,7 @@ export function TaskDetail() {
   const [editName, setEditName] = useState("");
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
+  const [showNetworkGraph, setShowNetworkGraph] = useState(true);
 
   // Subtask creation state
   const [creatingSubtaskKey, setCreatingSubtaskKey] = useState<string | null>(null);
@@ -459,12 +626,34 @@ export function TaskDetail() {
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
+        {t.stage === "intake" && t.project_id != null && (
+          <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
+        )}
       </div>
 
       {t.review_reason && (
         <div className="panel" style={{ borderColor: "var(--human)" }}>
           <h2>Needs review</h2>
           <p>{t.review_reason}</p>
+        </div>
+      )}
+
+      {t.network_id && t.stage !== "intake" && (
+        <div className="panel task-network-panel">
+          <div className="plan-header">
+            <h2 style={{ marginBottom: 0 }}>Agent Network</h2>
+            <button className="small" onClick={() => setShowNetworkGraph((p) => !p)}>
+              {showNetworkGraph ? "▾ Hide" : "▸ Show"}
+            </button>
+          </div>
+          {showNetworkGraph && (
+            <TaskNetworkGraph
+              networkId={t.network_id}
+              runs={d.runs}
+              plan={d.plan}
+              currentRole={activity.currentRole}
+            />
+          )}
         </div>
       )}
 
@@ -649,6 +838,70 @@ export function TaskDetail() {
             )}
           </div>
 
+          {/* In-progress role slat — shows as soon as role_start fires, before run is persisted */}
+          {activity.currentRole && activity.disposition !== "done" && (
+            <div className="panel in-progress" id="in-progress-role">
+              <div className="row" style={{ marginBottom: 6 }}>
+                <span className="in-progress-pulse" />
+                <h2 style={{ margin: 0 }}>{activity.currentRole}</h2>
+                <span className="pill warn">in progress</span>
+                <div style={{ flex: 1 }} />
+                {activity.roleStartTime && (
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    <ElapsedTime startTime={activity.roleStartTime} />
+                  </span>
+                )}
+              </div>
+              <div className="in-progress-stats">
+                <div className="in-progress-stat">
+                  <span className="muted">disposition</span>
+                  <span className="pill">
+                    {activity.disposition === "reading" && "📖 reading"}
+                    {activity.disposition === "thinking" && "💭 thinking"}
+                    {activity.disposition === "responding" && "✍ responding"}
+                    {activity.disposition === "tool" && "🔧 tool use"}
+                  </span>
+                </div>
+                <div className="in-progress-stat">
+                  <span className="muted">tps</span>
+                  <span className="pill dim">
+                    {activity.tpsHistory.length > 0
+                      ? `min ${Math.min(...activity.tpsHistory).toFixed(0)} / cur — / max ${Math.max(...activity.tpsHistory).toFixed(0)}`
+                      : "—"}
+                  </span>
+                </div>
+              </div>
+              <details className="in-progress-details" style={{ marginTop: 8 }}>
+                <summary className="muted" style={{ cursor: "pointer", fontSize: 12 }}>
+                  System prompt & settings
+                </summary>
+                <div style={{ marginTop: 8 }}>
+                  {t.project_id != null ? (
+                    <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                      Role configuration is sourced from the project's role settings.{" "}
+                      <Link to="/projects/$projectId/roles" params={{ projectId: String(t.project_id) }} className="muted" style={{ textDecoration: "underline" }}>
+                        Customize in Settings →
+                      </Link>
+                    </p>
+                  ) : (
+                    <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                      This task is not associated with a project.{" "}
+                      <Link to="/settings" className="muted" style={{ textDecoration: "underline" }}>
+                        Manage global roles in Settings →
+                      </Link>
+                    </p>
+                  )}
+                  <div className="in-progress-config-hint">
+                    <span className="muted" style={{ fontSize: 11 }}>
+                      The system prompt, tools, and model for this role are configurable per-project
+                      under the Roles editor. Changes take effect on the next role run.
+                    </span>
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
+
           {d.runs.length > 0 && (
             <div className="row" style={{ marginBottom: 8 }}>
               <button
@@ -704,6 +957,19 @@ export function TaskDetail() {
                   >
                     deepen
                   </button>
+                  {t.project_id != null && (
+                    <button
+                      className="small"
+                      title={`View ${r.role_key} configuration`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        window.open(`/projects/${t.project_id}/roles`, "_blank");
+                      }}
+                      style={{ fontSize: 14, lineHeight: 1 }}
+                    >
+                      👤
+                    </button>
+                  )}
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
                 {!isCollapsed && r.output_md && (
@@ -769,7 +1035,18 @@ export function TaskDetail() {
                 {activity.currentRole && (
                   <div className="current-state-row">
                     <span className="muted">Role</span>
-                    <span className="pill warn">{activity.currentRole}</span>
+                    <a
+                      href="#in-progress-role"
+                      className="pill warn clickable-role"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        const el = document.getElementById("in-progress-role");
+                        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+                      }}
+                      title="Jump to in-progress role slat"
+                    >
+                      {activity.currentRole}
+                    </a>
                   </div>
                 )}
                 {activity.disposition && (

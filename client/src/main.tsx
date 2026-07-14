@@ -10,12 +10,14 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 import { api } from "./api";
-import { Projects } from "./routes/Projects";
-import { ProjectBoard } from "./routes/ProjectBoard";
-import { RolesEditor } from "./routes/RolesEditor";
-import { Settings } from "./routes/Settings";
-import { TaskDetail } from "./routes/TaskDetail";
 import "./styles.css";
+
+const Projects = React.lazy(() => import("./routes/Projects").then((m) => ({ default: m.Projects })));
+const ProjectBoard = React.lazy(() => import("./routes/ProjectBoard").then((m) => ({ default: m.ProjectBoard })));
+const RolesEditor = React.lazy(() => import("./routes/RolesEditor").then((m) => ({ default: m.RolesEditor })));
+const Settings = React.lazy(() => import("./routes/Settings").then((m) => ({ default: m.Settings })));
+const TaskDetail = React.lazy(() => import("./routes/TaskDetail").then((m) => ({ default: m.TaskDetail })));
+const NetworkEditor = React.lazy(() => import("./routes/NetworkEditor").then((m) => ({ default: m.NetworkEditor })));
 
 function SchedulerToggle() {
   const qc = useQueryClient();
@@ -51,6 +53,7 @@ function Root() {
         <h1>◆ ORCHESTRA</h1>
         <nav>
           <Link to="/">Projects</Link>
+          <Link to="/networks">Networks</Link>
           <Link to="/settings">Settings</Link>
         </nav>
         <div className="spacer" />
@@ -69,8 +72,10 @@ const boardRoute = createRoute({ getParentRoute: () => rootRoute, path: "/projec
 const rolesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/projects/$projectId/roles", component: RolesEditor });
 const taskRoute = createRoute({ getParentRoute: () => rootRoute, path: "/tasks/$taskId", component: TaskDetail });
 const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings", component: Settings });
+const networksRoute = createRoute({ getParentRoute: () => rootRoute, path: "/networks", component: NetworkEditor });
+const networkDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: "/networks/$networkId", component: NetworkEditor });
 
-const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute, settingsRoute]);
+const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute, settingsRoute, networksRoute, networkDetailRoute]);
 const router = createRouter({ routeTree });
 
 declare module "@tanstack/react-router" {

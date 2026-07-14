@@ -23,6 +23,7 @@ export interface Task {
   paused: number | null;
   refinement_plan_json: string | null;
   content: string | null;
+  network_id: string | null;
 }
 
 export interface RoleRun {
@@ -137,6 +138,77 @@ export interface TaskDetail {
   interventions: Intervention[];
   children: Task[];
   taxonomy: string[];
+}
+
+// ---- Agent Networks ----
+
+export interface NetworkNode {
+  id: string;
+  roleKey: string;
+  position: { x: number; y: number };
+  overrides?: {
+    systemPrompt?: string;
+    model?: string;
+    tools?: string[];
+    depth?: number;
+  };
+  criteria?: NetworkNodeCriterion[];
+}
+
+export interface NetworkNodeCriterion {
+  id: string;
+  text: string;
+  severity: "must" | "should";
+  concern?: string;
+}
+
+export interface NetworkEdge {
+  id: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+  label?: string;
+  condition?: {
+    type: "verdict" | "always" | "coverage" | "criteria";
+    value?: string;
+    operator?: "eq" | "neq" | "any_unmet" | "any_missing";
+  };
+}
+
+export interface AgentNetworkGraph {
+  version: 1;
+  nodes: NetworkNode[];
+  edges: NetworkEdge[];
+  layout: { gridSize: number; snapToGrid: boolean };
+  metadata: {
+    rigor: "low" | "standard" | "high";
+    maxLoopbacks: number;
+    mandatoryConcerns: string[];
+    reviewerRole?: string;
+  };
+}
+
+export interface AgentNetwork {
+  id: number;
+  network_id: string;
+  name: string;
+  description: string;
+  project_id: number | null;
+  intake_kind: string | null;
+  graph_json: string;
+  is_system: number;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NetworkExport {
+  version: number;
+  exported_at: string;
+  network_id: string;
+  name: string;
+  description: string;
+  intake_kind: string | null;
+  graph: AgentNetworkGraph;
 }
 
 async function req<T>(url: string, opts?: RequestInit): Promise<T> {
@@ -254,6 +326,56 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  // Agent Networks
+  networks: (projectId?: number) =>
+    req<{ networks: AgentNetwork[] }>(`/api/networks${projectId ? `?project_id=${projectId}` : ""}`),
+  network: (networkId: string) =>
+    req<{ network: AgentNetwork }>(`/api/networks/${networkId}`),
+  defaultNetwork: (intakeKind: string, projectId?: number) =>
+    req<{ network: AgentNetwork | null }>(
+      `/api/networks/default?intake_kind=${intakeKind}${projectId ? `&project_id=${projectId}` : ""}`,
+    ),
+  createNetwork: (body: {
+    name: string;
+    description?: string;
+    project_id?: number;
+    intake_kind?: string;
+    graph_json: string;
+  }) =>
+    req<{ network: AgentNetwork }>("/api/networks", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateNetwork: (networkId: string, body: Record<string, unknown>) =>
+    req<{ network: AgentNetwork }>(`/api/networks/${networkId}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteNetwork: (networkId: string) =>
+    req<{ ok: boolean }>(`/api/networks/${networkId}`, { method: "DELETE" }),
+  duplicateNetwork: (networkId: string, name?: string) =>
+    req<{ network: AgentNetwork }>(`/api/networks/${networkId}/duplicate`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  setDefaultNetwork: (networkId: string) =>
+    req<{ network: AgentNetwork }>(`/api/networks/${networkId}/set-default`, { method: "POST" }),
+  importNetwork: (body: {
+    name?: string;
+    description?: string;
+    project_id?: number;
+    intake_kind?: string;
+    graph_json: string;
+  }) =>
+    req<{ network: AgentNetwork }>("/api/networks/import", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  exportNetwork: (networkId: string) =>
+    req<{ export: NetworkExport }>(`/api/networks/${networkId}/export`),
+  allRoles: (projectId?: number) =>
+    req<{ roles: Role[] }>(`/api/roles${projectId ? `?project_id=${projectId}` : ""}`),
 };
 
 export const STAGES = ["intake", "refining", "ready", "review"] as const;
