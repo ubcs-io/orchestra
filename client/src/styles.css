@@ -580,6 +580,7 @@ a.clickable-role:hover {
   max-width: 240px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   transition: border-color 0.15s;
+  position: relative;
 }
 .react-flow__node.selected .network-node-card {
   border-color: var(--brass);
@@ -606,6 +607,30 @@ a.clickable-role:hover {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+}
+
+.network-node-person-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: transparent;
+  border: none;
+  color: var(--ink-dim);
+  padding: 2px;
+  cursor: pointer;
+  border-radius: 3px;
+  line-height: 0;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  z-index: 10;
+}
+.network-node-card:hover .network-node-person-btn,
+.network-node-card:focus-within .network-node-person-btn {
+  opacity: 1;
+}
+.network-node-person-btn:hover {
+  color: var(--brass);
+  background: rgba(201, 162, 75, 0.12);
 }
 
 /* React Flow overrides for dark theme */

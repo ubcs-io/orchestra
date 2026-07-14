@@ -354,10 +354,10 @@ export const api = {
     }),
   deleteNetwork: (networkId: string) =>
     req<{ ok: boolean }>(`/api/networks/${networkId}`, { method: "DELETE" }),
-  duplicateNetwork: (networkId: string, name?: string) =>
+  duplicateNetwork: (networkId: string, name?: string, projectId?: number) =>
     req<{ network: AgentNetwork }>(`/api/networks/${networkId}/duplicate`, {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, project_id: projectId }),
     }),
   setDefaultNetwork: (networkId: string) =>
     req<{ network: AgentNetwork }>(`/api/networks/${networkId}/set-default`, { method: "POST" }),

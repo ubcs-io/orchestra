@@ -40,6 +40,172 @@ function generateId(): string {
 const nodeTypes = { networkNode: NetworkNodeCard };
 
 // ---------------------------------------------------------------------------
+// Role Edit Modal (extracted to manage its own form state)
+// ---------------------------------------------------------------------------
+
+function ProjectSelectModal({
+  projects,
+  onSelect,
+  onCancel,
+}: {
+  projects: Array<{ id: number; name: string }>;
+  onSelect: (projectId: number | null) => void;
+  onCancel: () => void;
+}) {
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+        <h3>Select Project</h3>
+        <p className="muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          Associate this template with a project, or leave unselected for a global template.
+        </p>
+        <select
+          value={selectedId ?? ""}
+          onChange={(e) => setSelectedId(e.target.value ? Number(e.target.value) : null)}
+          style={{ marginBottom: 12 }}
+        >
+          <option value="">(Global — no project)</option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <div className="modal-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={() => onSelect(selectedId)}>
+            Continue
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RoleEditModal({
+  role,
+  projectId,
+  onSave,
+  onCancel,
+  isSaving,
+}: {
+  role: {
+    key: string;
+    title: string | null;
+    enabled: number;
+    system_prompt: string | null;
+    tools_json: string | null;
+    model: string | null;
+    can_create_subtasks: number;
+  };
+  projectId: number | null;
+  onSave: (body: {
+    enabled: number;
+    can_create_subtasks: number;
+    system_prompt: string;
+    tools_json: string;
+    model?: string;
+  }) => void;
+  onCancel: () => void;
+  isSaving: boolean;
+}) {
+  const [prompt, setPrompt] = useState(role.system_prompt ?? "");
+  const [tools, setTools] = useState(() => {
+    try {
+      return (JSON.parse(role.tools_json ?? "[]") as string[]).join(", ");
+    } catch {
+      return "";
+    }
+  });
+  const [model, setModel] = useState(role.model ?? "");
+  const [enabled, setEnabled] = useState(role.enabled === 1);
+  const [canCreateSubtasks, setCanCreateSubtasks] = useState(role.can_create_subtasks === 1);
+
+  const handleSave = () => {
+    onSave({
+      enabled: enabled ? 1 : 0,
+      can_create_subtasks: canCreateSubtasks ? 1 : 0,
+      system_prompt: prompt,
+      tools_json: JSON.stringify(
+        tools
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      ),
+      model: model || undefined,
+    });
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+        <h3>
+          Edit Role — {role.title ?? role.key}
+        </h3>
+        <span className="pill dim" style={{ marginBottom: 12, display: "inline-block" }}>
+          {role.key}
+        </span>
+        {projectId != null && (
+          <span className="pill ok" style={{ marginLeft: 6, marginBottom: 12 }}>
+            project override
+          </span>
+        )}
+
+        <label>
+          <input
+            type="checkbox"
+            style={{ width: "auto", marginRight: 6 }}
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+          />{" "}
+          enabled
+        </label>
+
+        <label>
+          <input
+            type="checkbox"
+            style={{ width: "auto", marginRight: 6 }}
+            checked={canCreateSubtasks}
+            onChange={(e) => setCanCreateSubtasks(e.target.checked)}
+          />{" "}
+          Can Create Subtasks
+        </label>
+
+        <label>Tools (comma-separated pi built-ins: read, grep, find, ls)</label>
+        <input value={tools} onChange={(e) => setTools(e.target.value)} />
+
+        <label>Model override (optional)</label>
+        <input
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder={projectId != null ? "(project default)" : "(global default)"}
+        />
+
+        <label>System prompt</label>
+        <textarea
+          style={{ minHeight: 180 }}
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+        />
+
+        <p className="muted" style={{ fontSize: 11, fontStyle: "italic", marginTop: 10 }}>
+          Changes are applied globally to all networks that use this role.
+        </p>
+
+        <div className="modal-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" disabled={isSaving} onClick={handleSave}>
+            {isSaving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
 
@@ -57,6 +223,7 @@ export function NetworkEditor() {
     enabled: isEditing,
   });
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
+  const projectsQ = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
 
   // --- Parse current graph ---
   const currentNetwork = networkQ.data?.network ?? null;
@@ -68,6 +235,27 @@ export function NetworkEditor() {
       return null;
     }
   }, [currentNetwork]);
+
+  // --- UI & modal state (must come before initialNodes which references setRoleModalKey) ---
+  const [name, setName] = useState("New Network");
+  const [description, setDescription] = useState("");
+  const [intakeKind, setIntakeKind] = useState("manual");
+  const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
+  const [maxLoopbacks, setMaxLoopbacks] = useState(2);
+  const [snapToGrid, setSnapToGrid] = useState(true);
+
+  // Selection state — driven by React Flow's onSelectionChange for full
+  // multi-select support (nodes + edges, Shift+Click).
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+
+  // Role editing modal state
+  const [roleModalKey, setRoleModalKey] = useState<string | null>(null);
+
+  // Project selection modal state — shown before creating or duplicating
+  const [projectModalMode, setProjectModalMode] = useState<"create" | "duplicate" | null>(null);
+  // Pending project ID for "New Network" workflow (carried from modal to save)
+  const [pendingProjectId, setPendingProjectId] = useState<number | null>(null);
 
   // --- React Flow state ---
   const initialNodes: Node[] = useMemo(() => {
@@ -81,6 +269,7 @@ export function NetworkEditor() {
         roleKey: n.roleKey,
         criteriaCount: n.criteria?.length ?? 0,
         depth: n.overrides?.depth,
+        onPersonClick: () => setRoleModalKey(n.roleKey),
       },
     }));
   }, [parsedGraph, rolesQ.data]);
@@ -99,19 +288,6 @@ export function NetworkEditor() {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-
-  // --- UI state ---
-  const [name, setName] = useState("New Network");
-  const [description, setDescription] = useState("");
-  const [intakeKind, setIntakeKind] = useState("manual");
-  const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
-  const [maxLoopbacks, setMaxLoopbacks] = useState(2);
-  const [snapToGrid, setSnapToGrid] = useState(true);
-
-  // Selection state — driven by React Flow's onSelectionChange for full
-  // multi-select support (nodes + edges, Shift+Click).
-  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
-  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
 
   // Working copy of edge properties for the selected edge's condition/label
   const [edgeLabel, setEdgeLabel] = useState("");
@@ -259,6 +435,7 @@ export function NetworkEditor() {
           label: rolesQ.data?.roles.find((r) => r.key === roleKey)?.title ?? roleKey,
           roleKey,
           criteriaCount: 0,
+          onPersonClick: () => setRoleModalKey(roleKey),
         },
       };
 
@@ -371,6 +548,7 @@ export function NetworkEditor() {
       return api.createNetwork({
         name,
         description,
+        project_id: pendingProjectId ?? undefined,
         intake_kind: intakeKind,
         graph_json: graphJson,
       });
@@ -388,16 +566,50 @@ export function NetworkEditor() {
     mutationFn: () => api.deleteNetwork(networkId!),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["networks"] });
-      navigate({ to: "/networks" });
+      qc.removeQueries({ queryKey: ["network", networkId] });
+      navigate({ to: "/networks", replace: true });
     },
   });
 
+  // --- Project modal handlers ---
+  const handleProjectSelectForCreate = useCallback((projectId: number | null) => {
+    setProjectModalMode(null);
+    setPendingProjectId(projectId);
+    // Navigate to a fresh /networks route — the new network editor will use pendingProjectId on save
+    navigate({ to: "/networks" });
+  }, [navigate]);
+
+  const handleProjectSelectForDuplicate = useCallback((projectId: number | null) => {
+    setProjectModalMode(null);
+    duplicateMutation.mutate(projectId ?? undefined);
+  }, []);
+
   // --- Duplicate mutation ---
   const duplicateMutation = useMutation({
-    mutationFn: () => api.duplicateNetwork(networkId!),
+    mutationFn: (projectId?: number) => api.duplicateNetwork(networkId!, undefined, projectId),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["networks"] });
       navigate({ to: "/networks/$networkId", params: { networkId: res.network.network_id } });
+    },
+  });
+
+  // --- Role save mutation ---
+  const roleSaveMutation = useMutation({
+    mutationFn: async (body: {
+      enabled: number;
+      can_create_subtasks: number;
+      system_prompt: string;
+      tools_json: string;
+      model?: string;
+    }) => {
+      if (!roleModalKey) throw new Error("No role selected");
+      // Use network's project_id if available, otherwise 0 for global
+      const pid = currentNetwork?.project_id ?? 0;
+      return api.saveRole(pid, roleModalKey, body);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["allRoles"] });
+      setRoleModalKey(null);
     },
   });
 
@@ -438,6 +650,11 @@ export function NetworkEditor() {
                 className={`network-list-item ${n.network_id === networkId ? "active" : ""}`}
               >
                 <span>{n.name}</span>
+                {n.project_id != null && (
+                  <span className="muted">
+                    {projectsQ.data?.projects.find((p) => p.id === n.project_id)?.name ?? `Project #${n.project_id}`}
+                  </span>
+                )}
                 {n.is_default === 1 && <span className="pill ok">default</span>}
               </Link>
             ))}
@@ -445,7 +662,7 @@ export function NetworkEditor() {
             <button
               className="small"
               style={{ marginTop: 8, width: "100%" }}
-              onClick={() => duplicateMutation.mutate()}
+              onClick={() => setProjectModalMode("duplicate")}
             >
               + Duplicate
             </button>
@@ -453,7 +670,7 @@ export function NetworkEditor() {
           <button
             className="small primary"
             style={{ marginTop: 8, width: "100%" }}
-            onClick={() => navigate({ to: "/networks" })}
+            onClick={() => setProjectModalMode("create")}
           >
             + New Network
           </button>
@@ -759,6 +976,34 @@ export function NetworkEditor() {
             ))}
         </div>
       </aside>
+
+      {/* Project Select Modal */}
+      {projectModalMode && projectsQ.data && (
+        <ProjectSelectModal
+          projects={projectsQ.data.projects}
+          onSelect={
+            projectModalMode === "create"
+              ? handleProjectSelectForCreate
+              : handleProjectSelectForDuplicate
+          }
+          onCancel={() => setProjectModalMode(null)}
+        />
+      )}
+
+      {/* Role Edit Modal */}
+      {roleModalKey && (() => {
+        const role = rolesQ.data?.roles.find((r) => r.key === roleModalKey);
+        if (!role) return null;
+        return (
+          <RoleEditModal
+            role={role}
+            projectId={currentNetwork?.project_id ?? null}
+            onSave={(body) => roleSaveMutation.mutate(body)}
+            onCancel={() => setRoleModalKey(null)}
+            isSaving={roleSaveMutation.isPending}
+          />
+        );
+      })()}
     </div>
   );
 }
