@@ -23,6 +23,7 @@ export interface Task {
   paused: number | null;
   refinement_plan_json: string | null;
   content: string | null;
+  network_id: string | null;
 }
 
 export interface RoleRun {

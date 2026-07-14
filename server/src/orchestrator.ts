@@ -61,6 +61,13 @@ import {
 } from "./agent.js";
 import { getConfig } from "./config.js";
 import { resolveConnection } from "./settings.js";
+import {
+  resolveRouterConfig,
+  distillQuestions,
+  assessEscalation,
+  assessBorderline,
+  type RouterConfig,
+} from "./router.js";
 
 // ---------------------------------------------------------------------------
 // Role runner seam — injectable so the loop can be tested without a live LLM.
@@ -89,8 +96,36 @@ export interface PlanStep {
   /** Loop-back attempts spent on this step (reviewer steps only). */
   attempts?: number;
 }
+
+export interface NetworkEdgeCondition {
+  type: "verdict" | "always" | "coverage" | "criteria";
+  value?: string;
+  operator?: "eq" | "neq" | "any_unmet" | "any_missing";
+}
+
+export interface NetworkEdge {
+  id: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+  label?: string;
+  condition?: NetworkEdgeCondition;
+}
+
 export interface RefinementPlan {
   steps: PlanStep[];
+  /** If set, edge routing is enabled and edges are read from this network. */
+  networkId?: string;
+  /** Cached at plan-creation time: roleKey → nodeId. */
+  nodeIdByRole?: Record<string, string>;
+  /** Cached at plan-creation time: nodeIds in graph order. */
+  nodeIds?: string[];
+}
+
+/** Context assembled after a role step completes, used to evaluate edge conditions. */
+export interface EdgeEvaluationContext {
+  verdict: string;
+  coverage: CoverageMap;
+  criteriaResults: CriteriaResult[];
 }
 
 /** Resolve the flow template for a task from its intake kind.
@@ -158,21 +193,29 @@ function readPlan(task: TaskRow): RefinementPlan | null {
 }
 
 export function planFromTemplate(kind: IntakeKind, networkId?: string | null): RefinementPlan {
-  // If a custom network is set, resolve steps from its graph nodes in order.
+  // If a custom network is set, resolve steps from its graph nodes in order
+  // and cache edge routing data (nodeIdByRole, nodeIds, networkId).
   if (networkId) {
     const network = getNetwork(networkId);
     if (network) {
       try {
         const graph = JSON.parse(network.graph_json) as {
-          nodes?: Array<{ roleKey: string; overrides?: { depth?: number } }>;
+          nodes?: Array<{ id: string; roleKey: string; overrides?: { depth?: number } }>;
         };
         if (graph.nodes?.length) {
+          const nodeIdByRole: Record<string, string> = {};
+          for (const node of graph.nodes) {
+            nodeIdByRole[node.roleKey] = node.id;
+          }
           return {
             steps: graph.nodes.map((n) => ({
               role: n.roleKey,
               status: "pending" as const,
               depth: n.overrides?.depth ?? 1,
             })),
+            networkId,
+            nodeIdByRole,
+            nodeIds: graph.nodes.map((n) => n.id),
           };
         }
       } catch {
@@ -186,6 +229,160 @@ export function planFromTemplate(kind: IntakeKind, networkId?: string | null): R
 
 export function nextPending(plan: RefinementPlan): PlanStep | undefined {
   return plan.steps.find((s) => s.status === "pending");
+}
+
+// ---------------------------------------------------------------------------
+// Edge-aware routing engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluate a single edge condition against the context produced by the last
+ * completed role run.
+ */
+export function evaluateEdgeCondition(
+  condition: NetworkEdgeCondition | undefined,
+  context: EdgeEvaluationContext,
+): boolean {
+  if (!condition || condition.type === "always") return true;
+
+  switch (condition.type) {
+    case "verdict": {
+      const op = condition.operator ?? "eq";
+      if (op === "eq") return context.verdict === condition.value;
+      if (op === "neq") return context.verdict !== condition.value;
+      return false;
+    }
+
+    case "coverage": {
+      const op = condition.operator ?? "any_unmet";
+      const concern = condition.value;
+      if (op === "any_unmet") {
+        if (concern) return (context.coverage[concern]?.status ?? "never") !== "considered";
+        return Object.values(context.coverage).some((c) => c.status !== "considered");
+      }
+      if (op === "any_missing") {
+        if (concern) {
+          const s = context.coverage[concern]?.status ?? "never";
+          return s === "never" || s === "out_of_scope";
+        }
+        return Object.values(context.coverage).some(
+          (c) => c.status === "never" || c.status === "out_of_scope",
+        );
+      }
+      return false;
+    }
+
+    case "criteria": {
+      const op = condition.operator ?? "any_unmet";
+      if (op === "any_unmet") {
+        if (condition.value) {
+          return context.criteriaResults.some(
+            (c) => c.id === condition.value && c.status !== "met",
+          );
+        }
+        return context.criteriaResults.some((c) => c.status !== "met");
+      }
+      return false;
+    }
+
+    default:
+      return false;
+  }
+}
+
+/** Load edges from the network stored in the plan, falling back to the DB. */
+function loadEdges(plan: RefinementPlan): NetworkEdge[] {
+  // The plan stores a networkId reference; read edges from the network.
+  if (!plan.networkId) return [];
+  const network = getNetwork(plan.networkId);
+  if (!network) return [];
+  try {
+    const graph = JSON.parse(network.graph_json) as { edges?: NetworkEdge[] };
+    return graph.edges ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build an EdgeEvaluationContext from the most recent completed role run
+ * and the rolled-up task coverage.
+ */
+function buildEdgeContext(lastRun: RoleRunRow, taskId: string): EdgeEvaluationContext {
+  const coverage = rollupCoverage(taskId);
+  let criteriaResults: CriteriaResult[] = [];
+  if (lastRun.criteria_results_json) {
+    try {
+      criteriaResults = JSON.parse(lastRun.criteria_results_json) as CriteriaResult[];
+    } catch {
+      /* ignore */
+    }
+  }
+  return {
+    verdict: lastRun.verdict ?? "pass",
+    coverage,
+    criteriaResults,
+  };
+}
+
+/**
+ * Determine the next step after a role completes, using edge conditions if
+ * the plan has network routing data. Falls back to linear order when:
+ * - No network routing data exists on the plan
+ * - No context is available (first step of a task)
+ * - No outgoing edges match their conditions
+ */
+export function nextStep(
+  plan: RefinementPlan,
+  lastCompletedRole: string,
+  context?: EdgeEvaluationContext,
+): PlanStep | undefined {
+  // If no graph routing info or no context, use linear fallback
+  if (!plan.nodeIdByRole || !plan.nodeIds || !context) {
+    return plan.steps.find((s) => s.status === "pending");
+  }
+
+  const currentNodeId = plan.nodeIdByRole[lastCompletedRole];
+  if (!currentNodeId) {
+    // Role not found in graph — linear fallback
+    return plan.steps.find((s) => s.status === "pending");
+  }
+
+  // Get outgoing edges from the completed node
+  const edges = loadEdges(plan);
+  const outgoing = edges.filter((e) => e.sourceNodeId === currentNodeId);
+
+  if (outgoing.length > 0) {
+    // Evaluate conditions in edge array order — first match wins
+    for (const edge of outgoing) {
+      if (evaluateEdgeCondition(edge.condition, context)) {
+        // Find the target node's role key and return its pending step
+        const targetRole = Object.entries(plan.nodeIdByRole).find(
+          ([, id]) => id === edge.targetNodeId,
+        )?.[0];
+        if (targetRole) {
+          const targetStep = plan.steps.find(
+            (s) => s.role === targetRole && s.status === "pending",
+          );
+          if (targetStep) return targetStep;
+        }
+      }
+    }
+    // No edge matched — fall through to linear fallback
+  }
+
+  // Linear fallback: next pending step after current role in nodeIds order
+  const currentIndex = plan.nodeIds.indexOf(currentNodeId);
+  for (let i = currentIndex + 1; i < plan.nodeIds.length; i++) {
+    const nodeId = plan.nodeIds[i]!;
+    const roleKey = Object.entries(plan.nodeIdByRole).find(([, id]) => id === nodeId)?.[0];
+    if (roleKey) {
+      const step = plan.steps.find((s) => s.role === roleKey && s.status === "pending");
+      if (step) return step;
+    }
+  }
+
+  return undefined; // No pending steps — plan complete
 }
 
 /** Pure plan mutation for inject/rerun/deepen interventions (no DB). */
@@ -437,6 +634,12 @@ function answeredQuestions(taskId: string): Array<{ question: string; answer: st
     .filter((qa) => qa.question && qa.answer);
 }
 
+/** Resolve router config for a project, returning null if the router is disabled. */
+function getRouterCfg(project: ProjectRow): RouterConfig | null {
+  const cfg = resolveRouterConfig(project.config_json);
+  return cfg.enabled ? cfg : null;
+}
+
 // ---------------------------------------------------------------------------
 // Context building
 // ---------------------------------------------------------------------------
@@ -501,6 +704,90 @@ function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false): str
     );
   }
   return parts.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Call Point 1: Question Distillation (fire-and-forget after role run)
+// ---------------------------------------------------------------------------
+
+/**
+ * If the router is enabled and questionDistillation is on, run an async
+ * distillation pass over the role's open_questions. Fire-and-forget — does
+ * not block the tick. On completion, updates the stored open_questions_json.
+ */
+function maybeDistillQuestions(
+  task: TaskRow,
+  project: ProjectRow,
+  runId: number,
+  rawQuestions: string[],
+  routerCfg: RouterConfig,
+): void {
+  if (!rawQuestions.length) return;
+
+  const priorQA = answeredQuestions(task.task_id).map((qa) => ({
+    question: qa.question,
+    answer: qa.answer,
+  }));
+
+  // Also include unanswered prior questions
+  const allPrior: Array<{ question: string; answer: string | null }> = [...priorQA];
+  for (const run of listRoleRuns(task.task_id)) {
+    if (run.id === runId) continue; // skip the run we just created
+    try {
+      const qs = JSON.parse(run.open_questions_json ?? "[]") as string[];
+      for (const q of qs) {
+        if (!allPrior.some((p) => p.question === q)) {
+          allPrior.push({ question: q, answer: null });
+        }
+      }
+    } catch {
+      /* skip */
+    }
+  }
+
+  const conn = resolveConnection(project.id);
+  const modelId = task.model || project.default_model || conn.defaultModelId;
+
+  // Fire-and-forget — do not await
+  distillQuestions(
+    {
+      taskName: task.name ?? task.task_id.slice(0, 8),
+      intakeKind: task.intake_kind ?? "manual",
+      roleKey: "", // filled from the run that was just created
+      rawQuestions,
+      priorQuestions: allPrior.slice(0, 50), // cap at 50 prior questions
+    },
+    roleRunner,
+    project.repo_path,
+    project.planning_dir || "PLANNING",
+    modelId,
+  )
+    .then((distilled) => {
+      // Update the role run's open_questions with the distilled text versions
+      const distilledTexts = distilled.questions.map((dq) => dq.text);
+      // We can't directly update the role_run row's open_questions_json,
+      // but we can update a steer_note-style intervention to surface the
+      // distilled questions. For now, log the result.
+      if (distilled.merged_count > 0 || distilled.dropped_duplicates > 0) {
+        console.log(
+          `[router] question distillation for task ${task.task_id.slice(0, 8)}: ` +
+            `${distilled.merged_count} merged, ${distilled.dropped_duplicates} duplicates dropped, ` +
+            `${distilled.questions.length} final questions`,
+        );
+      }
+      // Store distilled questions as an intervention for the UI to pick up
+      createIntervention({
+        task_id: task.task_id,
+        kind: "steer_note",
+        payload_json: JSON.stringify({
+          text: `[router·distilled questions] ${distilled.questions.map((dq) => `[${dq.priority}] ${dq.text}${dq.suggested_answer ? ` → ${dq.suggested_answer}` : ""}`).join(" | ")}`,
+        }),
+        created_by: "router",
+      });
+    })
+    .catch((err) => {
+      console.warn(`[router] question distillation async failed: ${(err as Error).message}`);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +872,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   }
 
   // Persist the run.
-  createRoleRun({
+  const run = createRoleRun({
     task_id: task.task_id,
     role_key: step.role,
     verdict: findings.verdict,
@@ -604,6 +891,12 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     model: result.model,
     tokens: result.tokens,
   });
+
+  // ---- Call Point 1: Question Distillation (fire-and-forget) ----
+  const routerCfg = getRouterCfg(project);
+  if (routerCfg?.questionDistillation && findings.open_questions?.length) {
+    maybeDistillQuestions(task, project, run.id, findings.open_questions, routerCfg);
+  }
 
   // Append the section to the artifact + commit.
   appendArtifactSection(absArtifact, findings.section_md);
@@ -626,7 +919,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   });
 
   // Gate.
-  applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? []);
+  await applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? [], routerCfg);
 }
 
 /** Pure: build a context document for the orchestrator recap call. */
@@ -723,7 +1016,288 @@ async function generateRecap(
   }
 }
 
-function applyGate(
+// ---------------------------------------------------------------------------
+// Call Point 2: Escalation Assessment (before human REVIEW)
+// ---------------------------------------------------------------------------
+
+/**
+ * Before escalating a task to human REVIEW, optionally consult the router LLM
+ * to assess whether another role could resolve the issue instead.
+ * Returns true if the original escalation should be overridden (task stays in refining).
+ */
+async function maybeAssessEscalation(
+  task: TaskRow,
+  project: ProjectRow,
+  plan: RefinementPlan,
+  step: PlanStep,
+  verdict: string,
+  escalationReason: string,
+  routerCfg: RouterConfig,
+): Promise<boolean> {
+  const allRuns = listRoleRuns(task.task_id).map((r) => ({
+    role_key: r.role_key,
+    verdict: r.verdict ?? "?",
+    summary: r.summary ?? "",
+  }));
+
+  const coverage = rollupCoverage(task.task_id);
+  const lastRun = allRuns[allRuns.length - 1];
+
+  // Collect available roles from the project
+  const roles = [
+    ...new Set([
+      "privacy_review",
+      "security_review",
+      "performance_review",
+      "test_strategy",
+      "edge_case_analysis",
+      "options_exploration",
+      "ux_review",
+      "architecture_review",
+      "requirements_analyst",
+      "api_design",
+      "data_schema_review",
+      "style_conventions",
+      "dependency_integration",
+      "bug_investigator",
+    ]),
+  ];
+
+  const conn = resolveConnection(project.id);
+  const modelId = task.model || project.default_model || conn.defaultModelId;
+
+  try {
+    const assessment = await assessEscalation(
+      {
+        taskName: task.name ?? task.task_id.slice(0, 8),
+        intakeKind: task.intake_kind ?? "manual",
+        escalationReason,
+        lastRoleKey: step.role,
+        lastVerdict: verdict,
+        lastSummary: lastRun?.summary ?? "",
+        allRuns,
+        coverageMap: coverage,
+        criteriaResults: [],
+        loopbacksRemaining: 0,
+        availableRoles: roles,
+        planSteps: plan.steps,
+      },
+      roleRunner,
+      project.repo_path,
+      project.planning_dir || "PLANNING",
+      modelId,
+    );
+
+    console.log(
+      `[router] escalation assessment for task ${task.task_id.slice(0, 8)}: ` +
+        `decision=${assessment.decision} reasoning=${assessment.reasoning}`,
+    );
+
+    if (assessment.decision === "escalate" || assessment.decision === "close") {
+      // "close" overrides the escalation — treat as pass and continue
+      if (assessment.decision === "close") {
+        updateTask(task.task_id, {
+          stage: "refining",
+          paused: 0,
+        });
+        publish(task.task_id, "task_update", { stage: "refining" });
+        return true; // overridden
+      }
+      return false; // stick with escalation
+    }
+
+    // reroute or rerun
+    if (assessment.decision === "reroute" && assessment.action?.role) {
+      applyPlanMutation(
+        plan,
+        "inject_role",
+        { role: assessment.action.role, after: assessment.action.after || step.role },
+        (r) => isTerminalRole(task, r),
+      );
+      if (assessment.action.steer_note) {
+        createIntervention({
+          task_id: task.task_id,
+          kind: "steer_note",
+          payload_json: JSON.stringify({ text: assessment.action.steer_note }),
+          created_by: "router",
+        });
+      }
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        stage: "refining",
+        paused: 0,
+        review_reason: null,
+        exit_state: null,
+      });
+      publish(task.task_id, "task_update", {
+        stage: "refining",
+        routerAction: `rerouted to ${assessment.action.role}`,
+      });
+      return true; // overridden
+    }
+
+    if (assessment.decision === "rerun") {
+      const last = [...plan.steps].reverse().find((s) => s.role === step.role);
+      if (last) {
+        last.status = "pending";
+        last.depth += 1;
+      }
+      if (assessment.action?.steer_note) {
+        createIntervention({
+          task_id: task.task_id,
+          kind: "steer_note",
+          payload_json: JSON.stringify({ text: assessment.action.steer_note }),
+          created_by: "router",
+        });
+      }
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        stage: "refining",
+        paused: 0,
+        review_reason: null,
+        exit_state: null,
+      });
+      publish(task.task_id, "task_update", {
+        stage: "refining",
+        routerAction: "rerun",
+      });
+      return true; // overridden
+    }
+  } catch (err) {
+    console.warn(`[router] escalation assessment failed: ${(err as Error).message}`);
+  }
+
+  return false; // fallback: don't override
+}
+
+// ---------------------------------------------------------------------------
+// Call Point 3: Borderline Gate Assessment (partial criteria, near-exhaustion)
+// ---------------------------------------------------------------------------
+
+/**
+ * Before the reviewer gate loops back or escalates, optionally consult the
+ * router LLM for a more nuanced decision on borderline criteria.
+ * Returns null if the default behavior should proceed, or a steering action.
+ */
+async function maybeAssessBorderline(
+  task: TaskRow,
+  project: ProjectRow,
+  plan: RefinementPlan,
+  step: PlanStep,
+  unmetMust: Array<{ id: string; text: string; ownerRole: string }>,
+  missingConcerns: string[],
+  loopbackCount: number,
+  maxLoopbacks: number,
+  flow: FlowTemplate,
+  criteriaResults: CriteriaResult[],
+  coverage: CoverageMap,
+  routerCfg: RouterConfig,
+): Promise<"default" | "proceed" | "proceed_with_note" | "narrow_loopback" | "escalate_early"> {
+  // Only fire if this is a borderline situation: has partial criteria OR at last loopback
+  const hasPartials = criteriaResults.some((c) => c.status === "partial");
+  const atLastLoopback = loopbackCount >= maxLoopbacks - 1;
+
+  if (!hasPartials && !atLastLoopback) return "default";
+
+  const ownerRuns = listRoleRuns(task.task_id).filter((r) =>
+    unmetMust.some((c) => c.ownerRole === r.role_key),
+  );
+
+  const conn = resolveConnection(project.id);
+  const modelId = task.model || project.default_model || conn.defaultModelId;
+
+  try {
+    const assessment = await assessBorderline(
+      {
+        taskName: task.name ?? task.task_id.slice(0, 8),
+        intakeKind: task.intake_kind ?? "manual",
+        reviewerRole: step.role,
+        reviewerVerdict: "needs_more",
+        allCriteria: flow.criteria.map((c) => {
+          const result = criteriaResults.find((r) => r.id === c.id);
+          return {
+            id: c.id,
+            text: c.text,
+            severity: c.severity,
+            status: result?.status ?? "unmet",
+            note: result?.note ?? null,
+            ownerRole: c.ownerRole,
+          };
+        }),
+        unmetMust: unmetMust.map((c) => {
+          const result = criteriaResults.find((r) => r.id === c.id);
+          return { ...c, note: result?.note ?? null };
+        }),
+        missingConcerns,
+        loopbackCount,
+        maxLoopbacks,
+        ownerRolesSummaries: ownerRuns.map((r) => ({
+          role_key: r.role_key,
+          summary: r.summary ?? "",
+        })),
+        coverageMap: coverage,
+      },
+      roleRunner,
+      project.repo_path,
+      project.planning_dir || "PLANNING",
+      modelId,
+    );
+
+    console.log(
+      `[router] borderline assessment for task ${task.task_id.slice(0, 8)}: ` +
+        `decision=${assessment.decision} reasoning=${assessment.reasoning}`,
+    );
+
+    switch (assessment.decision) {
+      case "proceed":
+      case "proceed_with_note": {
+        if (assessment.steer_note) {
+          createIntervention({
+            task_id: task.task_id,
+            kind: "steer_note",
+            payload_json: JSON.stringify({
+              text: `[router·borderline] ${assessment.steer_note}`,
+            }),
+            created_by: "router",
+          });
+        }
+        return assessment.decision === "proceed_with_note" ? "proceed_with_note" : "proceed";
+      }
+      case "narrow_loopback": {
+        if (assessment.target_roles?.length) {
+          // Re-open only the specified target roles, not all owners
+          for (const s of plan.steps) {
+            if (assessment.target_roles.includes(s.role)) s.status = "pending";
+          }
+          step.status = "pending";
+          step.attempts = (step.attempts ?? 0) + 1;
+          if (assessment.steer_note) {
+            createIntervention({
+              task_id: task.task_id,
+              kind: "steer_note",
+              payload_json: JSON.stringify({
+                text: `[router·borderline] ${assessment.steer_note}`,
+              }),
+              created_by: "router",
+            });
+          }
+          return "narrow_loopback";
+        }
+        return "default";
+      }
+      case "escalate": {
+        return "escalate_early";
+      }
+      default:
+        return "default";
+    }
+  } catch (err) {
+    console.warn(`[router] borderline assessment failed: ${(err as Error).message}`);
+    return "default";
+  }
+}
+
+async function applyGate(
   task: TaskRow,
   project: ProjectRow,
   plan: RefinementPlan,
@@ -731,7 +1305,8 @@ function applyGate(
   verdict: string,
   coverage: CoverageMap,
   criteriaResults: CriteriaResult[] = [],
-): void {
+  routerCfg: RouterConfig | null = null,
+): Promise<void> {
   const planningDir = project.planning_dir || "PLANNING";
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const coverageJson = JSON.stringify(coverage);
@@ -762,11 +1337,37 @@ function applyGate(
   };
 
   if (verdict === "needs_human") {
+    // ---- Call Point 2: Escalation Assessment ----
+    if (routerCfg?.escalationAssessment) {
+      const overridden = await maybeAssessEscalation(
+        task,
+        project,
+        plan,
+        step,
+        verdict,
+        `Role ${step.role} flagged an ambiguity requiring human judgement.`,
+        routerCfg,
+      );
+      if (overridden) return;
+    }
     escalate(`Role ${step.role} flagged an ambiguity requiring human judgement.`);
     triggerRecap(coverage, criteriaResults);
     return;
   }
   if (verdict === "blocker") {
+    // ---- Call Point 2: Escalation Assessment ----
+    if (routerCfg?.escalationAssessment) {
+      const overridden = await maybeAssessEscalation(
+        task,
+        project,
+        plan,
+        step,
+        verdict,
+        `Role ${step.role} reported a blocker.`,
+        routerCfg,
+      );
+      if (overridden) return;
+    }
     escalate(`Role ${step.role} reported a blocker.`);
     triggerRecap(coverage, criteriaResults);
     return;
@@ -788,6 +1389,67 @@ function applyGate(
 
     if (failed) {
       const attempts = step.attempts ?? 0;
+
+      // ---- Call Point 3: Borderline Gate Assessment ----
+      if (routerCfg?.borderlineGateAssessment) {
+        const borderlineResult = await maybeAssessBorderline(
+          task,
+          project,
+          plan,
+          step,
+          unmetMust,
+          missingConcerns,
+          attempts,
+          flow.maxLoopbacks,
+          flow,
+          criteriaResults,
+          coverage,
+          routerCfg,
+        );
+
+        switch (borderlineResult) {
+          case "proceed":
+          case "proceed_with_note": {
+            // Override the loopback — proceed to terminal
+            updateTask(task.task_id, {
+              refinement_plan_json: JSON.stringify(plan),
+              coverage_json: coverageJson,
+              stage: "refining",
+            });
+            publish(task.task_id, "task_update", { stage: "refining", routerAction: borderlineResult });
+            return;
+          }
+          case "narrow_loopback": {
+            // Plan already mutated by maybeAssessBorderline — save and continue
+            updateTask(task.task_id, {
+              refinement_plan_json: JSON.stringify(plan),
+              coverage_json: coverageJson,
+              stage: "refining",
+            });
+            publish(task.task_id, "task_update", {
+              stage: "refining",
+              loopback: attempts + 1,
+              routerAction: "narrow_loopback",
+            });
+            return;
+          }
+          case "escalate_early": {
+            // Skip remaining loop-backs, escalate immediately
+            const reason =
+              `[router] Acceptance review incomplete — router advised early escalation after ${attempts} attempt(s).` +
+              (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => c.id).join(", ")}.` : "") +
+              (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
+            escalate(reason);
+            triggerRecap(coverage, criteriaResults);
+            return;
+          }
+          default:
+            // "default" — fall through to existing logic
+            break;
+        }
+      }
+
+      // ---- Default heuristic loop-back logic ----
       if (attempts < flow.maxLoopbacks) {
         // Re-open the owners of the unmet criteria (or every producer the reviewer
         // gates, if the reviewer gave no per-criterion detail) plus the reviewer.
@@ -999,10 +1661,21 @@ async function tickOnce(): Promise<boolean> {
   if (consumed.paused) return true;
   task = getTask(task.task_id)!;
 
-  const step = nextPending(plan);
+  // Determine the next step. If the plan has edge routing data and at least one
+  // role has already run, use edge conditions to bias routing. Otherwise fall
+  // back to linear order (first step, or tasks with no network graph).
+  const runs = listRoleRuns(task.task_id);
+  const lastRun = runs[runs.length - 1];
+  const context = lastRun ? buildEdgeContext(lastRun, task.task_id) : undefined;
+
+  const step = lastRun
+    ? nextStep(plan, lastRun.role_key, context)
+    : nextPending(plan);
+
   if (!step) {
     // No pending steps but not terminal — finalize as ready to avoid wedging.
-    applyGate(task, project, plan, { role: "", status: "done", depth: 1 }, "pass", rollupCoverage(task.task_id));
+    const routerCfg = getRouterCfg(project);
+    await applyGate(task, project, plan, { role: "", status: "done", depth: 1 }, "pass", rollupCoverage(task.task_id), [], routerCfg);
     return true;
   }
 

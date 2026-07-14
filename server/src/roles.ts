@@ -6,7 +6,7 @@
  * routing templates; users can override per task (§5.5 steering).
  */
 
-import { countGlobalRoles, createNetwork, getMeta, listNetworks, setMeta, upsertRole } from "./db.js";
+import { countGlobalRoles, createNetwork, getDb, getMeta, listNetworks, setMeta, upsertRole } from "./db.js";
 
 /** Read-only pi built-in tools given to code-inspecting roles. */
 export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -597,14 +597,51 @@ export function seedGlobalRoles(): void {
 // Network seeding — creates system agent_networks from built-in flow templates
 // ---------------------------------------------------------------------------
 
-const NETWORKS_SEED_VERSION = 2;
+const NETWORKS_SEED_VERSION = 4;
+
+const GRID = 20;
+/** Horizontal + vertical offset per sequential node in the waterfall layout.
+ *  Each node card is ~4 grid squares tall, so a 6-square diagonal step gives
+ *  ~40px clearance between consecutive nodes, preventing any overlap. */
+const WATERFALL_STEP = GRID * 6; // 120px diagonal step — six grid spaces down and right
+const WATERFALL_ORIGIN_X = 100;
+const WATERFALL_ORIGIN_Y = 80;
+
+/**
+ * Reposition a graph's nodes into a diagonal waterfall layout: each sequential
+ * node (by position in the nodes array) is placed WATERFALL_STEP px below and to
+ * the right of the previous node so the chain reads diagonally instead of
+ * stretching on a single unreadably-wide horizontal row.
+ */
+export interface NetworkGraph {
+  version: number;
+  nodes: { id: string; roleKey: string; position: { x: number; y: number }; criteria?: unknown[] }[];
+  edges: unknown[];
+  layout: { gridSize: number; snapToGrid: boolean };
+  metadata: { rigor?: string; maxLoopbacks?: number; mandatoryConcerns?: string[]; reviewerRole?: string };
+}
+
+export function applyWaterfallLayout(graph: NetworkGraph): NetworkGraph {
+  const nodes = (graph.nodes ?? []).map((n, i) => ({
+    ...n,
+    position: {
+      x: snap(WATERFALL_ORIGIN_X + i * WATERFALL_STEP, GRID),
+      y: snap(WATERFALL_ORIGIN_Y + i * WATERFALL_STEP, GRID),
+    },
+  }));
+  return {
+    ...graph,
+    nodes,
+    layout: { ...graph.layout, gridSize: GRID, snapToGrid: true },
+  };
+}
 
 /** Generate a default AgentNetworkGraph from a FlowTemplate. Nodes are laid out
- *  left-to-right in 240px steps with criteria attached to the nodes that own them.
+ *  in a diagonal waterfall: each subsequent node is four grid spaces below and to
+ *  the right of the previous so the chain is readable at a glance without overlap.
  */
 function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
-  const GRID = 20;
-  const STEP = GRID * 2; // 40px diagonal step per node — waterfall layout
+  const STEP = WATERFALL_STEP;
 
   // Group criteria by ownerRole.
   const criteriaByOwner = new Map<string, typeof template.criteria>();
@@ -713,6 +750,14 @@ export function seedNetworks(): void {
     // Check if any system networks exist at all — if not, re-seed regardless.
     const existing = listNetworks();
     if (existing.some((n) => n.is_system)) return;
+  }
+
+  // Bump: delete all old system networks so they are re-created with the
+  // current waterfall layout. User-created networks are never touched.
+  if (stored > 0 && stored < NETWORKS_SEED_VERSION) {
+    const d = getDb();
+    d.prepare(`DELETE FROM agent_networks WHERE is_system = 1`).run();
+    console.log(`[roles] purged old system networks (v${stored} → v${NETWORKS_SEED_VERSION})`);
   }
 
   const seededKinds = new Set(

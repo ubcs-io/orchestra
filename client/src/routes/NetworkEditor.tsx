@@ -17,6 +17,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { api, type AgentNetworkGraph } from "../api";
+import { NetworkNodeCard } from "../components/NetworkNodeCard";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,27 +34,8 @@ function generateId(): string {
 }
 
 // ---------------------------------------------------------------------------
-// NetworkNodeCard — custom React Flow node component
+// Custom React Flow node types
 // ---------------------------------------------------------------------------
-
-function NetworkNodeCard({ data }: { data: { label: string; roleKey: string; criteriaCount: number; depth?: number } }) {
-  return (
-    <div className="network-node-card">
-      <div className="network-node-header">
-        <span className="network-node-key">{data.roleKey}</span>
-        {data.depth && data.depth > 1 ? <span className="pill dim">d{data.depth}</span> : null}
-      </div>
-      <div className="network-node-body">
-        <span className="muted">{data.label}</span>
-      </div>
-      {data.criteriaCount > 0 && (
-        <div className="network-node-footer">
-          <span className="pill dim">{data.criteriaCount} criteria</span>
-        </div>
-      )}
-    </div>
-  );
-}
 
 const nodeTypes = { networkNode: NetworkNodeCard };
 
@@ -125,7 +107,11 @@ export function NetworkEditor() {
   const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
   const [maxLoopbacks, setMaxLoopbacks] = useState(2);
   const [snapToGrid, setSnapToGrid] = useState(true);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+
+  // Selection state — driven by React Flow's onSelectionChange for full
+  // multi-select support (nodes + edges, Shift+Click).
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
 
   // Sync React Flow nodes/edges whenever the parsed graph or roles data changes
   useEffect(() => {
@@ -150,6 +136,34 @@ export function NetworkEditor() {
     }
   }, [currentNetwork, parsedGraph]);
 
+  // Auto-navigate to most recent custom network (or bug flow) when landing on /networks
+  useEffect(() => {
+    if (networkId) return;
+    if (!networksQ.data) return;
+
+    const customNetworks = networksQ.data.networks
+      .filter((n) => !n.is_system)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+    if (customNetworks.length > 0) {
+      navigate({ to: "/networks/$networkId", params: { networkId: customNetworks[0].network_id }, replace: true });
+    } else {
+      const bugFlow = networksQ.data.networks.find((n) => n.is_system && n.intake_kind === "bug");
+      if (bugFlow) {
+        navigate({ to: "/networks/$networkId", params: { networkId: bugFlow.network_id }, replace: true });
+      }
+    }
+  }, [networkId, networksQ.data, navigate]);
+
+  // --- Selection handler (native React Flow multi-select) ---
+  const onSelectionChange = useCallback(
+    ({ nodes: selNodes, edges: selEdges }: { nodes: Node[]; edges: Edge[] }) => {
+      setSelectedNodeIds(selNodes.map((n) => n.id));
+      setSelectedEdgeIds(selEdges.map((e) => e.id));
+    },
+    [],
+  );
+
   // --- Connect handler ---
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -166,6 +180,39 @@ export function NetworkEditor() {
     },
     [setEdges],
   );
+
+  // --- Connect two currently-selected nodes ---
+  const connectSelected = useCallback(() => {
+    if (selectedNodeIds.length !== 2) return;
+    const [source, target] = selectedNodeIds;
+    if (!source || !target) return;
+    setEdges((eds) =>
+      addEdge(
+        {
+          id: `e-${generateId()}`,
+          source,
+          target,
+          type: "smoothstep",
+        },
+        eds,
+      ),
+    );
+  }, [selectedNodeIds, setEdges]);
+
+  // Keyboard shortcut: E connects two selected nodes
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Ignore if focus is in an input / textarea / select
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (e.key === "e" && selectedNodeIds.length === 2) {
+        e.preventDefault();
+        connectSelected();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [selectedNodeIds, connectSelected]);
 
   // --- Drop handler for adding nodes from sidebar ---
   const onDragOver = useCallback((e: React.DragEvent) => {
@@ -197,12 +244,21 @@ export function NetworkEditor() {
     [setNodes, rolesQ.data],
   );
 
-  // --- Delete selected node/edge ---
+  // --- Delete selected elements ---
   const deleteSelected = useCallback(() => {
-    setNodes((nds) => nds.filter((n) => n.id !== selectedNodeId));
-    setEdges((eds) => eds.filter((e) => e.id !== selectedNodeId));
-    setSelectedNodeId(null);
-  }, [selectedNodeId, setNodes, setEdges]);
+    if (selectedEdgeIds.length > 0) {
+      setEdges((eds) => eds.filter((e) => !selectedEdgeIds.includes(e.id)));
+    }
+    if (selectedNodeIds.length > 0) {
+      setNodes((nds) => nds.filter((n) => !selectedNodeIds.includes(n.id)));
+      // Also remove any edges incident to deleted nodes
+      setEdges((eds) =>
+        eds.filter(
+          (e) => !selectedNodeIds.includes(e.source) && !selectedNodeIds.includes(e.target),
+        ),
+      );
+    }
+  }, [selectedNodeIds, selectedEdgeIds, setNodes, setEdges]);
 
   // --- Build graph JSON for save ---
   const buildGraphJson = useCallback((): string => {
@@ -213,18 +269,26 @@ export function NetworkEditor() {
         return {
           id: n.id,
           roleKey: n.data.roleKey as string,
-          position: { x: snapToGrid ? snap(n.position.x) : n.position.x, y: snapToGrid ? snap(n.position.y) : n.position.y },
+          position: {
+            x: snapToGrid ? snap(n.position.x) : n.position.x,
+            y: snapToGrid ? snap(n.position.y) : n.position.y,
+          },
           overrides: existingNode?.overrides,
           criteria: existingNode?.criteria,
         };
       }),
-      edges: edges.map((e) => ({
-        id: e.id,
-        sourceNodeId: e.source,
-        targetNodeId: e.target,
-        label: (e.label as string) || undefined,
-        condition: { type: "always" as const },
-      })),
+      edges: edges.map((e) => {
+        const existingEdge = parsedGraph?.edges?.find((pe) => pe.id === e.id);
+        // Preserve stored condition if available, otherwise default to "always"
+        const condition = existingEdge?.condition ?? { type: "always" as const };
+        return {
+          id: e.id,
+          sourceNodeId: e.source,
+          targetNodeId: e.target,
+          label: (e.label as string) || undefined,
+          condition,
+        };
+      }),
       layout: { gridSize: GRID, snapToGrid },
       metadata: {
         rigor,
@@ -300,11 +364,45 @@ export function NetworkEditor() {
 
   const isSystem = currentNetwork?.is_system === 1;
   const isReadOnly = isSystem;
+  const hasSelection = selectedNodeIds.length > 0 || selectedEdgeIds.length > 0;
 
   return (
     <div className="network-editor-layout">
       {/* Left Sidebar — Network List */}
       <aside className="network-left-sidebar">
+        <div className="network-sidebar-section">
+          <h3>My Networks</h3>
+          {networksQ.data?.networks
+            .filter((n) => !n.is_system)
+            .map((n) => (
+              <Link
+                key={n.network_id}
+                to="/networks/$networkId"
+                params={{ networkId: n.network_id }}
+                className={`network-list-item ${n.network_id === networkId ? "active" : ""}`}
+              >
+                <span>{n.name}</span>
+                {n.is_default === 1 && <span className="pill ok">default</span>}
+              </Link>
+            ))}
+          {isEditing && (
+            <button
+              className="small"
+              style={{ marginTop: 8, width: "100%" }}
+              onClick={() => duplicateMutation.mutate()}
+            >
+              + Duplicate
+            </button>
+          )}
+          <button
+            className="small primary"
+            style={{ marginTop: 8, width: "100%" }}
+            onClick={() => navigate({ to: "/networks" })}
+          >
+            + New Network
+          </button>
+        </div>
+
         <div className="network-sidebar-section">
           <h3>Built-in Templates</h3>
           {networksQ.data?.networks
@@ -322,40 +420,11 @@ export function NetworkEditor() {
             ))}
         </div>
 
-        <div className="network-sidebar-section">
-          <h3>My Networks</h3>
-          {networksQ.data?.networks
-            .filter((n) => !n.is_system)
-            .map((n) => (
-              <Link
-                key={n.network_id}
-                to="/networks/$networkId"
-                params={{ networkId: n.network_id }}
-                className={`network-list-item ${n.network_id === networkId ? "active" : ""}`}
-              >
-                <span>{n.name}</span>
-                {n.is_default === 1 && <span className="pill ok">default</span>}
-              </Link>
-            ))}
-          <button
-            className="small primary"
-            style={{ marginTop: 8, width: "100%" }}
-            onClick={() => navigate({ to: "/networks" })}
-          >
-            + New Network
-          </button>
-        </div>
-
-        {isEditing && (
+        {isEditing && !isSystem && (
           <div className="network-sidebar-actions">
-            <button className="small" onClick={() => duplicateMutation.mutate()}>
-              Duplicate
+            <button className="small danger" onClick={() => deleteMutation.mutate()}>
+              Delete
             </button>
-            {!isSystem && (
-              <button className="small danger" onClick={() => deleteMutation.mutate()}>
-                Delete
-              </button>
-            )}
           </div>
         )}
       </aside>
@@ -401,7 +470,30 @@ export function NetworkEditor() {
                 disabled={isReadOnly}
               />
             </label>
+            <div className="row">
+              {!isReadOnly && (
+                <button
+                  className="small primary"
+                  disabled={saveMutation.isPending}
+                  onClick={() => saveMutation.mutate()}
+                >
+                  {saveMutation.isPending ? "Saving…" : "Save"}
+                </button>
+              )}
+              {isEditing && (
+                <button className="small" onClick={handleExport}>
+                  Export JSON
+                </button>
+              )}
+            </div>
           </div>
+        </div>
+
+        {/* Hint bar */}
+        <div className="network-hint-bar">
+          <span className="muted">
+            Drag from handle to connect · Shift+Click to multi-select · Click edge to select · E to connect two selected · Del to remove
+          </span>
         </div>
 
         {/* React Flow Canvas */}
@@ -413,29 +505,39 @@ export function NetworkEditor() {
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
-            onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-            onPaneClick={() => setSelectedNodeId(null)}
+            onSelectionChange={onSelectionChange}
             nodeTypes={nodeTypes}
             fitView
             snapToGrid={snapToGrid}
             snapGrid={[GRID, GRID]}
             deleteKeyCode={["Backspace", "Delete"]}
             multiSelectionKeyCode="Shift"
-            onNodesDelete={(deleted) => {
-              if (deleted.some((n) => n.id === selectedNodeId)) setSelectedNodeId(null);
-            }}
+            selectionKeyCode="Shift"
           >
             <Background variant={BackgroundVariant.Dots} gap={GRID} size={1} />
             <Controls />
             <MiniMap nodeColor={(n) => (n.selected ? "var(--brass)" : "var(--bg3)")} />
             <Panel position="top-right">
               <div className="network-canvas-toolbar">
-                {selectedNodeId && (
-                  <>
-                    <button className="small" onClick={deleteSelected}>
-                      Delete Selected
-                    </button>
-                  </>
+                {!isReadOnly && selectedEdgeIds.length === 1 && (
+                  <button className="small" onClick={deleteSelected}>
+                    Delete Edge
+                  </button>
+                )}
+                {!isReadOnly && selectedNodeIds.length === 1 && (
+                  <button className="small" onClick={deleteSelected}>
+                    Delete Node
+                  </button>
+                )}
+                {!isReadOnly && selectedNodeIds.length === 2 && (
+                  <button className="small" onClick={connectSelected}>
+                    Connect Nodes
+                  </button>
+                )}
+                {!isReadOnly && hasSelection && (selectedNodeIds.length > 2 || (selectedNodeIds.length > 0 && selectedEdgeIds.length > 0)) && (
+                  <button className="small" onClick={deleteSelected}>
+                    Delete Selected ({selectedNodeIds.length + selectedEdgeIds.length})
+                  </button>
                 )}
                 {isEditing && isSystem && (
                   <span className="muted" style={{ fontSize: 12 }}>
@@ -457,24 +559,6 @@ export function NetworkEditor() {
             />
             Snap to Grid ({GRID}px)
           </label>
-          <div className="row">
-            {!isReadOnly && (
-              <button
-                className="small primary"
-                disabled={saveMutation.isPending}
-                onClick={() => saveMutation.mutate()}
-              >
-                {saveMutation.isPending ? "Saving…" : "Save"}
-              </button>
-            )}
-            {isEditing && (
-              <>
-                <button className="small" onClick={handleExport}>
-                  Export JSON
-                </button>
-              </>
-            )}
-          </div>
         </div>
       </main>
 

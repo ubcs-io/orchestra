@@ -47,6 +47,7 @@ import {
   stopScheduler,
   tick,
 } from "../orchestrator.js";
+import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
 
 function bad(reply: FastifyReply, code: number, message: string) {
   return reply.code(code).send({ error: message });
@@ -539,6 +540,16 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     if (!network) return bad(reply, 404, "network not found");
     const body = (req.body ?? {}) as { name?: string };
     const copy = duplicateNetwork((req.params as { id: string }).id, body.name);
+
+    // Re-apply waterfall layout to the duplicate so it's always readable.
+    try {
+      const parsed = JSON.parse(copy.graph_json);
+      copy.graph_json = JSON.stringify(applyWaterfallLayout(parsed));
+      updateNetwork(copy.network_id, { graph_json: copy.graph_json });
+    } catch {
+      /* keep original layout if JSON is malformed */
+    }
+
     return { network: copy };
   });
 
@@ -580,7 +591,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       description: body.description,
       project_id: body.project_id ?? null,
       intake_kind: body.intake_kind ?? null,
-      graph_json: JSON.stringify(graph),
+      graph_json: JSON.stringify(applyWaterfallLayout(g as unknown as NetworkGraph)),
     });
     return { network };
   });

@@ -1045,12 +1045,12 @@ export function listNetworks(opts: { projectId?: number | null } = {}): AgentNet
   if (opts.projectId != null) {
     return d
       .prepare(
-        `SELECT * FROM agent_networks WHERE project_id = ? OR (project_id IS NULL AND is_system = 1) ORDER BY is_system DESC, name ASC`,
+        `SELECT * FROM agent_networks WHERE project_id = ? OR (project_id IS NULL AND is_system = 1) ORDER BY is_system ASC, name ASC`,
       )
       .all(opts.projectId) as AgentNetworkRow[];
   }
   return d
-    .prepare(`SELECT * FROM agent_networks ORDER BY is_system DESC, name ASC`)
+    .prepare(`SELECT * FROM agent_networks ORDER BY is_system ASC, name ASC`)
     .all() as AgentNetworkRow[];
 }
 

@@ -650,3 +650,53 @@ a.clickable-role:hover {
 .react-flow__handle:hover {
   background: var(--brass) !important;
 }
+.react-flow__edgeinteraction {
+  cursor: pointer !important;
+}
+.react-flow__connection-line {
+  stroke: var(--brass) !important;
+  stroke-width: 2 !important;
+}
+
+/* Hint bar */
+.network-hint-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+}
+.network-hint-bar .muted {
+  font-size: 11px;
+}
+
+/* ---- Task network graph (read-only view on TaskDetail) ---- */
+
+.task-network-graph {
+  width: 100%;
+  height: 300px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.task-network-node--active .network-node-card {
+  border-color: var(--warn) !important;
+  box-shadow: 0 0 8px rgba(209, 145, 60, 0.3);
+}
+
+.task-network-node--done .network-node-card {
+  border-color: var(--ok);
+  opacity: 0.85;
+}
+
+.task-network-node--skipped .network-node-card {
+  border-color: var(--ink-dim);
+  opacity: 0.5;
+}
+
+.task-network-panel h2 {
+  margin-bottom: 0;
+}
