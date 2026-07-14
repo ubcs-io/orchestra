@@ -12,7 +12,7 @@ import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import { getConfig } from "./config.js";
 import { getDb, initDb } from "./db.js";
-import { seedGlobalRoles } from "./roles.js";
+import { seedGlobalRoles, seedNetworks } from "./roles.js";
 import { seedGlobalConfig } from "./settings.js";
 import { apiRoutes } from "./routes/api.js";
 import { safetyRoutes } from "./routes/safety.js";
@@ -25,6 +25,7 @@ async function main(): Promise<void> {
   initDb();
   seedGlobalRoles();
   seedGlobalConfig();
+  seedNetworks();
 
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 8 * 1024 * 1024 });
 

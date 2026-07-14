@@ -425,8 +425,50 @@ function extractFindingsFromText(text: string): RoleFindings | null {
     if (parsed) return parsed;
   }
 
+  // Try unclosed fence: an opening ```json ... without a closing ```.
+  // This handles models whose output was cut off mid-response (e.g. pre-emptive
+  // nudge or token limit). We take everything after the LAST opening fence and
+  // attempt a best-effort parse.
+  const openFence = /```(?:json)?\s*\n([\s\S]*?)$/;
+  const om = openFence.exec(text);
+  if (om?.[1]) {
+    const partial = om[1].trim();
+    if (partial.length > 20) {
+      const parsed = tryParseFindings(partial);
+      if (parsed) return parsed;
+      // Best-effort: extract individual fields even from unparseable JSON.
+      const salvaged = salvageFieldsFromPartialJson(partial);
+      if (salvaged) return salvaged;
+    }
+  }
+
   // Fallback: try parsing the entire text as raw JSON (unlikely but possible).
   return tryParseFindings(text.trim());
+}
+
+/** Best-effort extraction of RoleFindings fields from malformed/partial JSON
+ *  by matching quoted field values with regex. Only returns a result when at
+ *  least verdict and summary can be extracted. */
+function salvageFieldsFromPartialJson(json: string): RoleFindings | null {
+  const str = (key: string): string | null => {
+    // Match "key": "value" — handles escaped quotes in the value via a simple
+    // greedy match to the next unescaped quote + comma/brace.
+    const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, "i");
+    const m = re.exec(json);
+    return m ? JSON.parse(`"${m[1]!.replace(/"/g, '\\"')}"`) as string : null;
+  };
+  const verdict = str("verdict");
+  const summary = str("summary");
+  if (!verdict || !summary) return null;
+  if (!["pass", "needs_more", "blocker", "needs_human"].includes(verdict)) return null;
+  return {
+    verdict: verdict as Verdict,
+    summary,
+    open_questions: [],
+    coverage: [],
+    section_md: str("section_md") ?? "",
+    criteria_results: [],
+  };
 }
 
 /** Parse a JSON string as RoleFindings, validating required fields. */

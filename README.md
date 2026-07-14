@@ -1,6 +1,6 @@
 # Orchestra
 
-**A repo-aware, steerable code-planning refinement loop.**
+**A configurable, Git-backed, code-planning refinement utility.**
 
 Connect any git repository, drop in work that ranges from a bare error log to an open-ended research prompt, and a single orchestrator routes it through a chain of specialized "software-company role" agents — powered by [pi](https://github.com/earendil-works/pi) over any OpenAI-compatible endpoint — until it becomes **actionable**: either a decomposed **spec** (epic → story → task) or a **research brief** (approaches, trade-offs, edge cases, recommendation).
 
@@ -54,6 +54,17 @@ Ten intake kinds are supported, each with a dedicated flow:
 - **Live pane** — Server-Sent Events stream the active role's reasoning and every file it reads, in real time.
 - **Coverage map** — each role declares which concerns (correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs) it examined, skipped, or ignored, so *omissions are visible* (you can see privacy was never looked at).
 - **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, create child **subtasks**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
+
+### Agent Networks
+
+Beyond the built-in flow templates, you can author custom **agent networks** — visual graphs that define how the orchestrator routes work through role agents. Networks replace a flow template's ordered list with a directed graph of nodes (roles) and edges (transitions), giving you full control over branching, parallelism, and gating logic.
+
+- **Visual editor** — available at `/networks` in the UI. Drag roles from the palette onto a React Flow canvas, connect them with edges to define the work path, and set per-network metadata (intake kind, rigor level, max loopbacks, reviewer role). Nodes are positioned on a snap-to-grid canvas.
+- **Built-in system templates** — Orchestra ships with pre-configured networks for common intake kinds (`bug`, `feature`, `security`, `research`, etc.). System networks are read-only; duplicate one to customize it for your project.
+- **Custom networks** — create networks from scratch or duplicate and modify a system template. Custom networks are editable: add/remove roles, rewire edges, adjust rigor, and set as the **default** for an intake kind. When set as default, the orchestrator will use your custom network instead of the built-in flow for matching intakes.
+- **Import / Export** — networks can be exported to and imported from JSON, making them portable across projects and Orchestra instances. Export from the canvas toolbar; import via the API (`POST /api/networks/import`).
+
+Networks are stored in SQLite alongside projects and are resolved by intake kind: when a task enters the orchestrator, the default network for its intake kind is loaded. If no custom network is set, the built-in flow template is used as a fallback.
 
 ---
 

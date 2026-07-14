@@ -9,6 +9,14 @@ export default defineConfig({
   build: {
     outDir: "../server/public",
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-reactflow": ["@xyflow/react"],
+          "vendor-marked": ["marked"],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

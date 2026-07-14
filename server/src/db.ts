@@ -153,6 +153,20 @@ export function initDb(): void {
       consumed_at  TEXT,
       created_at   TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS agent_networks (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      network_id    TEXT UNIQUE NOT NULL,
+      name          TEXT NOT NULL,
+      description   TEXT DEFAULT '',
+      project_id    INTEGER,
+      intake_kind   TEXT,
+      graph_json    TEXT NOT NULL,
+      is_system     INTEGER DEFAULT 0,
+      is_default    INTEGER DEFAULT 0,
+      created_at    TEXT,
+      updated_at    TEXT
+    );
   `);
 
   // New tasks columns (existing DBs only have the original db.py set). Must run
@@ -204,6 +218,9 @@ export function initDb(): void {
   // Whether a role can spawn child tasks via decomposition.
   addColumnIfMissing(d, "roles", "can_create_subtasks", "can_create_subtasks INTEGER DEFAULT 0");
 
+  // Agent network linking: custom flow template per task.
+  addColumnIfMissing(d, "tasks", "network_id", "network_id TEXT");
+
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_stage   ON tasks(stage);
@@ -211,6 +228,8 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_interventions_task ON interventions(task_id);
     CREATE INDEX IF NOT EXISTS idx_roles_project ON roles(project_id);
     CREATE INDEX IF NOT EXISTS idx_configs_project ON configs(project_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_networks_project ON agent_networks(project_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_networks_intake ON agent_networks(intake_kind);
   `);
 }
 
@@ -273,6 +292,7 @@ export interface TaskRow {
   review_reason: string | null;
   recap_md: string | null;
   paused: number | null;
+  network_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -335,6 +355,20 @@ export interface InterventionRow {
   created_by: string | null;
   consumed_at: string | null;
   created_at: string;
+}
+
+export interface AgentNetworkRow {
+  id: number;
+  network_id: string;
+  name: string;
+  description: string;
+  project_id: number | null;
+  intake_kind: string | null;
+  graph_json: string;
+  is_system: number;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +762,7 @@ const TASK_UPDATABLE = new Set([
   "review_reason",
   "recap_md",
   "paused",
+  "network_id",
 ]);
 
 export function updateTask(
@@ -933,4 +968,164 @@ export function listInterventions(taskId: string): InterventionRow[] {
 
 export function markInterventionConsumed(id: number): void {
   getDb().prepare(`UPDATE interventions SET consumed_at = ? WHERE id = ?`).run(now(), id);
+}
+
+// ---------------------------------------------------------------------------
+// Agent Networks (visual flow templates)
+// ---------------------------------------------------------------------------
+
+/** Create a new agent network with a unique nanoid-style identifier. */
+export function createNetwork(input: {
+  name: string;
+  description?: string;
+  project_id?: number | null;
+  intake_kind?: string | null;
+  graph_json: string;
+  is_system?: boolean;
+  is_default?: boolean;
+}): AgentNetworkRow {
+  const d = getDb();
+  const ts = now();
+  const networkId = genId(`${ts}-${process.hrtime.bigint()}`).slice(0, 16);
+  const info = d
+    .prepare(
+      `INSERT INTO agent_networks (network_id, name, description, project_id, intake_kind, graph_json, is_system, is_default, created_at, updated_at)
+       VALUES (@network_id, @name, @description, @project_id, @intake_kind, @graph_json, @is_system, @is_default, @ts, @ts)`,
+    )
+    .run({
+      network_id: networkId,
+      name: input.name,
+      description: input.description ?? "",
+      project_id: input.project_id ?? null,
+      intake_kind: input.intake_kind ?? null,
+      graph_json: input.graph_json,
+      is_system: input.is_system ? 1 : 0,
+      is_default: input.is_default ? 1 : 0,
+      ts,
+    });
+  return getNetwork(Number(info.lastInsertRowid))!;
+}
+
+export function getNetwork(identifier: number | string): AgentNetworkRow | undefined {
+  const d = getDb();
+  if (typeof identifier === "number" || /^\d+$/.test(identifier)) {
+    const row = d
+      .prepare(`SELECT * FROM agent_networks WHERE id = ?`)
+      .get(Number(identifier)) as AgentNetworkRow | undefined;
+    if (row) return row;
+  }
+  return d
+    .prepare(`SELECT * FROM agent_networks WHERE network_id = ?`)
+    .get(String(identifier)) as AgentNetworkRow | undefined;
+}
+
+export function getNetworkByIntakeKind(
+  projectId: number | null,
+  intakeKind: string,
+): AgentNetworkRow | undefined {
+  const d = getDb();
+  // Prefer a project-scoped default, then global default.
+  if (projectId != null) {
+    const row = d
+      .prepare(
+        `SELECT * FROM agent_networks WHERE intake_kind = ? AND project_id = ? AND is_default = 1 ORDER BY is_system ASC, id ASC LIMIT 1`,
+      )
+      .get(intakeKind, projectId) as AgentNetworkRow | undefined;
+    if (row) return row;
+  }
+  return d
+    .prepare(
+      `SELECT * FROM agent_networks WHERE intake_kind = ? AND project_id IS NULL AND is_default = 1 ORDER BY is_system ASC, id ASC LIMIT 1`,
+    )
+    .get(intakeKind) as AgentNetworkRow | undefined;
+}
+
+export function listNetworks(opts: { projectId?: number | null } = {}): AgentNetworkRow[] {
+  const d = getDb();
+  if (opts.projectId != null) {
+    return d
+      .prepare(
+        `SELECT * FROM agent_networks WHERE project_id = ? OR (project_id IS NULL AND is_system = 1) ORDER BY is_system DESC, name ASC`,
+      )
+      .all(opts.projectId) as AgentNetworkRow[];
+  }
+  return d
+    .prepare(`SELECT * FROM agent_networks ORDER BY is_system DESC, name ASC`)
+    .all() as AgentNetworkRow[];
+}
+
+const NETWORK_UPDATABLE = new Set([
+  "name",
+  "description",
+  "project_id",
+  "intake_kind",
+  "graph_json",
+  "is_default",
+]);
+
+export function updateNetwork(
+  identifier: number | string,
+  fields: Record<string, unknown>,
+): AgentNetworkRow | undefined {
+  const d = getDb();
+  const network = getNetwork(identifier);
+  if (!network || network.is_system) return network; // system networks are immutable
+
+  const updates = Object.entries(fields).filter(([k]) => NETWORK_UPDATABLE.has(k));
+  if (updates.length) {
+    updates.push(["updated_at", now()]);
+    const isNumeric = typeof identifier === "number" || /^\d+$/.test(String(identifier));
+    const keyCol = isNumeric ? "id" : "network_id";
+    const keyVal = isNumeric ? Number(identifier) : String(identifier);
+    const setClause = updates.map(([k]) => `${k} = ?`).join(", ");
+    d.prepare(`UPDATE agent_networks SET ${setClause} WHERE ${keyCol} = ?`).run(
+      ...updates.map(([, v]) => v as never),
+      keyVal,
+    );
+  }
+  return getNetwork(identifier);
+}
+
+/** Set a network as the default for its intake_kind, clearing any previous default. */
+export function setDefaultNetwork(
+  identifier: number | string,
+): AgentNetworkRow | undefined {
+  const network = getNetwork(identifier);
+  if (!network || !network.intake_kind) return network;
+
+  const d = getDb();
+  // Clear previous default for this intake_kind + scope
+  d.prepare(
+    `UPDATE agent_networks SET is_default = 0 WHERE intake_kind = ? AND project_id IS ?`,
+  ).run(network.intake_kind, network.project_id);
+
+  // Set this one as default
+  d.prepare(`UPDATE agent_networks SET is_default = 1 WHERE id = ?`).run(network.id);
+  return getNetwork(network.id);
+}
+
+export function deleteNetwork(identifier: number | string): void {
+  const d = getDb();
+  const network = getNetwork(identifier);
+  if (!network || network.is_system) return; // cannot delete system networks
+
+  const isNumeric = typeof identifier === "number" || /^\d+$/.test(String(identifier));
+  const keyCol = isNumeric ? "id" : "network_id";
+  const keyVal = isNumeric ? Number(identifier) : String(identifier);
+  d.prepare(`DELETE FROM agent_networks WHERE ${keyCol} = ?`).run(keyVal);
+}
+
+/** Duplicate a network (creates a new user-editable copy). */
+export function duplicateNetwork(identifier: number | string, newName?: string): AgentNetworkRow {
+  const network = getNetwork(identifier);
+  if (!network) throw new Error("Network not found");
+  return createNetwork({
+    name: newName ?? `${network.name} (copy)`,
+    description: network.description,
+    project_id: network.project_id,
+    intake_kind: network.intake_kind,
+    graph_json: network.graph_json,
+    is_system: false,
+    is_default: false,
+  });
 }

@@ -10,19 +10,27 @@ import { fileURLToPath } from "node:url";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   createIntervention,
+  createNetwork,
   createProject,
   createTask,
+  deleteNetwork,
   deleteProject,
   deleteTask,
+  duplicateNetwork,
   getGlobalConfig,
+  getNetwork,
+  getNetworkByIntakeKind,
   getProject,
   getTask,
   listInterventions,
+  listNetworks,
   listProjects,
   listRoles,
   listRoleRuns,
   listTasks,
   resetTask,
+  setDefaultNetwork,
+  updateNetwork,
   updateProject,
   updateTask,
   upsertConfig,
@@ -445,5 +453,165 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       payload_json: body.payload ? JSON.stringify(body.payload) : null,
     });
     return { intervention: iv };
+  });
+
+  // ---- Agent Networks (visual flow templates) ----
+
+  // List all networks. Query params: ?project_id=X (filters to project scope + global system).
+  app.get("/api/networks", async (req: FastifyRequest) => {
+    const q = req.query as { project_id?: string };
+    const projectId = q.project_id ? Number(q.project_id) : undefined;
+    return { networks: listNetworks({ projectId }) };
+  });
+
+  // Get the default network for an intake kind in a project context.
+  app.get("/api/networks/default", async (req: FastifyRequest, reply: FastifyReply) => {
+    const q = req.query as { project_id?: string; intake_kind?: string };
+    if (!q.intake_kind) return bad(reply, 400, "intake_kind is required");
+    const projectId = q.project_id ? Number(q.project_id) : null;
+    const network = getNetworkByIntakeKind(projectId, q.intake_kind);
+    return { network: network ?? null };
+  });
+
+  // Get a single network by id.
+  app.get("/api/networks/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const network = getNetwork((req.params as { id: string }).id);
+    if (!network) return bad(reply, 404, "network not found");
+    return { network };
+  });
+
+  // Create a new custom network.
+  app.post("/api/networks", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      description?: string;
+      project_id?: number;
+      intake_kind?: string;
+      graph_json?: string;
+    };
+    if (!body.name) return bad(reply, 400, "name is required");
+    if (!body.graph_json) return bad(reply, 400, "graph_json is required");
+    try {
+      JSON.parse(body.graph_json);
+    } catch {
+      return bad(reply, 400, "graph_json is not valid JSON");
+    }
+    const network = createNetwork({
+      name: body.name,
+      description: body.description,
+      project_id: body.project_id ?? null,
+      intake_kind: body.intake_kind ?? null,
+      graph_json: body.graph_json,
+    });
+    return { network };
+  });
+
+  // Update a network (PUT for full replace semantics).
+  app.put("/api/networks/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const networkId = (req.params as { id: string }).id;
+    const network = getNetwork(networkId);
+    if (!network) return bad(reply, 404, "network not found");
+    if (network.is_system) return bad(reply, 403, "system networks are read-only; duplicate to edit");
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (body.graph_json !== undefined) {
+      try {
+        JSON.parse(body.graph_json as string);
+      } catch {
+        return bad(reply, 400, "graph_json is not valid JSON");
+      }
+    }
+    const updated = updateNetwork(networkId, body);
+    return { network: updated };
+  });
+
+  // Delete a custom network.
+  app.delete("/api/networks/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const network = getNetwork((req.params as { id: string }).id);
+    if (!network) return bad(reply, 404, "network not found");
+    if (network.is_system) return bad(reply, 403, "system networks are read-only");
+    deleteNetwork((req.params as { id: string }).id);
+    return { ok: true };
+  });
+
+  // Duplicate a network (system or custom) into a new editable copy.
+  app.post("/api/networks/:id/duplicate", async (req: FastifyRequest, reply: FastifyReply) => {
+    const network = getNetwork((req.params as { id: string }).id);
+    if (!network) return bad(reply, 404, "network not found");
+    const body = (req.body ?? {}) as { name?: string };
+    const copy = duplicateNetwork((req.params as { id: string }).id, body.name);
+    return { network: copy };
+  });
+
+  // Set a network as the default for its intake_kind.
+  app.post("/api/networks/:id/set-default", async (req: FastifyRequest, reply: FastifyReply) => {
+    const network = getNetwork((req.params as { id: string }).id);
+    if (!network) return bad(reply, 404, "network not found");
+    if (!network.intake_kind) return bad(reply, 400, "network has no intake_kind");
+    const updated = setDefaultNetwork((req.params as { id: string }).id);
+    return { network: updated };
+  });
+
+  // Import a network from JSON.
+  app.post("/api/networks/import", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      description?: string;
+      project_id?: number;
+      intake_kind?: string;
+      graph_json?: string;
+    };
+    if (!body.graph_json) return bad(reply, 400, "graph_json is required");
+    // Validate graph structure
+    let graph: unknown;
+    try {
+      graph = JSON.parse(body.graph_json);
+    } catch {
+      return bad(reply, 400, "graph_json is not valid JSON");
+    }
+    const g = graph as Record<string, unknown>;
+    if (!g.nodes || !Array.isArray(g.nodes)) {
+      return bad(reply, 400, "graph_json must have a 'nodes' array");
+    }
+    if (!g.edges || !Array.isArray(g.edges)) {
+      return bad(reply, 400, "graph_json must have an 'edges' array");
+    }
+    const network = createNetwork({
+      name: body.name ?? "Imported Network",
+      description: body.description,
+      project_id: body.project_id ?? null,
+      intake_kind: body.intake_kind ?? null,
+      graph_json: JSON.stringify(graph),
+    });
+    return { network };
+  });
+
+  // Export a network as JSON.
+  app.get("/api/networks/:id/export", async (req: FastifyRequest, reply: FastifyReply) => {
+    const network = getNetwork((req.params as { id: string }).id);
+    if (!network) return bad(reply, 404, "network not found");
+    let graph: unknown;
+    try {
+      graph = JSON.parse(network.graph_json);
+    } catch {
+      return bad(reply, 500, "stored graph_json is not valid JSON");
+    }
+    return {
+      export: {
+        version: 1,
+        exported_at: new Date().toISOString(),
+        network_id: network.network_id,
+        name: network.name,
+        description: network.description,
+        intake_kind: network.intake_kind,
+        graph,
+      },
+    };
+  });
+
+  // List all roles (global + project-merged) — used by the network editor palette.
+  app.get("/api/roles", async (req: FastifyRequest) => {
+    const q = req.query as { project_id?: string };
+    const projectId = q.project_id ? Number(q.project_id) : null;
+    return { roles: listRoles(projectId) };
   });
 }

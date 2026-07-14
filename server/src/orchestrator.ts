@@ -13,6 +13,7 @@ import {
   createIntervention,
   createRoleRun,
   createTask,
+  getNetwork,
   getProject,
   getRole,
   getTask,
@@ -92,9 +93,59 @@ export interface RefinementPlan {
   steps: PlanStep[];
 }
 
-/** Resolve the flow template for a task from its intake kind. */
+/** Resolve the flow template for a task from its intake kind.
+ *  If the task has a custom network_id, resolve criteria, reviewer, rigor,
+ *  mandatoryConcerns, and maxLoopbacks from the stored graph. */
 function flowForTask(task: TaskRow): FlowTemplate {
-  return flowForIntake((task.intake_kind as IntakeKind) || "manual");
+  const base = flowForIntake((task.intake_kind as IntakeKind) || "manual");
+  if (!task.network_id) return base;
+
+  const network = getNetwork(task.network_id);
+  if (!network) return base;
+
+  try {
+    const graph = JSON.parse(network.graph_json) as {
+      metadata?: {
+        rigor?: "low" | "standard" | "high";
+        maxLoopbacks?: number;
+        mandatoryConcerns?: string[];
+        reviewerRole?: string;
+      };
+      nodes?: Array<{
+        roleKey: string;
+        criteria?: Array<{ id: string; text: string; severity: string; concern?: string }>;
+      }>;
+    };
+
+    const meta = graph.metadata ?? {};
+
+    // Merge criteria: graph criteria attached to nodes become criterion with
+    // ownerRole = node's roleKey, severity from criterion if present, "must" default.
+    const graphCriteria: typeof base.criteria = [];
+    for (const node of graph.nodes ?? []) {
+      for (const c of node.criteria ?? []) {
+        graphCriteria.push({
+          id: c.id,
+          text: c.text,
+          ownerRole: node.roleKey,
+          severity: (c.severity as "must" | "should") || "must",
+          concern: c.concern,
+        });
+      }
+    }
+
+    return {
+      key: base.key,
+      rigor: meta.rigor ?? base.rigor,
+      steps: graph.nodes?.map((n) => n.roleKey) ?? base.steps,
+      reviewerRole: meta.reviewerRole ?? base.reviewerRole,
+      criteria: graphCriteria.length > 0 ? graphCriteria : base.criteria,
+      mandatoryConcerns: meta.mandatoryConcerns ?? base.mandatoryConcerns,
+      maxLoopbacks: meta.maxLoopbacks ?? base.maxLoopbacks,
+    };
+  } catch {
+    return base;
+  }
 }
 
 function readPlan(task: TaskRow): RefinementPlan | null {
@@ -106,7 +157,29 @@ function readPlan(task: TaskRow): RefinementPlan | null {
   }
 }
 
-export function planFromTemplate(kind: IntakeKind): RefinementPlan {
+export function planFromTemplate(kind: IntakeKind, networkId?: string | null): RefinementPlan {
+  // If a custom network is set, resolve steps from its graph nodes in order.
+  if (networkId) {
+    const network = getNetwork(networkId);
+    if (network) {
+      try {
+        const graph = JSON.parse(network.graph_json) as {
+          nodes?: Array<{ roleKey: string; overrides?: { depth?: number } }>;
+        };
+        if (graph.nodes?.length) {
+          return {
+            steps: graph.nodes.map((n) => ({
+              role: n.roleKey,
+              status: "pending" as const,
+              depth: n.overrides?.depth ?? 1,
+            })),
+          };
+        }
+      } catch {
+        // Fall through to built-in template.
+      }
+    }
+  }
   const roles = flowForIntake(kind).steps;
   return { steps: roles.map((role) => ({ role, status: "pending", depth: 1 })) };
 }
@@ -780,8 +853,19 @@ function applyGate(
     if (isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec") {
       // Only [epic] and [story] nodes decompose further; [task] is the atomic leaf.
       // The role must also have can_create_subtasks enabled (default: only decomposition).
-      const level = task.level ?? "task";
+      let level = task.level ?? "task";
       const roleCfg = getRole(project.id, step.role);
+      // Auto-promote a "task" level to "story" when the decomposition role produced
+      // a parseable [epic]/[story]/[task] tree. The model clearly intends this to be
+      // decomposable — the default "task" level was just never overridden.
+      if (level === "task" && roleCfg?.can_create_subtasks) {
+        const runs = listRoleRuns(task.task_id);
+        const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
+        if (decomp?.output_md && parseDecompositionTree(decomp.output_md).length > 0) {
+          level = "story";
+          updateTask(task.task_id, { level });
+        }
+      }
       if ((level === "epic" || level === "story") && roleCfg?.can_create_subtasks) {
         createDecompositionChildren(task, project);
       }
@@ -898,7 +982,10 @@ async function tickOnce(): Promise<boolean> {
   // Ensure a plan; intake → refining on first plan.
   let plan = readPlan(task);
   if (!plan) {
-    plan = planFromTemplate((task.intake_kind as IntakeKind) || "manual");
+    plan = planFromTemplate(
+      (task.intake_kind as IntakeKind) || "manual",
+      task.network_id,
+    );
     // Fold any promoted project roles for this kind into the plan.
     plan = withPromotedRoles(project, task, plan);
     updateTask(task.task_id, { refinement_plan_json: JSON.stringify(plan), stage: "refining" });

@@ -6,7 +6,7 @@
  * routing templates; users can override per task (§5.5 steering).
  */
 
-import { countGlobalRoles, getMeta, setMeta, upsertRole } from "./db.js";
+import { countGlobalRoles, createNetwork, getMeta, listNetworks, setMeta, upsertRole } from "./db.js";
 
 /** Read-only pi built-in tools given to code-inspecting roles. */
 export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -347,6 +347,15 @@ Rules:
 If you are a counter-reviewer with acceptance criteria to verify, also include:
 - **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
 
+IMPORTANT for decomposition: in section_md, present the task tree using nested
+bullets labeled **[epic]**, **[story]**, and **[task]** (case-insensitive) so
+downstream tooling can parse them. Each label must appear at the START of the
+bullet line. Example:
+- **[epic] Big Goal**
+  - **[story] User-facing Story**
+    - **[task] Atomic Action**
+    - **[task] Another Atomic Action**
+
 Output ONLY the JSON block — nothing before, nothing after.
 `.trim();
 
@@ -582,4 +591,153 @@ export function seedGlobalRoles(): void {
   }
   setMeta("roles_seed_version", String(ROLES_SEED_VERSION));
   console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (v${ROLES_SEED_VERSION})`);
+}
+
+// ---------------------------------------------------------------------------
+// Network seeding — creates system agent_networks from built-in flow templates
+// ---------------------------------------------------------------------------
+
+const NETWORKS_SEED_VERSION = 2;
+
+/** Generate a default AgentNetworkGraph from a FlowTemplate. Nodes are laid out
+ *  left-to-right in 240px steps with criteria attached to the nodes that own them.
+ */
+function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
+  const GRID = 20;
+  const STEP = GRID * 2; // 40px diagonal step per node — waterfall layout
+
+  // Group criteria by ownerRole.
+  const criteriaByOwner = new Map<string, typeof template.criteria>();
+  for (const c of template.criteria) {
+    const list = criteriaByOwner.get(c.ownerRole) ?? [];
+    list.push(c);
+    criteriaByOwner.set(c.ownerRole, list);
+  }
+
+  const nodes = template.steps.map((roleKey, i) => {
+    const isReviewer = roleKey === template.reviewerRole;
+    const isTerminal =
+      roleKey === TERMINAL_ROLE["spec"] || roleKey === TERMINAL_ROLE["research_brief"];
+
+    // Assign criteria to the owner nodes.
+    const ownerCriteria = criteriaByOwner.get(roleKey) ?? [];
+    // Reviewer also gets all "must" criteria for display.
+    const reviewerCriteria =
+      isReviewer
+        ? template.criteria.filter((c) => c.severity === "must")
+        : [];
+
+    const nodeCriteria =
+      ownerCriteria.length > 0
+        ? ownerCriteria.map((c) => ({
+            id: c.id,
+            text: c.text,
+            severity: c.severity,
+            concern: c.concern,
+          }))
+        : reviewerCriteria.length > 0
+          ? reviewerCriteria.map((c) => ({
+              id: c.id,
+              text: c.text,
+              severity: c.severity,
+              concern: c.concern,
+            }))
+          : undefined;
+
+    // Waterfall: first node at top-left origin, each subsequent node offset 2 grid
+    // spaces down and right so the chain reads diagonally rather than stretching on
+    // a single unreadably wide horizontal row.
+    const ORIGIN_X = 100;
+    const ORIGIN_Y = 80;
+    return {
+      id: `n${i + 1}`,
+      roleKey,
+      position: {
+        x: snap(ORIGIN_X + i * STEP, GRID),
+        y: snap(ORIGIN_Y + i * STEP, GRID),
+      },
+      criteria: nodeCriteria,
+    };
+  });
+
+  // Build edges: connect consecutive nodes.
+  const edges = [];
+  for (let i = 1; i < nodes.length; i++) {
+    edges.push({
+      id: `e${i}`,
+      sourceNodeId: nodes[i - 1]!.id,
+      targetNodeId: nodes[i]!.id,
+      label: i === nodes.length - 1 ? "pass" : undefined,
+      condition: { type: "always" as const },
+    });
+  }
+
+  // Identify the reviewer node and add loopback metadata.
+  const reviewerIdx = template.steps.indexOf(template.reviewerRole);
+  if (reviewerIdx >= 0) {
+    // Find the predecessor (the last non-reviewer, non-terminal before the reviewer).
+    const predIdx = reviewerIdx - 1;
+    if (predIdx >= 0 && edges[predIdx]) {
+      edges[predIdx]!.label = "needs_more → loopback";
+    }
+  }
+
+  const graph = {
+    version: 1,
+    nodes,
+    edges,
+    layout: { gridSize: GRID, snapToGrid: true },
+    metadata: {
+      rigor: template.rigor,
+      maxLoopbacks: template.maxLoopbacks,
+      mandatoryConcerns: template.mandatoryConcerns,
+      reviewerRole: template.reviewerRole,
+    },
+  };
+
+  return JSON.stringify(graph);
+}
+
+function snap(v: number, grid: number): number {
+  return Math.round(v / grid) * grid;
+}
+
+/**
+ * Seed (or refresh) system agent networks from the built-in flow templates.
+ * Idempotent: only runs when version bumps or networks are missing. Only creates
+ * rows for intake kinds that don't already have a system default.
+ */
+export function seedNetworks(): void {
+  const stored = Number(getMeta("networks_seed_version") ?? "0");
+  if (stored >= NETWORKS_SEED_VERSION) {
+    // Check if any system networks exist at all — if not, re-seed regardless.
+    const existing = listNetworks();
+    if (existing.some((n) => n.is_system)) return;
+  }
+
+  const seededKinds = new Set(
+    listNetworks()
+      .filter((n) => n.is_system)
+      .map((n) => n.intake_kind),
+  );
+
+  let count = 0;
+  for (const [kind, template] of Object.entries(FLOW_TEMPLATES) as [IntakeKind, FlowTemplate][]) {
+    if (seededKinds.has(kind)) continue;
+
+    const graphJson = flowToGraph(template, kind);
+    createNetwork({
+      name: `${kind.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())} Flow`,
+      description: `Built-in ${template.rigor}-rigor flow for ${kind} intakes. ${template.steps.length} roles, ${template.criteria.length} criteria.`,
+      project_id: null,
+      intake_kind: kind,
+      graph_json: graphJson,
+      is_system: true,
+      is_default: true,
+    });
+    count++;
+  }
+
+  setMeta("networks_seed_version", String(NETWORKS_SEED_VERSION));
+  console.log(`[roles] seeded ${count} system agent networks (v${NETWORKS_SEED_VERSION})`);
 }

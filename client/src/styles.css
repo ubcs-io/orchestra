@@ -334,3 +334,319 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .steering-header h2 {
   margin: 0 !important;
 }
+
+/* ---- In-progress role slat (appears below Refinement Plan while a role runs) ---- */
+.panel.in-progress {
+  border-color: var(--warn);
+  border-left: 3px solid var(--warn);
+  background: rgba(209, 145, 60, 0.06);
+}
+.in-progress-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex-shrink: 0;
+  animation: in-progress-pulse-anim 1.2s ease-in-out infinite;
+}
+@keyframes in-progress-pulse-anim {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.75); }
+}
+.in-progress-stats {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.in-progress-stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.in-progress-details summary:hover {
+  color: var(--brass);
+}
+.in-progress-config-hint {
+  background: rgba(201, 162, 75, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+
+/* ---- Clickable role pill in the Current State panel ---- */
+a.clickable-role {
+  cursor: pointer;
+}
+a.clickable-role:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* ---- Network Editor ---- */
+
+.network-editor-layout {
+  display: flex;
+  height: calc(100vh - 52px);
+  overflow: hidden;
+}
+
+/* Left sidebar — network list */
+.network-left-sidebar {
+  width: 240px;
+  min-width: 200px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.network-sidebar-section h3 {
+  margin: 0 0 6px 0;
+  font-size: 13px;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.network-list-item {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 13px;
+  transition: border-color 0.15s;
+}
+.network-list-item:hover {
+  border-color: var(--line);
+  text-decoration: none;
+}
+.network-list-item.active {
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.08);
+}
+.network-list-item .muted {
+  font-size: 11px;
+}
+.network-sidebar-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+/* Canvas area */
+.network-canvas-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.network-topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.network-name-input {
+  font-size: 15px;
+  font-weight: 600;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--brass);
+  padding: 4px 8px;
+  border-radius: 4px;
+  width: auto;
+  min-width: 200px;
+}
+.network-name-input:focus {
+  border-color: var(--brass);
+  outline: none;
+}
+.network-topbar .row {
+  gap: 8px;
+  align-items: center;
+}
+.network-topbar select {
+  width: auto;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+/* Flow wrapper */
+.network-flow-wrapper {
+  flex: 1;
+  position: relative;
+}
+.network-canvas-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+/* Bottom bar */
+.network-bottombar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+.network-bottombar .row {
+  gap: 8px;
+  align-items: center;
+}
+.network-bottombar input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+/* Right sidebar — role palette */
+.network-right-sidebar {
+  width: 220px;
+  min-width: 180px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  padding: 12px;
+  overflow-y: auto;
+}
+.network-right-sidebar h3 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.network-role-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.network-role-card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  cursor: grab;
+  transition: border-color 0.15s, background 0.15s;
+}
+.network-role-card:hover {
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.06);
+}
+.network-role-card:active {
+  cursor: grabbing;
+  border-color: var(--accent);
+}
+.network-role-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.network-role-key {
+  font-size: 11px;
+  color: var(--brass);
+  font-weight: 600;
+}
+.network-role-card .muted {
+  font-size: 11px;
+  display: block;
+}
+
+/* Custom network node card */
+.network-node-card {
+  background: var(--panel);
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-width: 180px;
+  max-width: 240px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  transition: border-color 0.15s;
+}
+.react-flow__node.selected .network-node-card {
+  border-color: var(--brass);
+}
+.network-node-card:hover {
+  border-color: var(--accent);
+}
+.network-node-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.network-node-key {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--brass);
+}
+.network-node-body {
+  font-size: 11px;
+}
+.network-node-footer {
+  margin-top: 6px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+/* React Flow overrides for dark theme */
+.react-flow {
+  background: var(--bg) !important;
+}
+.react-flow__node {
+  font-family: inherit !important;
+}
+.react-flow__edge-path {
+  stroke: var(--ink-dim) !important;
+  stroke-width: 2;
+}
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--brass) !important;
+}
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--accent) !important;
+}
+.react-flow__edge-text {
+  fill: var(--ink-dim) !important;
+  font-size: 11px !important;
+}
+.react-flow__controls button {
+  background: var(--panel-2) !important;
+  border-color: var(--line) !important;
+  fill: var(--ink) !important;
+}
+.react-flow__controls button:hover {
+  background: var(--panel) !important;
+  border-color: var(--brass) !important;
+}
+.react-flow__minimap {
+  background: var(--panel-2) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 4px !important;
+}
+.react-flow__handle {
+  background: var(--line) !important;
+  border: 2px solid var(--panel) !important;
+}
+.react-flow__handle:hover {
+  background: var(--brass) !important;
+}
