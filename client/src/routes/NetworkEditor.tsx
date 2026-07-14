@@ -16,7 +16,7 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type AgentNetworkGraph } from "../api";
+import { api, type AgentNetworkGraph, type NetworkEdge } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 
 // ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ export function NetworkEditor() {
       target: e.targetNodeId,
       label: e.label,
       type: "smoothstep",
-      animated: !!e.condition,
+      animated: !e.condition,
     }));
   }, [parsedGraph]);
 
@@ -112,6 +112,27 @@ export function NetworkEditor() {
   // multi-select support (nodes + edges, Shift+Click).
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+
+  // Working copy of edge properties for the selected edge's condition/label
+  const [edgeLabel, setEdgeLabel] = useState("");
+  const [edgeCondition, setEdgeCondition] = useState<NetworkEdge["condition"]>({ type: "always" });
+
+  // When a single edge is selected, populate the editor from current data
+  useEffect(() => {
+    if (selectedEdgeIds.length !== 1) return;
+    const edgeId = selectedEdgeIds[0];
+    // Check parsed graph first, then React Flow state for unsaved edges
+    const stored = parsedGraph?.edges?.find((pe) => pe.id === edgeId);
+    if (stored) {
+      setEdgeLabel(stored.label ?? "");
+      setEdgeCondition(stored.condition ?? { type: "always" });
+      return;
+    }
+    // Unsaved edge – use internal label if any
+    const rfEdge = edges.find((e) => e.id === edgeId);
+    setEdgeLabel((rfEdge?.label as string) ?? "");
+    setEdgeCondition({ type: "always" });
+  }, [selectedEdgeIds, parsedGraph, edges]);
 
   // Sync React Flow nodes/edges whenever the parsed graph or roles data changes
   useEffect(() => {
@@ -168,11 +189,12 @@ export function NetworkEditor() {
   const onConnect = useCallback(
     (connection: Connection) => {
       setEdges((eds) =>
-        addEdge(
+          addEdge(
           {
             ...connection,
             id: `e-${generateId()}`,
             type: "smoothstep",
+            animated: true,
           },
           eds,
         ),
@@ -193,6 +215,7 @@ export function NetworkEditor() {
           source,
           target,
           type: "smoothstep",
+          animated: true,
         },
         eds,
       ),
@@ -244,6 +267,32 @@ export function NetworkEditor() {
     [setNodes, rolesQ.data],
   );
 
+  // --- Edge property handlers ---
+  const updateEdgeLabel = useCallback(
+    (id: string, label: string) => {
+      setEdgeLabel(label);
+      setEdges((eds) =>
+        eds.map((e) => (e.id === id ? { ...e, label } : e)),
+      );
+    },
+    [setEdges],
+  );
+
+  const updateEdgeCondition = useCallback(
+    (id: string, condition: NetworkEdge["condition"]) => {
+      setEdgeCondition(condition);
+      // Edges with a non-"always" condition become solid (animated=false) like saved edges
+      const hasCustomCondition =
+        condition?.type !== "always" || condition?.operator || condition?.value;
+      setEdges((eds) =>
+        eds.map((e) =>
+          e.id === id ? { ...e, animated: !hasCustomCondition } : e,
+        ),
+      );
+    },
+    [setEdges],
+  );
+
   // --- Delete selected elements ---
   const deleteSelected = useCallback(() => {
     if (selectedEdgeIds.length > 0) {
@@ -279,13 +328,20 @@ export function NetworkEditor() {
       }),
       edges: edges.map((e) => {
         const existingEdge = parsedGraph?.edges?.find((pe) => pe.id === e.id);
-        // Preserve stored condition if available, otherwise default to "always"
-        const condition = existingEdge?.condition ?? { type: "always" as const };
+        // If this edge is currently selected and being edited, use working copy
+        const isSelected =
+          selectedEdgeIds.length === 1 && selectedEdgeIds[0] === e.id;
+        const condition = isSelected
+          ? edgeCondition
+          : (existingEdge?.condition ?? { type: "always" as const });
+        const label = isSelected
+          ? (edgeLabel || undefined)
+          : ((e.label as string) || undefined);
         return {
           id: e.id,
           sourceNodeId: e.source,
           targetNodeId: e.target,
-          label: (e.label as string) || undefined,
+          label,
           condition,
         };
       }),
@@ -516,8 +572,12 @@ export function NetworkEditor() {
           >
             <Background variant={BackgroundVariant.Dots} gap={GRID} size={1} />
             <Controls />
-            <MiniMap nodeColor={(n) => (n.selected ? "var(--brass)" : "var(--bg3)")} />
-            <Panel position="top-right">
+            <MiniMap
+              nodeColor={(n) => (n.selected ? "var(--brass)" : "var(--bg3)")}
+              position="top-right"
+              style={{ width: 150, height: 113 }}
+            />
+            <Panel position="top-center">
               <div className="network-canvas-toolbar">
                 {!isReadOnly && selectedEdgeIds.length === 1 && (
                   <button className="small" onClick={deleteSelected}>
@@ -562,8 +622,119 @@ export function NetworkEditor() {
         </div>
       </main>
 
-      {/* Right Sidebar — Role Palette */}
+      {/* Right Sidebar — Edge Properties & Role Palette */}
       <aside className="network-right-sidebar">
+        {/* Edge Properties Panel — shown when exactly one edge is selected */}
+        {!isReadOnly && selectedEdgeIds.length === 1 && (() => {
+          const edgeId = selectedEdgeIds[0];
+          const rfEdge = edges.find((e) => e.id === edgeId);
+          const sourceNode = nodes.find((n) => n.id === rfEdge?.source);
+          const targetNode = nodes.find((n) => n.id === rfEdge?.target);
+          const sourceRole = rolesQ.data?.roles.find((r) => r.key === (sourceNode?.data?.roleKey as string));
+          const targetRole = rolesQ.data?.roles.find((r) => r.key === (targetNode?.data?.roleKey as string));
+
+          const condType = edgeCondition?.type ?? "always";
+          const showOperator = condType !== "always";
+          const showValue = condType === "verdict" || condType === "criteria";
+
+          return (
+            <div className="network-sidebar-section">
+              <h3>Edge Properties</h3>
+
+              {/* Source / Target info */}
+              <div className="row muted" style={{ fontSize: 12, marginBottom: 8, gap: 4 }}>
+                <span>{sourceRole?.title ?? (sourceNode?.data as any)?.roleKey as string ?? rfEdge?.source ?? "?"}</span>
+                <span>→</span>
+                <span>{targetRole?.title ?? (targetNode?.data as any)?.roleKey as string ?? rfEdge?.target ?? "?"}</span>
+              </div>
+
+              {/* Label */}
+              <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                Label
+                <input
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={edgeLabel}
+                  onChange={(e) => updateEdgeLabel(edgeId, e.target.value)}
+                  placeholder="Optional edge label"
+                />
+              </label>
+
+              {/* Condition Type */}
+              <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                Condition
+                <select
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={condType}
+                  onChange={(e) => {
+                    const newType = e.target.value as NonNullable<NetworkEdge["condition"]>["type"];
+                    if (newType === "always") {
+                      updateEdgeCondition(edgeId, { type: "always" });
+                    } else if (newType === "coverage") {
+                      updateEdgeCondition(edgeId, { type: "coverage", operator: "any_unmet" });
+                    } else if (newType === "verdict") {
+                      updateEdgeCondition(edgeId, { type: "verdict", operator: "eq", value: "pass" });
+                    } else {
+                      updateEdgeCondition(edgeId, { type: newType, operator: "any_unmet", value: "" });
+                    }
+                  }}
+                >
+                  <option value="always">Always (unconditional)</option>
+                  <option value="verdict">Verdict — pass / blocker / etc.</option>
+                  <option value="coverage">Coverage — unmet / missing</option>
+                  <option value="criteria">Criteria — unmet / missing</option>
+                </select>
+              </label>
+
+              {/* Operator (for non-"always" types) */}
+              {showOperator && (
+                <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                  Operator
+                  <select
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={edgeCondition?.operator ?? "any_unmet"}
+                    onChange={(e) =>
+                      updateEdgeCondition(edgeId, {
+                        ...edgeCondition!,
+                        operator: e.target.value as NonNullable<NetworkEdge["condition"]>["operator"],
+                      })
+                    }
+                  >
+                    {condType === "verdict" ? (
+                      <>
+                        <option value="eq">Equals (==)</option>
+                        <option value="neq">Not Equals (!=)</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="any_unmet">Any Unmet</option>
+                        <option value="any_missing">Any Missing</option>
+                      </>
+                    )}
+                  </select>
+                </label>
+              )}
+
+              {/* Value (for verdict / criteria) */}
+              {showValue && (
+                <label className="muted" style={{ display: "block", marginBottom: 8 }}>
+                  {condType === "verdict" ? "Verdict" : "Key"}
+                  <input
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={edgeCondition?.value ?? ""}
+                    onChange={(e) =>
+                      updateEdgeCondition(edgeId, {
+                        ...edgeCondition!,
+                        value: e.target.value,
+                      })
+                    }
+                    placeholder={condType === "verdict" ? "pass" : "criteria key"}
+                  />
+                </label>
+              )}
+            </div>
+          );
+        })()}
+
         <h3>Roles</h3>
         <div className="network-role-list">
           {rolesQ.data?.roles
