@@ -639,7 +639,7 @@ export function NetworkEditor() {
       {/* Left Sidebar — Network List */}
       <aside className="network-left-sidebar">
         <div className="network-sidebar-section">
-          <h3>My Networks</h3>
+          <h3>Custom Templates</h3>
           {networksQ.data?.networks
             .filter((n) => !n.is_system)
             .map((n) => (
@@ -664,7 +664,7 @@ export function NetworkEditor() {
               style={{ marginTop: 8, width: "100%" }}
               onClick={() => setProjectModalMode("duplicate")}
             >
-              + Duplicate
+              + Duplicate Template
             </button>
           )}
           <button
@@ -672,7 +672,7 @@ export function NetworkEditor() {
             style={{ marginTop: 8, width: "100%" }}
             onClick={() => setProjectModalMode("create")}
           >
-            + New Network
+            + New Template
           </button>
         </div>
 
