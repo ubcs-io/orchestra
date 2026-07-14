@@ -55,8 +55,14 @@ export interface Connection {
   thinkingFormat: string;
   /** When true, record_findings is NOT registered as a tool and the model is
    *  instructed to output findings as JSON in markdown instead. Opt-in for
-   *  models whose native function-calling is unreliable. */
+   *  models whose native function-calling is unreliable. Superseded by twoPhase. */
   textMode: boolean;
+  /** When true, the role run is split into two phases within one session:
+   *  phase 1 explores with tools and produces a natural-language summary;
+   *  phase 2 formalizes that summary as structured JSON (no custom tool call).
+   *  Supersedes textMode — use this for models whose built-in tool usage works
+   *  but whose custom tool calling (record_findings) is unreliable. */
+  twoPhase: boolean;
 }
 
 /**
@@ -122,5 +128,6 @@ export function resolveConnection(projectId?: number | null): Connection {
     thinkingLevel: pick(project?.thinking_level, global?.thinking_level, cfg.thinkingLevel)! as Connection["thinkingLevel"],
     thinkingFormat: pick(project?.thinking_format, global?.thinking_format, cfg.thinkingFormat)!,
     textMode: pick(boolFromDb(project?.text_mode), boolFromDb(global?.text_mode)) ?? false,
+    twoPhase: pick(boolFromDb(project?.two_phase), boolFromDb(global?.two_phase)) ?? false,
   };
 }

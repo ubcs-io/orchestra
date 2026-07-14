@@ -21,6 +21,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { appendArtifactSection, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
+import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.js";
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
 export type CoverageStatus = "considered" | "skipped" | "out_of_scope";
@@ -76,6 +77,8 @@ export interface RoleRunResult {
   /** True if the run narrated a tool call instead of invoking it and had to be aborted
    *  mid-turn (see createStallDetector) — even if the auto-retry then recovered. */
   stalled: boolean;
+  /** For twoPhase mode: 0 = normal/tool mode, 1 = phase 1 complete, 2 = phase 2 complete. */
+  phase?: number;
   /** The LLM stop reason ("stop" | "length" | "toolUse" | ...); "length" == truncated. */
   stopReason?: string;
   /** The model's reasoning trace (native reasoning channel + any inline <think>). */
@@ -97,8 +100,14 @@ export interface RunRoleParams {
   thinkingLevel?: ThinkingLevel;
   /** When true, record_findings is NOT registered as a tool — the model must output
    *  findings as a ```json block in the answer text instead. Opt-in for models whose
-   *  native function-calling is unreliable. */
+   *  native function-calling is unreliable. Superseded by twoPhase. */
   textMode?: boolean;
+  /** When true, splits the run into two phases within the same pi session:
+   *  phase 1 explores with tools and produces a natural-language summary;
+   *  phase 2 formalizes that summary as structured JSON (no custom tool call).
+   *  Supersedes textMode for models whose built-in tool usage works but whose
+   *  custom tool calling (record_findings) is unreliable. */
+  twoPhase?: boolean;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -554,9 +563,14 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     },
   });
 
-  // System prompt: append text-mode finish instruction when textMode is on,
-  // otherwise use the normal tool-call discipline.
-  const disciplineSuffix = textMode ? TEXT_MODE_INSTRUCTION : TOOL_CALL_DISCIPLINE;
+  // System prompt: twoPhase supersedes textMode — it uses the exploration-phase
+  // contract (no record_findings tool, just explore and summarize naturally).
+  const twoPhase = params.twoPhase === true;
+  const disciplineSuffix = twoPhase
+    ? TWO_PHASE_EXPLORE_CONTRACT
+    : textMode
+      ? TEXT_MODE_INSTRUCTION
+      : TOOL_CALL_DISCIPLINE;
 
   const settingsManager = SettingsManager.inMemory();
   const loader = new DefaultResourceLoader({
@@ -579,10 +593,12 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const wantsGit = params.tools.includes(GIT_HISTORY_TOOL);
   const builtinTools = params.tools.filter((t) => t !== GIT_HISTORY_TOOL);
 
-  // In text mode, strip record_findings from custom tools — the model must output
-  // JSON in text instead. write_artifact and git_history remain available.
+  // In textMode or twoPhase, strip record_findings from custom tools — the model
+  // must output findings in text instead. write_artifact and git_history remain
+  // available for both exploration phases.
+  const wantsRecordFindings = !textMode && !twoPhase;
   const customTools: ReturnType<typeof defineTool>[] = [writeArtifact];
-  if (!textMode) customTools.unshift(recordFindings);
+  if (wantsRecordFindings) customTools.unshift(recordFindings);
   if (wantsGit) customTools.push(gitHistory);
 
   const { session } = await createAgentSession({
@@ -677,7 +693,10 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     if (params.signal) {
       params.signal.addEventListener("abort", () => void session.abort(), { once: true });
     }
-    emit({ type: "status", message: textMode ? "running (text mode)" : "running" });
+    const modeLabel = twoPhase ? "running (phase 1/2)" : textMode ? "running (text mode)" : "running";
+    emit({ type: "status", message: modeLabel });
+
+    // ---- Phase 1: Exploration (twoPhase) or single-turn (normal/textMode) ----
     try {
       await session.prompt(params.context);
     } catch (err) {
@@ -689,22 +708,41 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     }
 
     // Retry logic for stall/preemptive-nudge: if the model was narrating without
-    // acting, inject the nudge and give it one more chance.
-    if ((stalled || preemptiveNudged) && !captured && !stallRetried) {
+    // acting, inject the nudge and give it one more chance. In twoPhase mode,
+    // retries are disabled — if phase 1 stalls we proceed directly to phase 2
+    // which gives the model a clean prompt for JSON output.
+    if ((stalled || preemptiveNudged) && !captured && !stallRetried && !twoPhase) {
       stallRetried = true;
       stalled = false;
       preemptiveNudged = false;
       stallDetector.reset();
       answerTextLenSinceLastTool = 0;
-      const nudgeMsg = preemptiveNudged
-        ? STALL_NUDGE
-        : stalled
-          ? STALL_NUDGE
-          : STALL_NUDGE;
       record({ type: "status", message: "retrying: call the tool directly instead of narrating it" });
       try {
-        await session.prompt(nudgeMsg);
+        await session.prompt(STALL_NUDGE);
       } catch (err) {
+        const selfAbort = stalled || preemptiveNudged;
+        if (!selfAbort || params.signal?.aborted) throw err;
+      }
+    }
+
+    // ---- Phase 2: Formalize (twoPhase only) ----
+    // In twoPhase mode, after phase 1 exploration, send a second prompt asking
+    // the model to formalize its findings as JSON (no tools expected). This avoids
+    // the unreliable custom-tool-calling path while preserving built-in tool usage.
+    if (twoPhase && !captured) {
+      // Reset stall state for the formalization turn.
+      stalled = false;
+      preemptiveNudged = false;
+      stallDetector.reset();
+      answerTextLenSinceLastTool = 0;
+
+      record({ type: "status", message: "phase 2: formalizing findings as structured JSON" });
+      try {
+        await session.prompt(TWO_PHASE_FORMALIZE_PROMPT);
+      } catch (err) {
+        // Self-aborts during phase 2 are tolerable — we'll fall back to extracting
+        // whatever text was produced. External cancellations still propagate.
         const selfAbort = stalled || preemptiveNudged;
         if (!selfAbort || params.signal?.aborted) throw err;
       }
@@ -719,46 +757,86 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   emitThinking(tail.thinking);
 
   let fallback = false;
-  if (!captured) {
-    // The model finished without the required tool call. First, try to extract
-    // structured findings from the answer text (text-mode path or accidental JSON).
+  let phase: number | undefined;
+  if (twoPhase) {
+    // Two-phase: the model should have produced a JSON block in phase 2 answer text.
+    // If phase 1 stalled or phase 2 didn't produce JSON, we still consider it
+    // non-fallback if we can extract structured findings from either phase.
+    phase = captured ? 2 : stalled ? 1 : 2;
     const extracted = extractFindingsFromText(answerText);
     if (extracted) {
       captured = extracted;
-      // Not a fallback — the model did produce structured output, just via text.
       fallback = false;
     } else {
-      // True fallback: salvage the (think-stripped) answer text.
       fallback = true;
-      const stallReason = stallEverDetected
-        ? `Role repeated itself / narrated tool use without invoking it${
-            stallRetried ? " (even after a direct nudge)" : ""
-          }; captured raw output.`
-        : preemptiveNudged && !stallEverDetected
-          ? "Model produced substantial text without any tool call; captured raw output."
-          : stopReason === "length"
-            ? "Output was truncated (hit the token limit) before the role recorded a verdict."
-            : "Role finished without a structured verdict; captured raw output.";
-
-      const narrationNote = hasNarrationPattern(answerText)
-        ? " (model was still narrating intent to call tools at end of run)"
-        : "";
-
-      captured = {
-        verdict: "needs_more",
-        summary: stallReason + narrationNote,
-        open_questions: [],
-        coverage: [],
-        section_md: answerText.trim() || "_(model produced only reasoning — see the reasoning trace)_",
-        criteria_results: [],
-      };
+      captured = synthesizeFallback(
+        answerText,
+        stallEverDetected,
+        stallRetried,
+        preemptiveNudged,
+        stopReason,
+      );
+    }
+  } else if (!captured) {
+    // Normal/textMode: the model finished without the required tool call.
+    // First, try to extract structured findings from the answer text.
+    const extracted = extractFindingsFromText(answerText);
+    if (extracted) {
+      captured = extracted;
+      fallback = false;
+    } else {
+      fallback = true;
+      captured = synthesizeFallback(
+        answerText,
+        stallEverDetected,
+        stallRetried,
+        preemptiveNudged,
+        stopReason,
+      );
     }
   }
+
+  // ---- Fallback synthesis (reused by both paths) ----
+  function synthesizeFallback(
+    text: string,
+    everStalled: boolean,
+    retried: boolean,
+    nudged: boolean,
+    reason: string | undefined,
+  ): RoleFindings {
+    if (!text) {
+      text = answerText; // fallback to accumulated text in closure
+    }
+    const stallReason = everStalled
+      ? `Role repeated itself / narrated tool use without invoking it${
+          retried ? " (even after a direct nudge)" : ""
+        }; captured raw output.`
+      : nudged && !everStalled
+        ? "Model produced substantial text without any tool call; captured raw output."
+        : reason === "length"
+          ? "Output was truncated (hit the token limit) before the role recorded a verdict."
+          : "Role finished without a structured verdict; captured raw output.";
+
+    const narrationNote = hasNarrationPattern(text)
+      ? " (model was still narrating intent to call tools at end of run)"
+      : "";
+
+    return {
+      verdict: "needs_more",
+      summary: stallReason + narrationNote,
+      open_questions: [],
+      coverage: [],
+      section_md: text.trim() || "_(model produced only reasoning — see the reasoning trace)_",
+      criteria_results: [],
+    };
+  }
+
+  // ---- Remove old fallback block (logic moved above) ----
 
   if (fallback || stopReason === "length" || stallEverDetected) {
     console.warn(
       `[agent] role run: model=${params.modelId} stop=${stopReason ?? "?"} ` +
-        `fallback=${fallback} stalled=${stallEverDetected} retried=${stallRetried} textMode=${textMode} ` +
+        `fallback=${fallback} stalled=${stallEverDetected} retried=${stallRetried} textMode=${textMode} twoPhase=${twoPhase} ` +
         `tokens=${tokens} answer_chars=${answerText.length} thinking_chars=${thinkingText.length}`,
     );
   }
@@ -773,6 +851,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     model: params.modelId,
     fallback,
     stalled: stallEverDetected,
+    phase,
     stopReason,
     thinkingText,
   };

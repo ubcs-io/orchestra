@@ -197,6 +197,10 @@ export function initDb(): void {
   // model is instead instructed to output findings as a JSON code block. Opt-in
   // for models whose function-calling is unreliable (small MoE, quantized, etc.).
   addColumnIfMissing(d, "configs", "text_mode", "text_mode INTEGER DEFAULT 0");
+  // Two-phase session mode: phase 1 explores with tools, phase 2 formalizes as JSON.
+  // Supersedes text_mode for models whose built-in tool usage works but whose
+  // custom tool calling (record_findings) is unreliable.
+  addColumnIfMissing(d, "configs", "two_phase", "two_phase INTEGER DEFAULT 0");
   // Whether a role can spawn child tasks via decomposition.
   addColumnIfMissing(d, "roles", "can_create_subtasks", "can_create_subtasks INTEGER DEFAULT 0");
 
@@ -295,6 +299,7 @@ export interface ConfigRow {
   thinking_level: string | null;
   thinking_format: string | null;
   text_mode: number | null;
+  two_phase: number | null;
   extra_json: string | null;
   created_at: string;
   updated_at: string;
@@ -556,6 +561,7 @@ export function upsertConfig(input: {
   thinking_level?: string | null;
   thinking_format?: string | null;
   text_mode?: number | null;
+  two_phase?: number | null;
   extra_json?: string | null;
 }): ConfigRow {
   const d = getDb();
@@ -585,6 +591,7 @@ export function upsertConfig(input: {
     thinking_level: keep(input.thinking_level, base.thinking_level),
     thinking_format: keep(input.thinking_format, base.thinking_format),
     text_mode: keep(input.text_mode, base.text_mode),
+    two_phase: keep(input.two_phase, base.two_phase),
     extra_json: keep(input.extra_json, base.extra_json),
   };
 
@@ -593,7 +600,7 @@ export function upsertConfig(input: {
       `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
-        thinking_format=@thinking_format, text_mode=@text_mode, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
+        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
   }
@@ -601,9 +608,9 @@ export function upsertConfig(input: {
   const info = d
     .prepare(
       `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
-         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, extra_json, created_at, updated_at)
+         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, two_phase, extra_json, created_at, updated_at)
        VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
-         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @extra_json, @ts, @ts)`,
+         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
   return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;

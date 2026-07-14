@@ -550,7 +550,7 @@ export function TaskDetail() {
                     <label className="muted" style={{ display: "block", marginBottom: 4 }}>Name</label>
                     <input
                       className="intake-textarea"
-                      style={{ height: "auto", marginBottom: 8 }}
+                      style={{ minHeight: "auto", height: "auto", marginBottom: 8 }}
                       value={editName}
                       onChange={(e) => setEditName(e.target.value)}
                       placeholder="Task name"

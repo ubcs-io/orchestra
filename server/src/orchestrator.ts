@@ -368,7 +368,7 @@ function answeredQuestions(taskId: string): Array<{ question: string; answer: st
 // Context building
 // ---------------------------------------------------------------------------
 
-function buildRoleContext(task: TaskRow, roleKey: string): string {
+function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false): string {
   const parts: string[] = [];
   parts.push(`# Task: ${task.name ?? task.task_id}`);
   parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
@@ -413,11 +413,20 @@ function buildRoleContext(task: TaskRow, roleKey: string): string {
     }
   }
 
-  parts.push(
-    `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
-      `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in plain ` +
-      `text first — just make it.`,
-  );
+  if (twoPhase) {
+    parts.push(
+      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+        `write a concise natural-language summary of your findings. Do not look for a "record_findings" ` +
+        `tool — just write your summary as plain text. You will be asked to formalize it as structured ` +
+        `JSON in the next step.`,
+    );
+  } else {
+    parts.push(
+      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
+        `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in plain ` +
+        `text first — just make it.`,
+    );
+  }
   return parts.join("\n");
 }
 
@@ -454,9 +463,10 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       modelId,
       systemPrompt: role.system_prompt,
       tools,
-      context: buildRoleContext(task, step.role),
+      context: buildRoleContext(task, step.role, conn.twoPhase),
       thinkingLevel: conn.reasoning ? conn.thinkingLevel : undefined,
       textMode: conn.textMode,
+      twoPhase: conn.twoPhase,
       onEvent: (ev) => publish(task.task_id, ev.type as never, ev),
       signal: ac.signal,
     });

@@ -129,3 +129,16 @@ describe("createStallDetector", () => {
     expect(d.push("Something else.")).toBe(false);
   });
 });
+
+describe("twoPhase contract (pure)", () => {
+  it("TWO_PHASE_EXPLORE_CONTRACT does not mention record_findings", async () => {
+    const { TWO_PHASE_EXPLORE_CONTRACT } = await import("../src/roles.js");
+    expect(TWO_PHASE_EXPLORE_CONTRACT).not.toMatch(/record_findings/);
+  });
+
+  it("TWO_PHASE_FORMALIZE_PROMPT includes JSON block instruction", async () => {
+    const { TWO_PHASE_FORMALIZE_PROMPT } = await import("../src/roles.js");
+    expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/```json/);
+    expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/verdict/);
+  });
+});
