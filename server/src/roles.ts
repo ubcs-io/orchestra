@@ -291,6 +291,65 @@ Set verdict "needs_more" if any "must" criterion is not fully met (this routes t
 work back to the responsible role); use "pass" only when every "must" criterion is met.
 `.trim();
 
+/**
+ * Two-phase session contract: phase 1 (exploration). Appended to the system prompt
+ * when twoPhase is active. The model uses available tools freely, then stops with a
+ * natural-language summary — record_findings is NOT registered as a tool, so the
+ * model cannot accidentally try to call it and stall.
+ */
+export const TWO_PHASE_EXPLORE_CONTRACT = `
+## How to finish (two-phase exploration)
+
+You are in the exploration phase. Use the available tools to inspect the repository
+and ground your reasoning in real code. When you have gathered enough to assess the
+situation, write a concise natural-language summary of your key findings and then
+stop. Do NOT call any "finish" tool — just write your summary as plain text.
+
+Your summary should cover:
+- What you examined and what you found
+- Any open questions or uncertainties
+- A preliminary verdict (pass / needs_more / blocker / needs_human)
+
+You will be asked to formalize your findings as structured JSON in the next step.
+Do not pre-empt that step — save formalization for when you are explicitly asked.
+`.trim();
+
+/**
+ * Two-phase session: phase 2 prompt. Sent as a follow-up within the same pi
+ * session after the exploration phase completes. The model has full conversation
+ * context from phase 1 and is instructed to formalize its findings as JSON text
+ * (no tools). Parsed by extractFindingsFromText() in agent.ts.
+ */
+export const TWO_PHASE_FORMALIZE_PROMPT = `
+## Phase 2 — Formalize your findings
+
+Based on the exploration you completed above, output your structured findings as a
+single JSON code block. Do NOT use any tools for this — just produce the JSON.
+
+Format exactly (replace the example values with your own):
+\`\`\`json
+{
+  "verdict": "pass",
+  "summary": "One or two sentences capturing your key takeaway.",
+  "open_questions": [],
+  "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}],
+  "section_md": "## My Role\\n\\nFindings with concrete file references..."
+}
+\`\`\`
+
+Rules:
+- **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
+- **summary**: brief key takeaway
+- **open_questions**: array of strings (empty if none)
+- **coverage**: array of { concern, status, note }. status is "considered", "skipped", or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}. Be honest about what you did NOT examine.
+- **section_md**: a markdown section (start with "## <Your Role>" heading) with concrete file references. This will be appended to the task's planning artifact.
+
+If you are a counter-reviewer with acceptance criteria to verify, also include:
+- **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
+
+Output ONLY the JSON block — nothing before, nothing after.
+`.trim();
+
 export const DEFAULT_ROLES: RoleSeed[] = [
   {
     key: "intake_triage",

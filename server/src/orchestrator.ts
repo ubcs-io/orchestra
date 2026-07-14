@@ -26,6 +26,7 @@ import {
   updateTask,
   upsertRole,
   type ProjectRow,
+  type RoleRunRow,
   type TaskRow,
 } from "./db.js";
 import { publish } from "./bus.js";
@@ -212,7 +213,7 @@ function artifactName(task: TaskRow): string {
   const shortId = task.task_id.slice(0, 8);
   const safe = (task.name ?? "task").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 40);
   const base = safe.replace(/\.md$/i, "");
-  return `${shortId}-${base}.md`;
+  return `${base}-${shortId}.md`;
 }
 
 /** Scan every project's INTAKE folder and create tasks for new files. */
@@ -352,11 +353,22 @@ function steeringNotes(taskId: string): string[] {
     .filter((t): t is string => !!t);
 }
 
+/** Collect answered questions for a task. Returns pairs of { question, answer }. */
+function answeredQuestions(taskId: string): Array<{ question: string; answer: string }> {
+  return listInterventions(taskId)
+    .filter((iv) => iv.kind === "question_answer")
+    .map((iv) => {
+      const p = parsePayload(iv.payload_json) as { question?: string; answer?: string };
+      return { question: p.question?.trim() ?? "", answer: p.answer?.trim() ?? "" };
+    })
+    .filter((qa) => qa.question && qa.answer);
+}
+
 // ---------------------------------------------------------------------------
 // Context building
 // ---------------------------------------------------------------------------
 
-function buildRoleContext(task: TaskRow, roleKey: string): string {
+function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false): string {
   const parts: string[] = [];
   parts.push(`# Task: ${task.name ?? task.task_id}`);
   parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
@@ -378,6 +390,15 @@ function buildRoleContext(task: TaskRow, roleKey: string): string {
     for (const n of notes) parts.push(`- ${n}`);
   }
 
+  // Resolved questions from human answers.
+  const answers = answeredQuestions(task.task_id);
+  if (answers.length) {
+    parts.push(`\n## Questions resolved by human`);
+    for (const qa of answers) {
+      parts.push(`- Q: ${qa.question}\n  A: ${qa.answer}`);
+    }
+  }
+
   // Counter-reviewer: hand it the acceptance checklist it must verify.
   const flow = flowForTask(task);
   if (roleKey === flow.reviewerRole && flow.criteria.length) {
@@ -392,9 +413,20 @@ function buildRoleContext(task: TaskRow, roleKey: string): string {
     }
   }
 
-  parts.push(
-    `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, and finish by calling record_findings.`,
-  );
+  if (twoPhase) {
+    parts.push(
+      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+        `write a concise natural-language summary of your findings. Do not look for a "record_findings" ` +
+        `tool — just write your summary as plain text. You will be asked to formalize it as structured ` +
+        `JSON in the next step.`,
+    );
+  } else {
+    parts.push(
+      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
+        `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in plain ` +
+        `text first — just make it.`,
+    );
+  }
   return parts.join("\n");
 }
 
@@ -431,8 +463,10 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       modelId,
       systemPrompt: role.system_prompt,
       tools,
-      context: buildRoleContext(task, step.role),
+      context: buildRoleContext(task, step.role, conn.twoPhase),
       thinkingLevel: conn.reasoning ? conn.thinkingLevel : undefined,
+      textMode: conn.textMode,
+      twoPhase: conn.twoPhase,
       onEvent: (ev) => publish(task.task_id, ev.type as never, ev),
       signal: ac.signal,
     });
@@ -469,11 +503,11 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   const { findings } = result;
 
-  // Surface degraded runs (missing verdict / truncated output) in the logs.
-  if (result.fallback || result.stopReason === "length") {
+  // Surface degraded runs (missing verdict / truncated output / stalled narration) in the logs.
+  if (result.fallback || result.stopReason === "length" || result.stalled) {
     console.warn(
       `[orchestrator] degraded run: task=${task.task_id.slice(0, 8)} role=${step.role} ` +
-        `stop=${result.stopReason ?? "?"} fallback=${result.fallback} tokens=${result.tokens}`,
+        `stop=${result.stopReason ?? "?"} fallback=${result.fallback} stalled=${result.stalled} tokens=${result.tokens}`,
     );
   }
 
@@ -490,7 +524,9 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     transcript_jsonl: result.transcriptJsonl,
     stop_reason: result.stopReason ?? null,
     fallback: result.fallback ? 1 : 0,
+    stalled: result.stalled ? 1 : 0,
     thinking_md: result.thinkingText || null,
+    open_questions_json: JSON.stringify(findings.open_questions ?? []),
     depth: step.depth,
     model: result.model,
     tokens: result.tokens,
@@ -513,10 +549,105 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     verdict: findings.verdict,
     fallback: result.fallback,
     stopReason: result.stopReason,
+    tokens: result.tokens,
   });
 
   // Gate.
   applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? []);
+}
+
+/** Pure: build a context document for the orchestrator recap call. */
+function buildRecapContext(task: TaskRow, project: ProjectRow, runs: RoleRunRow[], coverage: CoverageMap, criteriaResults: CriteriaResult[]): string {
+  const parts: string[] = [];
+  parts.push(`# Recapitulation for: ${task.name ?? task.task_id.slice(0, 8)}`);
+  parts.push(`Intake kind: ${task.intake_kind} · Exit kind: ${task.exit_kind} · Stage: ${task.stage}`);
+  parts.push(`Exit state: ${task.exit_state ?? "n/a"} · Review reason: ${task.review_reason || "none"}`);
+  parts.push("");
+  parts.push("## Role run results");
+  if (runs.length === 0) {
+    parts.push("No role runs recorded.");
+  } else {
+    for (const r of runs) {
+      parts.push(`### ${r.role_key} (depth ${r.depth})`);
+      parts.push(`- **Verdict**: ${r.verdict ?? "n/a"}`);
+      parts.push(`- **Summary**: ${r.summary ?? "n/a"}`);
+      if (r.output_md) {
+        const excerpt = r.output_md.slice(0, 600).replace(/\n+/g, " ");
+        parts.push(`- **Output excerpt**: ${excerpt}${r.output_md.length > 600 ? "…" : ""}`);
+      }
+      if (r.stop_reason === "length") parts.push(`- ⚠ Truncated (hit token limit)`);
+      if (r.fallback === 1) parts.push(`- ⚠ Fallback (no record_findings call)`);
+      if (r.stalled === 1) parts.push(`- ⚠ Stalled (narrated tool use instead of invoking)`);
+      parts.push("");
+    }
+  }
+
+  parts.push("## Coverage map");
+  for (const [concern, entry] of Object.entries(coverage)) {
+    parts.push(`- **${concern}**: ${entry.status}${entry.note ? ` (${entry.note})` : ""}`);
+  }
+
+  if (criteriaResults.length > 0) {
+    parts.push("");
+    parts.push("## Acceptance criteria results");
+    for (const cr of criteriaResults) {
+      const labels: Record<string, string> = { met: "✅", partial: "⚠", unmet: "❌" };
+      parts.push(`- ${labels[cr.status] ?? "?"} \`${cr.id}\`: ${cr.status}${cr.note ? ` — ${cr.note}` : ""}`);
+    }
+  }
+
+  parts.push("");
+  parts.push(
+    `## Your task now\n` +
+    `You are the **orchestrator** performing a final recap. Synthesize the above into a concise, ` +
+    `actionable final status summary in Markdown. Cover:\n` +
+    `1. **Disposition**: one-sentence outcome — ready for implementation, needs more work, or needs human review.\n` +
+    `2. **Key findings**: 2-5 bullet points synthesizing the most important discoveries from all roles.\n` +
+    `3. **Coverage**: which concerns were fully addressed, which were skipped, and any gaps.\n` +
+    `4. **Recommendation**: clear next steps for the developer or reviewer.\n\n` +
+    `Be direct. Do not repeat the raw data verbatim — synthesize. Start directly with "## Disposition" as a level-2 heading.`,
+  );
+  return parts.join("\n");
+}
+
+/**
+ * Run a one-shot recap call through the LLM to synthesize a final disposition
+ * for the task after all role runs have completed. Uses the existing roleRunner
+ * seam so it is testable without a live model.
+ */
+async function generateRecap(
+  task: TaskRow,
+  project: ProjectRow,
+  runs: RoleRunRow[],
+  coverage: CoverageMap,
+  criteriaResults: CriteriaResult[],
+): Promise<string | null> {
+  const conn = resolveConnection(project.id);
+  const modelId = task.model || project.default_model || conn.defaultModelId;
+  const planningDir = project.planning_dir || "PLANNING";
+  const context = buildRecapContext(task, project, runs, coverage, criteriaResults);
+
+  try {
+    const result = await roleRunner({
+      repoPath: project.repo_path,
+      planningDir,
+      artifactAbsPath: path.join(project.repo_path, planningDir, "REFINING", `${task.task_id.slice(0, 8)}.md`),
+      modelId,
+      systemPrompt:
+        "You are the orchestration layer performing a final recap of a multi-role refinement pipeline. " +
+        "You receive structured findings from every role that ran and produce a concise, " +
+        "actionable final status summary in well-formatted Markdown. " +
+        "Do NOT use any tools — simply read the context and produce the recap text directly. " +
+        "Do not describe what you are doing; just produce the recap.",
+      tools: [],
+      context,
+      signal: new AbortController().signal,
+    });
+    return result.findings.section_md || result.findings.summary || null;
+  } catch (err) {
+    console.error(`[orchestrator] recap call failed for task ${task.task_id.slice(0, 8)}: ${(err as Error).message}`);
+    return null;
+  }
 }
 
 function applyGate(
@@ -548,12 +679,23 @@ function applyGate(
     publish(task.task_id, "task_update", { stage: "review" });
   };
 
+  /** Fire-and-forget: generate a recap for a task that just reached terminal state. */
+  const triggerRecap = (finalCoverage: CoverageMap, finalCriteria: CriteriaResult[]) => {
+    generateRecap(task, project, listRoleRuns(task.task_id), finalCoverage, finalCriteria).then(
+      (recapMd) => {
+        if (recapMd) updateTask(task.task_id, { recap_md: recapMd });
+      },
+    );
+  };
+
   if (verdict === "needs_human") {
     escalate(`Role ${step.role} flagged an ambiguity requiring human judgement.`);
+    triggerRecap(coverage, criteriaResults);
     return;
   }
   if (verdict === "blocker") {
     escalate(`Role ${step.role} reported a blocker.`);
+    triggerRecap(coverage, criteriaResults);
     return;
   }
 
@@ -615,6 +757,7 @@ function applyGate(
         (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => c.id).join(", ")}.` : "") +
         (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
       escalate(reason);
+      triggerRecap(coverage, criteriaResults);
       return;
     }
     // Review passed → fall through to the forward/terminal logic below.
@@ -633,6 +776,7 @@ function applyGate(
       status: "complete",
     });
     commitArtifacts(project.repo_path, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
+    triggerRecap(coverage, criteriaResults);
     if (isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec") {
       // Only [epic] and [story] nodes decompose further; [task] is the atomic leaf.
       // The role must also have can_create_subtasks enabled (default: only decomposition).

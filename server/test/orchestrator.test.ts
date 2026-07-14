@@ -146,6 +146,7 @@ function fakeRunner(
     tokens: 3,
     model: "fake",
     fallback: false,
+    stalled: false,
     thinkingText: "",
   });
 }
@@ -197,6 +198,7 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
       tokens: 1,
       model: "fake",
       fallback: false,
+      stalled: false,
       thinkingText: "",
     };
   };
@@ -351,6 +353,7 @@ describe("orchestrator loop (integration)", () => {
       tokens: 42,
       model: "fake",
       fallback: true,
+      stalled: false,
       stopReason: "length",
       thinkingText: "the model was thinking hard",
     }));

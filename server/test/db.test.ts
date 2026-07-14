@@ -142,8 +142,8 @@ describe("configs / connection resolution", () => {
 
   it("resolves thinkingFormat project → global → bootstrap default", () => {
     freshDb();
-    // No rows yet: falls back to the bootstrap config default ("deepseek").
-    expect(resolveConnection().thinkingFormat).toBe("deepseek");
+    // No rows yet: falls back to the bootstrap config default ("qwen-chat-template").
+    expect(resolveConnection().thinkingFormat).toBe("qwen-chat-template");
 
     // Global row wins over the bootstrap default.
     upsertConfig({ project_id: null, key: "default", thinking_format: "qwen" });

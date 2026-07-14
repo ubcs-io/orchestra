@@ -21,6 +21,7 @@ body {
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.5 "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+  overflow-wrap: break-word;
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -40,6 +41,7 @@ button.small { padding: 2px 7px; font-size: 12px; }
 input, textarea, select {
   font: inherit; background: #0f1216; color: var(--ink);
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; width: 100%;
+  overflow-wrap: break-word;
 }
 textarea { min-height: 90px; resize: vertical; }
 label { display: block; font-size: 12px; color: var(--ink-dim); margin: 8px 0 3px; }
@@ -90,7 +92,7 @@ header.topbar .spacer { flex: 1; }
 .coverage .skipped { color: var(--warn); }
 .coverage .out_of_scope { color: var(--ink-dim); }
 .run { border-left: 2px solid var(--line); padding: 4px 0 10px 12px; margin-left: 4px; }
-.section-md { white-space: pre-wrap; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-size: 12px; overflow-x: auto; }
+.section-md { white-space: pre-wrap; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-size: 12px; overflow-wrap: break-word; }
 .rendered-md { white-space: normal; }
 .rendered-md h1, .rendered-md h2, .rendered-md h3, .rendered-md h4 { color: var(--brass); margin: 12px 0 6px; font-size: 14px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
 .rendered-md h1 { font-size: 16px; }
@@ -100,7 +102,7 @@ header.topbar .spacer { flex: 1; }
 .rendered-md em { color: var(--accent); }
 .rendered-md code { background: #0f1216; border: 1px solid var(--line); border-radius: 3px; padding: 1px 5px; font-size: 11px; color: var(--human); }
 .rendered-md pre { margin: 8px 0; }
-.rendered-md pre code { display: block; padding: 8px; color: var(--ink); border: 1px solid var(--line); }
+.rendered-md pre code { display: block; padding: 8px; color: var(--ink); border: 1px solid var(--line); overflow-wrap: break-word; white-space: pre-wrap; }
 .rendered-md ul, .rendered-md ol { padding-left: 18px; margin: 4px 0; }
 .rendered-md li { margin: 2px 0; }
 .rendered-md li::marker { color: var(--ink-dim); }
@@ -117,7 +119,10 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 .empty { color: var(--ink-dim); padding: 20px; text-align: center; }
 
 /* Settings */
-.settings { max-width: 760px; }
+.settings { max-width: 912px; margin: 0 auto; }
+.safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.safety-grid .panel { margin-bottom: 0; }
+.safety-grid .full-width { grid-column: 1 / -1; }
 .settings code { background: #0f1216; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
 .field-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 14px; }
 button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
@@ -133,6 +138,13 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .steering-entry { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; font-size: 12px; }
 .steering-entry.consumed { opacity: 0.55; }
 .steering-entry.pending { background: rgba(209, 145, 60, 0.08); border: 1px solid rgba(209, 145, 60, 0.2); }
+
+/* Next steps (post-completion follow-up actions) */
+.next-steps-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.next-step-item { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.next-step-item:last-child { border-bottom: none; }
+.next-step-text { flex: 1; font-size: 12px; color: var(--ink); line-height: 1.4; word-break: break-word; }
+.next-step-item .small { flex-shrink: 0; white-space: nowrap; }
 
 /* ---- Modal ---- */
 .modal-overlay {
@@ -195,4 +207,130 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 }
 .modal-actions button.warn:hover {
   background: rgba(209, 145, 60, 0.3);
+}
+
+/* ---- Questions panel ---- */
+.questions-panel {
+  max-height: 480px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.questions-role-group {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+}
+.questions-role-group:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+.questions-role-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.questions-role-header a {
+  font-weight: bold;
+  color: var(--brass);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.questions-role-header a:hover {
+  color: var(--accent);
+}
+.question-item {
+  margin-left: 4px;
+  padding: 4px 0 8px;
+  border-top: 1px solid rgba(51, 60, 74, 0.4);
+}
+.question-item:first-of-type {
+  border-top: none;
+}
+.question-text {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--ink);
+  line-height: 1.4;
+}
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.question-default {
+  font-size: 11px;
+  color: var(--ink-dim);
+  margin: 0 0 4px;
+}
+.question-default strong {
+  color: var(--brass);
+}
+.question-answer-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.question-answer-input {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+/* ---- Intake content flip ---- */
+.plan-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.plan-header h2 {
+  margin-bottom: 0;
+}
+.intake-content {
+  margin-top: 10px;
+}
+.intake-textarea {
+  width: 100%;
+  min-height: 200px;
+  resize: vertical;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.intake-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* ---- Current State panel ---- */
+.current-state {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.current-state-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+.current-state-row .muted {
+  flex-shrink: 0;
+}
+
+/* ---- Steering header row ---- */
+.steering-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.steering-header h2 {
+  margin: 0 !important;
 }

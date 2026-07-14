@@ -68,7 +68,7 @@ const DEFAULTS: Config = {
   requestTimeoutMs: 300_000,
   reasoning: true,
   thinkingLevel: "medium",
-  thinkingFormat: "deepseek",
+  thinkingFormat: "qwen-chat-template",
   dbPath: path.join(REPO_ROOT, "orchestra.db"),
   schedulerIdleMs: 3_000,
   roleToolBudget: 40,

@@ -19,6 +19,7 @@ export interface Task {
   exit_kind: string | null;
   exit_state: string | null;
   review_reason: string | null;
+  recap_md: string | null;
   paused: number | null;
   refinement_plan_json: string | null;
   content: string | null;
@@ -34,9 +35,11 @@ export interface RoleRun {
   thinking_md: string | null;
   stop_reason: string | null;
   fallback: number | null;
+  stalled: number | null;
   tokens: number | null;
   depth: number;
   model: string | null;
+  open_questions_json: string | null;
   created_at: string;
 }
 
@@ -77,6 +80,7 @@ export interface ConnectionConfig {
   reasoning: number | null;
   thinking_level: string | null;
   thinking_format: string | null;
+  text_mode: number | null;
   has_api_key: boolean;
 }
 
@@ -92,6 +96,7 @@ export interface ConfigResponse {
     reasoning: boolean;
     thinkingLevel: string;
     thinkingFormat: string;
+    textMode: boolean;
     has_api_key: boolean;
   };
   env_overrides: { base_url: boolean; api_key: boolean };
@@ -109,6 +114,7 @@ export interface ConfigPatch {
   reasoning?: boolean;
   thinking_level?: string;
   thinking_format?: string;
+  text_mode?: boolean;
 }
 
 export type CoverageMap = Record<string, { status: string; note?: string }>;
@@ -124,6 +130,7 @@ export interface Plan {
 
 export interface TaskDetail {
   task: Task;
+  recap_md: string | null;
   plan: Plan | null;
   coverage: CoverageMap | null;
   runs: RoleRun[];
@@ -133,8 +140,12 @@ export interface TaskDetail {
 }
 
 async function req<T>(url: string, opts?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (opts?.body !== undefined) {
+    headers["content-type"] = "application/json";
+  }
   const res = await fetch(url, {
-    headers: { "content-type": "application/json" },
+    headers,
     ...opts,
   });
   if (!res.ok) {
@@ -223,6 +234,9 @@ export const api = {
 
   resetTask: (taskId: string) => req<{ task: Task }>(`/api/tasks/${taskId}/reset`, { method: "POST" }),
 
+  updateTask: (taskId: string, body: { name?: string; content?: string }) =>
+    req<TaskDetail>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(body) }),
+
   intake: (projectId: number, body: { name: string; content: string; intake_kind?: string }) =>
     req<{ accepted: boolean; path: string }>(`/api/projects/${projectId}/intake`, {
       method: "POST",
@@ -233,6 +247,12 @@ export const api = {
     req<{ intervention: Intervention }>(`/api/tasks/${taskId}/interventions`, {
       method: "POST",
       body: JSON.stringify({ kind, payload }),
+    }),
+
+  createSubtask: (taskId: string, body: { name: string; content?: string }) =>
+    req<{ task: Task }>(`/api/tasks/${taskId}/subtasks`, {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 };
 
