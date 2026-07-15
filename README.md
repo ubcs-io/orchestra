@@ -6,8 +6,6 @@ Connect any git repository, drop in work that ranges from a bare error log to an
 
 The point is **tighter control and visibility over long-running, nebulous work**. LLMs fail at big vague tasks; Orchestra breaks them into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably.
 
-> Full design rationale lives in [PLANNING/refinement-loop-plan.md](PLANNING/refinement-loop-plan.md).
-
 ---
 
 ## How it works
@@ -117,8 +115,27 @@ Resolution order (lowest → highest precedence): built-in defaults → `config.
 | `dbPath` | `ORCHESTRA_DB_PATH` | `./orchestra.db` | SQLite file (WAL). |
 | `schedulerIdleMs` | `ORCHESTRA_SCHEDULER_IDLE_MS` | `3000` | Idle poll interval when there's no work. |
 | `roleToolBudget` | — | `40` | Max tool-calling turns per role run. |
+| `clientDir` | — | `<server>/public` | Built SPA directory served in production. |
 
-> **Prefer a tool-capable model.** Roles use pi's function-calling to read the repo and to record findings. A model without tool support falls back to reasoning over pre-packed context. For models whose custom tool calling (`record_findings`) is unreliable, enable **two-phase** mode in the connection profile — the role will explore with built-in tools in phase 1, then formalize findings as structured JSON in phase 2.
+### Runtime-editable connection profiles
+
+Beyond the bootstrap config, connection settings are stored in SQLite and editable at runtime via `PATCH /api/config` or the **Settings UI**. These take precedence over `config.json` (except for `baseUrl` and `apiKey`, where env vars always win).
+
+| Field | Default | Description |
+|---|---|---|
+| `baseUrl` | (from `config.json`) | OpenAI-compatible base URL. |
+| `apiKey` | (from `config.json`) | Bearer token. |
+| `api` | `openai-completions` | Provider API type. |
+| `defaultModelId` | (from `config.json`) | Model ID used when a project/role doesn't override. |
+| `contextWindow` / `maxTokens` | (from `config.json`) | Advertised to pi for the local model. |
+| `requestTimeoutMs` | (from `config.json`) | Per-request LLM timeout. |
+| `reasoning` | (from `config.json`) | Whether the model is a reasoning model. |
+| `thinkingLevel` | (from `config.json`) | pi thinking verbosity (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`). |
+| `thinkingFormat` | (from `config.json`) | pi reasoning request dialect (e.g. `qwen-chat-template`, `deepseek`, `openai`). |
+| `textMode` | `false` | Bypass native tool calls; model outputs structured JSON via markdown instead. |
+| `twoPhase` | `false` | Split run into exploration (no tool-calling) + formalization phases. Supersedes `textMode`. Useful when a model's native function calling (`record_findings`) is unreliable. |
+
+> **Prefer a tool-capable model.** Roles use pi's function-calling to read the repo and to record findings. A model without tool support falls back to reasoning over pre-packed context. For unreliable tool-calling models, enable `twoPhase` mode above.
 
 ---
 
@@ -225,6 +242,16 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | GET | `/api/projects/:id/roles` · PUT `/api/projects/:id/roles/:key` | Per-project role config (prompt, tools, model, enabled). |
 | POST | `/api/projects/:id/intake` | Submit an intake (writes into `INTAKE/`). |
 | POST | `/api/tasks` | Create a manual task (without a repo file). |
+| GET | `/api/networks` | List all networks (system + custom). |
+| POST | `/api/networks` | Create a custom network. |
+| GET | `/api/networks/:id` | Get a single network. |
+| PATCH | `/api/networks/:id` | Update a custom network. |
+| DELETE | `/api/networks/:id` | Delete a custom network. |
+| POST | `/api/networks/:id/duplicate` | Duplicate a network (custom or system). |
+| POST | `/api/networks/default/:intakeKind` | Set a network as default for an intake kind. |
+| POST | `/api/networks/import` | Import a network from JSON. |
+| GET | `/api/networks/export/:id` | Export a network as JSON. |
+| POST | `/api/networks/:id/reset` | Reset a custom network to its original. |
 | GET | `/api/tasks` · GET · DELETE `/api/tasks/:id` | Tasks + full detail (runs, coverage, plan, children, flow). |
 | PATCH | `/api/tasks/:id` | Edit a task's name/content while in intake stage. |
 | POST | `/api/tasks/:id/reset` | Reset a task to intake state (clears history). |

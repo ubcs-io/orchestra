@@ -41,5 +41,9 @@ client/dist/
 # Planning (internal)
 /PLANNING/
 
+# VitePress (build artifacts)
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
 # Test coverage (build artifacts)
 server/coverage/
