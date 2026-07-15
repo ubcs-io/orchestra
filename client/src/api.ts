@@ -6,6 +6,7 @@ export interface Project {
   repo_path: string;
   planning_dir: string;
   default_model: string | null;
+  models: string[];
 }
 
 export interface Task {
@@ -83,6 +84,37 @@ export interface ConnectionConfig {
   thinking_format: string | null;
   text_mode: number | null;
   has_api_key: boolean;
+}
+
+/** A named model config card (excluding the global default). */
+export interface ModelConfig {
+  id: number;
+  project_id: number | null;
+  key: string;
+  name: string | null;
+  base_url: string | null;
+  api: string | null;
+  default_model: string | null;
+  context_window: number | null;
+  max_tokens: number | null;
+  request_timeout_ms: number | null;
+  reasoning: number | null;
+  thinking_level: string | null;
+  thinking_format: string | null;
+  text_mode: number | null;
+  two_phase: number | null;
+  extra_json: string | null;
+  compat_json: string | null;
+  has_api_key: boolean;
+  has_env_token: boolean;
+  location: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelConfigsResponse {
+  configs: ModelConfig[];
+  has_tokens_env: boolean;
 }
 
 export interface ConfigResponse {
@@ -269,6 +301,33 @@ export interface SafetyPatch {
   role_tool_budget?: number;
 }
 
+export interface SummaryStats {
+  total: number;
+  by_stage: Record<string, number>;
+  in_flight: number;
+  action_items: number;
+  blockers: number;
+  paused: number;
+  projects_count: number;
+  blockers_list: Array<{
+    task_id: string;
+    name: string | null;
+    exit_state: string | null;
+    stage: string | null;
+    project_id: number | null;
+    review_reason: string | null;
+    project_name: string | null;
+  }>;
+}
+
+export interface PingResult {
+  config_id: number;
+  name: string;
+  base_url: string;
+  available: boolean;
+  error?: string;
+}
+
 export const api = {
   health: () => req<{ ok: boolean }>("/api/health"),
   models: () => req<{ models: string[] }>("/api/models"),
@@ -376,7 +435,62 @@ export const api = {
     req<{ export: NetworkExport }>(`/api/networks/${networkId}/export`),
   allRoles: (projectId?: number) =>
     req<{ roles: Role[] }>(`/api/roles${projectId ? `?project_id=${projectId}` : ""}`),
+
+  // Folder picker dialog
+  pickFolder: () =>
+    req<{ path: string | null }>("/api/dialogs/folder", { method: "POST" }),
+
+  // Model Configs
+  discoverModels: (baseUrl: string, apiKey?: string) =>
+    req<{ models: string[] }>("/api/models/discover", {
+      method: "POST",
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    }),
+  modelConfigs: () => req<ModelConfigsResponse>("/api/model-configs"),
+  createModelConfig: (body: {
+    name: string;
+    base_url?: string;
+    api_key?: string;
+    default_model?: string;
+    context_window?: number;
+    max_tokens?: number;
+    request_timeout_ms?: number;
+    reasoning?: boolean;
+    thinking_level?: string;
+    thinking_format?: string;
+    text_mode?: boolean;
+  }) =>
+    req<{ config: ModelConfig }>("/api/model-configs", { method: "POST", body: JSON.stringify(body) }),
+  updateModelConfig: (id: number, body: {
+    name?: string;
+    base_url?: string;
+    api_key?: string;
+    default_model?: string;
+    context_window?: number;
+    max_tokens?: number;
+    request_timeout_ms?: number;
+    reasoning?: boolean;
+    thinking_level?: string;
+    thinking_format?: string;
+    text_mode?: boolean;
+  }) =>
+    req<{ config: ModelConfig }>(`/api/model-configs/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteModelConfig: (id: number) =>
+    req<{ ok: boolean }>(`/api/model-configs/${id}`, { method: "DELETE" }),
+  duplicateModelConfig: (id: number, name?: string) =>
+    req<{ config: ModelConfig }>(`/api/model-configs/${id}/duplicate`, { method: "POST", body: JSON.stringify({ name }) }),
+  setDefaultModelConfig: (id: number) =>
+    req<{ config: ModelConfig }>(`/api/model-configs/${id}/set-default`, { method: "POST" }),
+
+  // Summary dashboard
+  summary: () => req<SummaryStats>("/api/summary"),
+  pingNetwork: () => req<{ results: PingResult[] }>("/api/ping-network", { method: "POST" }),
 };
+
+/** Strip GGUF shard suffixes like "-00001-of-00003.gguf" for display purposes. */
+export function displayModelName(name: string): string {
+  return name.replace(/-(\d{5})-of-(\d{5})\.gguf$/i, "");
+}
 
 export const STAGES = ["intake", "refining", "ready", "review"] as const;
 

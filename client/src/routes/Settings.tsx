@@ -1,315 +1,7 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type ConfigResponse, type ConnectionConfig, type SafetyResponse } from "../api";
-
-/**
- * Reasoning dialects (pi `thinkingFormat`), one per model family. Labeled for the
- * dropdown; the value is what the server persists + validates. Qwen + DeepSeek are
- * first since those are the common self-hosted cases.
- */
-const THINKING_FORMAT_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "qwen-chat-template", label: "Qwen (vLLM / llama.cpp — chat_template_kwargs)" },
-  { value: "qwen", label: "Qwen (DashScope — top-level enable_thinking)" },
-  { value: "deepseek", label: "DeepSeek-R1 / QwQ (thinking + reasoning_effort)" },
-  { value: "zai", label: "GLM / Z.ai" },
-  { value: "openai", label: "OpenAI o-series (reasoning_effort)" },
-  { value: "openrouter", label: "OpenRouter" },
-  { value: "together", label: "Together" },
-  { value: "string-thinking", label: "String thinking (advanced)" },
-  { value: "chat-template", label: "Generic chat template (advanced)" },
-  { value: "ant-ling", label: "Ant Ling (advanced)" },
-];
-
-/**
- * Global connection settings. Today there is exactly one profile (the global
- * `default`), rendered as a single card. The page is deliberately laid out as a
- * vertical stack of self-contained cards so per-project / multi-endpoint
- * profiles can be added later as additional cards with no restructuring.
- */
-export function Settings() {
-  const { data, isLoading } = useQuery({ queryKey: ["config"], queryFn: api.config });
-
-  return (
-    <div className="settings">
-      <div className="row" style={{ marginBottom: 12 }}>
-        <Link to="/">← projects</Link>
-        <h2 style={{ margin: 0, color: "var(--brass)" }}>Settings</h2>
-      </div>
-      <p className="muted">
-        The model endpoint every project uses. This is a single global connection for now — per-project
-        and per-role overrides will layer on top of it later.
-      </p>
-
-      {isLoading || !data ? (
-        <p className="muted">Loading…</p>
-      ) : (
-        <ConnectionCard data={data} />
-      )}
-
-      <button className="ghost" disabled title="Multiple connections are coming — the layout is already built for them.">
-        + Add connection (coming soon)
-      </button>
-
-      <SafetyDashboard />
-    </div>
-  );
-}
-
-function ConnectionCard({ data }: { data: ConfigResponse }) {
-  const qc = useQueryClient();
-  const cfg: ConnectionConfig = data.config;
-  const env = data.env_overrides;
-
-  const [name, setName] = useState(cfg.name ?? "");
-  const [baseUrl, setBaseUrl] = useState(cfg.base_url ?? "");
-  const [defaultModel, setDefaultModel] = useState(cfg.default_model ?? "");
-  const [contextWindow, setContextWindow] = useState(String(cfg.context_window ?? ""));
-  const [maxTokens, setMaxTokens] = useState(String(cfg.max_tokens ?? ""));
-  const [timeoutMs, setTimeoutMs] = useState(String(cfg.request_timeout_ms ?? ""));
-  // reasoning is stored 0/1; null → fall back to the resolved default.
-  const [reasoning, setReasoning] = useState(
-    cfg.reasoning == null ? data.resolved.reasoning : cfg.reasoning === 1,
-  );
-  const [thinkingLevel, setThinkingLevel] = useState(cfg.thinking_level ?? data.resolved.thinkingLevel);
-  const [thinkingFormat, setThinkingFormat] = useState(
-    cfg.thinking_format ?? data.resolved.thinkingFormat,
-  );
-  const [textMode, setTextMode] = useState(
-    cfg.text_mode == null ? data.resolved.textMode : cfg.text_mode === 1,
-  );
-  const [advanced, setAdvanced] = useState(false);
-
-  // The API key is write-only from the client's view: we know only whether one
-  // is set (has_api_key), never its value. Typing sets a new one; blank = keep.
-  const [apiKey, setApiKey] = useState("");
-  const [apiKeyTouched, setApiKeyTouched] = useState(false);
-
-  const save = useMutation({
-    mutationFn: () =>
-      api.saveConfig({
-        name: name.trim() || undefined,
-        base_url: baseUrl.trim() || undefined,
-        default_model: defaultModel.trim() || undefined,
-        context_window: contextWindow ? Number(contextWindow) : undefined,
-        max_tokens: maxTokens ? Number(maxTokens) : undefined,
-        request_timeout_ms: timeoutMs ? Number(timeoutMs) : undefined,
-        reasoning,
-        thinking_level: thinkingLevel,
-        thinking_format: thinkingFormat,
-        text_mode: textMode,
-        // Only send the key when the user actually typed into the field.
-        ...(apiKeyTouched ? { api_key: apiKey } : {}),
-      }),
-    onSuccess: () => {
-      setApiKey("");
-      setApiKeyTouched(false);
-      qc.invalidateQueries({ queryKey: ["config"] });
-    },
-  });
-
-  const clearKey = useMutation({
-    mutationFn: () => api.saveConfig({ api_key: "" }),
-    onSuccess: () => {
-      setApiKey("");
-      setApiKeyTouched(false);
-      qc.invalidateQueries({ queryKey: ["config"] });
-    },
-  });
-
-  return (
-    <div className="panel">
-      <div className="row">
-        <strong>{cfg.name ?? "Default"}</strong>
-        <span className="pill dim">{cfg.key}</span>
-        <span className="pill dim">{cfg.api ?? "openai-completions"}</span>
-      </div>
-
-      <label>Name</label>
-      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Default" />
-
-      <label>
-        Base URL (OpenAI-compatible, ending in /v1 — not /chat/completions)
-        {env.base_url && <span className="pill warn" style={{ marginLeft: 8 }}>overridden by env</span>}
-      </label>
-      <input
-        value={baseUrl}
-        onChange={(e) => setBaseUrl(e.target.value)}
-        placeholder="http://192.168.2.245:8080/v1"
-      />
-
-      <label>
-        API key {cfg.has_api_key ? <span className="pill ok" style={{ marginLeft: 6 }}>set</span> : <span className="pill dim" style={{ marginLeft: 6 }}>none</span>}
-        {env.api_key && <span className="pill warn" style={{ marginLeft: 8 }}>overridden by env</span>}
-      </label>
-      <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
-        <input
-          type="password"
-          value={apiKey}
-          onChange={(e) => {
-            setApiKey(e.target.value);
-            setApiKeyTouched(true);
-          }}
-          placeholder={cfg.has_api_key ? "•••••••• (leave blank to keep)" : "(none — leave blank if the endpoint needs no auth)"}
-        />
-        {cfg.has_api_key && (
-          <button className="small" disabled={clearKey.isPending} onClick={() => clearKey.mutate()}>
-            Clear
-          </button>
-        )}
-      </div>
-      <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>
-        Stored in the local SQLite DB. Prefer secrets in the environment? Set <code>ORCHESTRA_API_KEY</code> —
-        it overrides the stored value and keeps the key out of the DB.
-      </p>
-
-      <label>Default model</label>
-      <input value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} placeholder="llama-serve" />
-
-      <label style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
-        <input
-          type="checkbox"
-          checked={reasoning}
-          onChange={(e) => setReasoning(e.target.checked)}
-          style={{ width: "auto", margin: 0 }}
-        />
-        Reasoning model (DeepSeek-R1 / QwQ style)
-      </label>
-      <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
-        Enable for models that emit chain-of-thought. Off registers the model as a plain instruct model.
-        Inline <code>&lt;think&gt;</code> is always separated into the reasoning trace regardless of this setting.
-      </p>
-      {reasoning && (
-        <>
-          <label>Thinking level</label>
-          <select value={thinkingLevel} onChange={(e) => setThinkingLevel(e.target.value)}>
-            {["minimal", "low", "medium", "high", "xhigh", "max"].map((l) => (
-              <option key={l} value={l}>{l}</option>
-            ))}
-          </select>
-
-          <label>Reasoning dialect (model family)</label>
-          <select value={thinkingFormat} onChange={(e) => setThinkingFormat(e.target.value)}>
-            {THINKING_FORMAT_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
-          <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
-            Shapes how pi requests thinking for this model's family. On Ollama / llama.cpp the endpoint
-            may ignore it and emit inline <code>&lt;think&gt;</code> — Orchestra's splitter still routes
-            that into the reasoning trace, so output stays clean either way.
-          </p>
-        </>
-      )}
-
-      <label style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
-        <input
-          type="checkbox"
-          checked={textMode}
-          onChange={(e) => setTextMode(e.target.checked)}
-          style={{ width: "auto", margin: 0 }}
-        />
-        Text mode — no native function calling
-      </label>
-      <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
-        When enabled, the model outputs findings as a JSON code block in plain text instead of using{" "}
-        <code>record_findings</code> as a function call. Use this for models whose function-calling is
-        unreliable (e.g. small MoE models, heavy quantization, or older llama.cpp builds).
-      </p>
-
-      <button className="small" style={{ marginTop: 10 }} onClick={() => setAdvanced((a) => !a)}>
-        {advanced ? "▾" : "▸"} Advanced (context window, max tokens, timeout)
-      </button>
-      {advanced && (
-        <div className="field-grid" style={{ marginTop: 8 }}>
-          <div>
-            <label>Context window</label>
-            <input value={contextWindow} onChange={(e) => setContextWindow(e.target.value)} placeholder="128000" />
-          </div>
-          <div>
-            <label>Max tokens</label>
-            <input value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} placeholder="16384" />
-          </div>
-          <div>
-            <label>Request timeout (ms)</label>
-            <input value={timeoutMs} onChange={(e) => setTimeoutMs(e.target.value)} placeholder="300000" />
-          </div>
-        </div>
-      )}
-
-      <div className="row" style={{ marginTop: 12 }}>
-        <button className="primary" disabled={save.isPending} onClick={() => save.mutate()}>
-          {save.isPending ? "Saving…" : "Save connection"}
-        </button>
-        {save.isError && <span className="pill bad">{(save.error as Error).message}</span>}
-        {save.isSuccess && <span className="pill ok">saved</span>}
-      </div>
-
-      <ModelDiscovery defaultModel={cfg.default_model} />
-    </div>
-  );
-}
-
-/**
- * Lists the models the *saved* endpoint advertises (GET /api/models →
- * discoverModels). Bounded + scrollable so a large catalog can't blow out the
- * page — the same list will host multiple endpoints' models in the future.
- */
-function ModelDiscovery({ defaultModel }: { defaultModel: string | null }) {
-  const [checked, setChecked] = useState(false);
-  const query = useQuery({
-    queryKey: ["discover-models"],
-    queryFn: api.models,
-    enabled: false,
-  });
-
-  const run = () => {
-    setChecked(true);
-    query.refetch();
-  };
-
-  const models = query.data?.models ?? [];
-
-  return (
-    <div className="model-discovery">
-      <div className="row" style={{ marginTop: 14 }}>
-        <strong style={{ fontSize: 13 }}>Available models</strong>
-        <button className="small" disabled={query.isFetching} onClick={run}>
-          {query.isFetching ? "Checking…" : "Check endpoint"}
-        </button>
-        {checked && !query.isFetching && (
-          <span className="muted" style={{ fontSize: 12 }}>{models.length} found</span>
-        )}
-      </div>
-      <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
-        Reflects the saved connection above — save first if you just changed the URL.
-      </p>
-
-      {query.isError && <p className="pill bad" style={{ marginTop: 8 }}>{(query.error as Error).message}</p>}
-
-      {checked && !query.isFetching && !query.isError && (
-        models.length === 0 ? (
-          <p className="muted" style={{ marginTop: 8 }}>
-            No models reported (endpoint unreachable or exposes no <code>/models</code> route).
-          </p>
-        ) : (
-          <div className="model-list">
-            {models.map((m) => (
-              <div className="model" key={m}>
-                <span>{m}</span>
-                {m === defaultModel && <span className="pill ok">default</span>}
-              </div>
-            ))}
-          </div>
-        )
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Pi Dev Safety Dashboard
-// ---------------------------------------------------------------------------
+import { api, type SafetyResponse } from "../api";
 
 const FLOW_LABELS: Record<string, string> = {
   error_file: "Bug / Error",
@@ -323,6 +15,32 @@ const FLOW_LABELS: Record<string, string> = {
   ux: "UX",
   question: "Question",
 };
+
+/**
+ * Settings page — now focuses on the Pi Dev Safety Dashboard.
+ * Connection settings have moved to the Models page.
+ */
+export function Settings() {
+  return (
+    <div className="settings">
+      <div className="row" style={{ marginBottom: 12 }}>
+        <Link to="/">← projects</Link>
+        <h2 style={{ margin: 0, color: "var(--brass)" }}>Settings</h2>
+      </div>
+      <p className="muted">
+        Connection settings are now managed on the{" "}
+        <Link to="/models">Models page</Link>. Visit Models to view, edit, create,
+        and set the default model configuration.
+      </p>
+
+      <SafetyDashboard />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pi Dev Safety Dashboard
+// ---------------------------------------------------------------------------
 
 function SafetyDashboard() {
   const { data, isLoading, isError, error } = useQuery({
@@ -346,19 +64,10 @@ function SafetyDashboard() {
       </p>
 
       <div className="safety-grid">
-        {/* A: Agent Tool Boundaries */}
         <ToolBoundaries data={data} />
-
-        {/* B: Configurable Limits */}
         <LimitsCard data={data} />
-
-        {/* C: Gate & Review Controls */}
         <GatesCard data={data} />
-
-        {/* D: Role Summary */}
         <RolesSummary data={data} />
-
-        {/* E: Security Posture */}
         <div className="full-width">
           <SecurityPosture data={data} />
         </div>
@@ -371,7 +80,7 @@ function ToolBoundaries({ data }: { data: SafetyResponse }) {
   const items: Array<{ label: string; ok: boolean; detail: string }> = [
     { label: "Read repo files", ok: true, detail: "read, grep, find, ls — scoped to registered repo" },
     { label: "Git history", ok: true, detail: "read-only git log — scoped to registered repo" },
-    { label: "Write artifacts", ok: true, detail: data.agent_tools.write_scope },
+    { label: "Write artifacts", ok: true, detail: "(sandbox uses write_artifact tool)" },
     { label: "Shell / exec access", ok: false, detail: "no exec, shell, or system tools available to agents" },
     { label: "Source code editing", ok: false, detail: "no write/edit tools — repository code is never modified" },
     { label: "Cross-repo isolation", ok: true, detail: "each session locked to a single project's repoPath" },
@@ -410,42 +119,62 @@ function LimitsCard({ data }: { data: SafetyResponse }) {
   return (
     <div className="panel">
       <strong style={{ marginBottom: 8, display: "block" }}>Configurable Limits</strong>
-
-      <div className="field-grid" style={{ marginBottom: 10 }}>
-        <div>
-          <label>
-            Tool calls per role run
-            {save.isSuccess && <span className="pill ok" style={{ marginLeft: 6, fontSize: 10 }}>saved</span>}
-          </label>
-          <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
-            <input
-              value={budget}
-              onChange={(e) => setBudget(e.target.value)}
-              placeholder="40"
-              style={{ width: 80 }}
-            />
-            <button className="small" disabled={save.isPending} onClick={() => save.mutate()}>
-              {save.isPending ? "…" : "Save"}
-            </button>
-          </div>
-          {save.isError && <span className="pill bad" style={{ fontSize: 10 }}>{(save.error as Error).message}</span>}
-        </div>
-        <div>
-          <label>Request timeout</label>
-          <input value={`${data.limits.request_timeout_ms} ms`} disabled style={{ opacity: 0.6 }} />
-          <span className="muted" style={{ fontSize: 10 }}>edit in Connection above</span>
-        </div>
-        <div>
-          <label>Max tokens per response</label>
-          <input value={String(data.limits.max_tokens)} disabled style={{ opacity: 0.6 }} />
-          <span className="muted" style={{ fontSize: 10 }}>edit in Connection above</span>
-        </div>
-        <div>
-          <label>Context window</label>
-          <input value={String(data.limits.context_window)} disabled style={{ opacity: 0.6 }} />
-          <span className="muted" style={{ fontSize: 10 }}>edit in Connection above</span>
-        </div>
-      </div>
+      <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", marginBottom: 10 }}>
+        <thead>
+          <tr style={{ textAlign: "left", borderBottom: "1px solid var(--border-color, #333)" }}>
+            <th style={{ padding: "4px 8px" }}>Setting</th>
+            <th style={{ padding: "4px 8px" }}>Value</th>
+            <th style={{ padding: "4px 8px" }}>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style={{ borderBottom: "1px solid var(--border-color, #222)" }}>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              Tool calls per role run
+              {save.isSuccess && <span className="pill ok" style={{ marginLeft: 6, fontSize: 10 }}>saved</span>}
+            </td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                <input
+                  value={budget}
+                  onChange={(e) => setBudget(e.target.value)}
+                  placeholder="40"
+                  style={{ width: 80 }}
+                />
+                <button className="small" disabled={save.isPending} onClick={() => save.mutate()}>
+                  {save.isPending ? "…" : "Save"}
+                </button>
+              </div>
+              {save.isError && <span className="pill bad" style={{ fontSize: 10 }}>{(save.error as Error).message}</span>}
+            </td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <span className="pill dim" style={{ fontSize: 10 }}>editable</span>
+            </td>
+          </tr>
+          <tr style={{ borderBottom: "1px solid var(--border-color, #222)" }}>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>Request timeout</td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <input value={`${data.limits.request_timeout_ms} ms`} disabled style={{ opacity: 0.6, width: "100%" }} />
+            </td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <span className="muted" style={{ fontSize: 10 }}>edit on Models page</span>
+            </td>
+          </tr>
+          <tr style={{ borderBottom: "1px solid var(--border-color, #222)" }}>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>Max tokens / Context window</td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <div className="row" style={{ gap: 8, flexWrap: "nowrap" }}>
+                <input value={String(data.limits.max_tokens)} disabled style={{ opacity: 0.6, flex: 1 }} />
+                <span className="muted" style={{ fontSize: 10, whiteSpace: "nowrap" }}>/</span>
+                <input value={String(data.limits.context_window)} disabled style={{ opacity: 0.6, flex: 1 }} />
+              </div>
+            </td>
+            <td style={{ padding: "4px 8px", verticalAlign: "middle" }}>
+              <span className="muted" style={{ fontSize: 10 }}>edit on Models page</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -461,7 +190,6 @@ function GatesCard({ data }: { data: SafetyResponse }) {
         Counter-reviewers verify prior role output against acceptance criteria. Unmet "must" criteria trigger
         loop-backs (bounded). After exhaustion, tasks escalate to human REVIEW.
       </p>
-
       <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
         <thead>
           <tr style={{ textAlign: "left", borderBottom: "1px solid var(--border-color, #333)" }}>

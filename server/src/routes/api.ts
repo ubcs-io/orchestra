@@ -7,29 +7,38 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   createIntervention,
+  createModelConfig,
   createNetwork,
   createProject,
   createTask,
+  deleteModelConfig,
   deleteNetwork,
   deleteProject,
   deleteTask,
+  duplicateModelConfig,
   duplicateNetwork,
+  getConfigById,
+  getDb,
   getGlobalConfig,
   getNetwork,
   getNetworkByIntakeKind,
   getProject,
   getTask,
   listInterventions,
+  listModelConfigs,
   listNetworks,
   listProjects,
   listRoles,
   listRoleRuns,
   listTasks,
   resetTask,
+  setDefaultModelConfig,
   setDefaultNetwork,
+  updateModelConfig,
   updateNetwork,
   updateProject,
   updateTask,
@@ -38,7 +47,7 @@ import {
 } from "../db.js";
 import { isGitRepo, removeFile, scaffoldPlanning, writeArtifact } from "../git.js";
 import { discoverModels } from "../providers.js";
-import { resolveConnection, THINKING_FORMATS } from "../settings.js";
+import { envTokenForModel, locationLabel, resolveConnection, THINKING_FORMATS } from "../settings.js";
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   isSchedulerRunning,
@@ -125,14 +134,84 @@ export function normalizeRepoPath(input: string): string {
   return path.isAbsolute(raw) ? path.resolve(raw) : raw;
 }
 
+/**
+ * Discover models from an arbitrary OpenAI-compatible endpoint.
+ * Best-effort: returns [] if the endpoint is unreachable or shaped differently.
+ */
+async function discoverModelsFrom(baseUrl: string, apiKey?: string): Promise<string[]> {
+  const url = baseUrl.replace(/\/+$/, "") + "/models";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { data?: Array<{ id?: string }> } | Array<{ id?: string }>;
+    const list = Array.isArray(data) ? data : (data.data ?? []);
+    return list.map((m) => m.id).filter((id): id is string => typeof id === "string");
+  } catch {
+    return [];
+  }
+}
+
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/health", async () => ({ ok: true }));
 
   app.get("/api/models", async () => ({ models: await discoverModels() }));
 
+  // Discover models from a caller-supplied base URL (for model-config setup flow).
+  app.post("/api/models/discover", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as { base_url?: string; api_key?: string };
+    if (!body.base_url) return bad(reply, 400, "base_url is required");
+    const models = await discoverModelsFrom(body.base_url.trim(), body.api_key?.trim() || undefined);
+    return { models };
+  });
+
   app.get("/api/concerns", async () => ({ concerns: CONCERN_TAXONOMY }));
 
   app.get("/api/flows", async () => ({ flows: FLOW_TEMPLATES }));
+
+  // ---- Folder picker dialog (native OS dialog) ----
+  app.post("/api/dialogs/folder", async (_req: FastifyRequest, reply: FastifyReply) => {
+    try {
+      let script: string;
+      let args: string[];
+      if (process.platform === "darwin") {
+        script = "osascript";
+        args = ["-e", 'POSIX path of (choose folder with prompt "Select repository folder")'];
+      } else if (process.platform === "win32") {
+        script = "powershell";
+        args = [
+          "-NoProfile",
+          "-Command",
+          `Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.FolderBrowserDialog
+$f.Description = "Select repository folder"
+if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
+        ];
+      } else {
+        // Linux — try zenity, fall back to kdialog
+        script = "zenity";
+        args = ["--file-selection", "--directory", "--title=Select repository folder"];
+      }
+      const path = await new Promise<string>((resolve) => {
+        execFile(script, args, { timeout: 120_000 }, (err, stdout) => {
+          if (err) {
+            // Non-zero exit (e.g. user cancelled) — return null, not an error.
+            resolve("");
+            return;
+          }
+          resolve(stdout.trim());
+        });
+      });
+      return { path: path || null };
+    } catch (err) {
+      console.error(`[api] folder picker failed: ${(err as Error).message}`);
+      return { path: null };
+    }
+  });
 
   // ---- Connection config (global 'default' profile) ----
   // The API key is never sent back to the client — only whether one is set, and
@@ -157,6 +236,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         thinkingLevel: resolved.thinkingLevel,
         thinkingFormat: resolved.thinkingFormat,
         textMode: resolved.textMode,
+        compat: resolved.compat,
         has_api_key: !!resolved.apiKey,
       },
       env_overrides: {
@@ -179,6 +259,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       thinking_level?: string;
       thinking_format?: string;
       text_mode?: boolean;
+      compat?: Record<string, unknown> | null;
     };
     if (
       body.thinking_format !== undefined &&
@@ -190,6 +271,13 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     // omitting the field leaves the existing token untouched.
     const api_key =
       body.api_key === undefined ? undefined : body.api_key.trim() === "" ? null : body.api_key.trim();
+    // compat_json: null clears it, undefined keeps prior, an object serialises.
+    const compat_json =
+      body.compat === undefined
+        ? undefined
+        : body.compat === null
+          ? null
+          : JSON.stringify(body.compat);
     upsertConfig({
       project_id: null,
       key: "default",
@@ -204,11 +292,202 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       thinking_level: body.thinking_level,
       thinking_format: body.thinking_format,
       text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
+      compat_json,
     });
     // Return the same redacted shape as GET.
     const row = getGlobalConfig();
     const { api_key: _k, ...safe } = row ?? {};
     return { config: { ...safe, has_api_key: !!(_k && _k.length) } };
+  });
+
+  // ---- Model Configs (named connection profiles) ----
+
+  // List all model configs.
+  app.get("/api/model-configs", async () => {
+    const configs = listModelConfigs();
+    const hasTokensEnv = !!process.env.ORCHESTRA_TOKENS;
+    const enriched = configs.map((cfg) => {
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        ...safe,
+        has_api_key: !!(api_key && api_key.length),
+        has_env_token: !!envKey,
+        location: locationLabel(cfg.base_url),
+      };
+    });
+    return { configs: enriched, has_tokens_env: hasTokensEnv };
+  });
+
+  // Create a new model config.
+  app.post("/api/model-configs", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      base_url?: string;
+      api_key?: string;
+      default_model?: string;
+      context_window?: number;
+      max_tokens?: number;
+      request_timeout_ms?: number;
+      reasoning?: boolean;
+      thinking_level?: string;
+      thinking_format?: string;
+      text_mode?: boolean;
+    };
+    if (!body.name || !body.name.trim()) return bad(reply, 400, "name is required");
+    if (
+      body.thinking_format !== undefined &&
+      !(THINKING_FORMATS as readonly string[]).includes(body.thinking_format)
+    ) {
+      return bad(reply, 400, `unknown thinking_format '${body.thinking_format}'`);
+    }
+    try {
+      const cfg = createModelConfig({
+        name: body.name.trim(),
+        base_url: body.base_url?.trim(),
+        api_key: body.api_key?.trim() || null,
+        default_model: body.default_model?.trim(),
+        context_window: body.context_window,
+        max_tokens: body.max_tokens,
+        request_timeout_ms: body.request_timeout_ms,
+        reasoning: body.reasoning,
+        thinking_level: body.thinking_level,
+        thinking_format: body.thinking_format,
+        text_mode: body.text_mode,
+      });
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Get a single model config.
+  app.get("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const cfg = getConfigById(id);
+    if (!cfg) return bad(reply, 404, "model config not found");
+    const { api_key, ...safe } = cfg;
+    const envKey = envTokenForModel(cfg.name);
+    return {
+      config: {
+        ...safe,
+        has_api_key: !!(api_key && api_key.length),
+        has_env_token: !!envKey,
+        location: locationLabel(cfg.base_url),
+      },
+    };
+  });
+
+  // Update a model config.
+  app.patch("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body ?? {}) as {
+      name?: string;
+      base_url?: string;
+      api_key?: string;
+      default_model?: string;
+      context_window?: number;
+      max_tokens?: number;
+      request_timeout_ms?: number;
+      reasoning?: boolean;
+      thinking_level?: string;
+      thinking_format?: string;
+      text_mode?: boolean;
+    };
+    if (
+      body.thinking_format !== undefined &&
+      !(THINKING_FORMATS as readonly string[]).includes(body.thinking_format)
+    ) {
+      return bad(reply, 400, `unknown thinking_format '${body.thinking_format}'`);
+    }
+    try {
+      const cfg = updateModelConfig(id, {
+        name: body.name?.trim(),
+        base_url: body.base_url?.trim(),
+        api_key: body.api_key !== undefined ? (body.api_key.trim() === "" ? null : body.api_key.trim()) : undefined,
+        default_model: body.default_model?.trim(),
+        context_window: body.context_window,
+        max_tokens: body.max_tokens,
+        request_timeout_ms: body.request_timeout_ms,
+        reasoning: body.reasoning === undefined ? undefined : body.reasoning ? 1 : 0,
+        thinking_level: body.thinking_level,
+        thinking_format: body.thinking_format,
+        text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
+      });
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Delete a model config.
+  app.delete("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    try {
+      deleteModelConfig(id);
+      return { ok: true };
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
+  });
+
+  // Duplicate a model config.
+  app.post("/api/model-configs/:id/duplicate", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body ?? {}) as { name?: string };
+    try {
+      const cfg = duplicateModelConfig(id, body.name);
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Set a model config as the global default.
+  app.post("/api/model-configs/:id/set-default", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    try {
+      const cfg = setDefaultModelConfig(id);
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
   });
 
   // ---- Scheduler ----
@@ -224,7 +503,25 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/tick", async () => ({ worked: await tick() }));
 
   // ---- Projects ----
-  app.get("/api/projects", async () => ({ projects: listProjects() }));
+  app.get("/api/projects", async () => {
+    const projects = listProjects();
+    const enriched = projects.map((p) => {
+      const roles = listRoles(p.id);
+      const models = [...new Set(
+        roles
+          .filter((r) => r.enabled && r.model)
+          .map((r) => r.model!)
+      )];
+      // If no per-role model is set, fall back to the project default_model or
+      // the global default model config so the homepage card never shows "—".
+      if (models.length === 0) {
+        const fallback = p.default_model ?? getGlobalConfig()?.default_model ?? null;
+        if (fallback) models.push(fallback);
+      }
+      return { ...p, models };
+    });
+    return { projects: enriched };
+  });
 
   app.post("/api/projects", async (req: FastifyRequest, reply: FastifyReply) => {
     const body = (req.body ?? {}) as {
@@ -624,5 +921,110 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const q = req.query as { project_id?: string };
     const projectId = q.project_id ? Number(q.project_id) : null;
     return { roles: listRoles(projectId) };
+  });
+
+  // ---- Summary stats (homepage dashboard) ----
+  app.get("/api/summary", async () => {
+    const d = getDb();
+    const projects = listProjects();
+    const allTasks = listTasks();
+    const byStage: Record<string, number> = { intake: 0, refining: 0, ready: 0, review: 0 };
+    let inFlight = 0;
+    let actionItems = 0;
+    let blockers = 0;
+    let paused = 0;
+    const blockersList: Array<{
+      task_id: string;
+      name: string | null;
+      exit_state: string | null;
+      stage: string | null;
+      project_id: number | null;
+      review_reason: string | null;
+    }> = [];
+
+    for (const t of allTasks) {
+      const stage = t.stage ?? "intake";
+      if (byStage[stage] !== undefined) byStage[stage]++;
+      if (stage === "refining" || stage === "ready") inFlight++;
+      if (t.exit_state && ["blocker", "needs_human", "needs_more"].includes(t.exit_state)) {
+        actionItems++;
+        if (t.exit_state === "blocker") blockers++;
+        blockersList.push({
+          task_id: t.task_id,
+          name: t.name,
+          exit_state: t.exit_state,
+          stage: t.stage,
+          project_id: t.project_id,
+          review_reason: t.review_reason,
+        });
+      }
+      if (t.paused === 1) paused++;
+    }
+
+    // Enrich action items with project name
+    const enrichedBlockers = blockersList.map((b) => {
+      const proj = projects.find((p) => p.id === b.project_id);
+      return { ...b, project_name: proj?.name ?? null };
+    });
+
+    return {
+      total: allTasks.length,
+      by_stage: byStage,
+      in_flight: inFlight,
+      action_items: actionItems,
+      blockers,
+      paused,
+      projects_count: projects.length,
+      blockers_list: enrichedBlockers,
+    };
+  });
+
+  // ---- Ping network: heartbeat check against every model config ----
+  app.post("/api/ping-network", async () => {
+    const configs = listModelConfigs();
+    const results = await Promise.all(
+      configs.map(async (cfg) => {
+        const baseUrl = (cfg.base_url ?? "").trim();
+        if (!baseUrl) {
+          return {
+            config_id: cfg.id,
+            name: cfg.name ?? cfg.key,
+            base_url: baseUrl,
+            available: false,
+            error: "No base URL configured",
+          };
+        }
+        try {
+          const url = baseUrl.replace(/\/+$/, "") + "/models";
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 8_000);
+          const headers: Record<string, string> = { "Content-Type": "application/json" };
+          // Use stored API key if available, else fall back to env token
+          const apiKey = cfg.api_key?.trim();
+          const envKey = envTokenForModel(cfg.name);
+          const authKey = apiKey || envKey;
+          if (authKey) headers.Authorization = `Bearer ${authKey}`;
+          const res = await fetch(url, { headers, signal: controller.signal });
+          clearTimeout(timer);
+          return {
+            config_id: cfg.id,
+            name: cfg.name ?? cfg.key,
+            base_url: baseUrl,
+            available: res.ok,
+            error: res.ok ? undefined : `HTTP ${res.status}`,
+          };
+        } catch (err) {
+          return {
+            config_id: cfg.id,
+            name: cfg.name ?? cfg.key,
+            base_url: baseUrl,
+            available: false,
+            error: (err as Error).message,
+          };
+        }
+      }),
+    );
+
+    return { results };
   });
 }

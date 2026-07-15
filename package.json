@@ -15,10 +15,14 @@
     "build": "npm --workspace client run build && npm --workspace server run build",
     "start": "npm --workspace server run start",
     "test": "npm --workspace server run test",
-    "typecheck": "npm --workspace server run typecheck && npm --workspace client run typecheck"
+    "typecheck": "npm --workspace server run typecheck && npm --workspace client run typecheck",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "vitepress": "^1.6.4"
   },
   "engines": {
     "node": ">=20"

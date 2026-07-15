@@ -790,6 +790,11 @@ function maybeDistillQuestions(
     });
 }
 
+/** Detect JSON parse errors (strict "after JSON" or generic SyntaxError). */
+function isJsonParseError(message: string): boolean {
+  return message.includes("JSON") || message.includes("Unexpected token") || message.includes("Unexpected non-whitespace");
+}
+
 // ---------------------------------------------------------------------------
 // Running one role step
 // ---------------------------------------------------------------------------
@@ -831,9 +836,50 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       signal: ac.signal,
     });
   } catch (err) {
-    // A role failure must not crash the daemon; record it and escalate to review.
     const msg = (err as Error).message;
     const aborted = ac.signal.aborted || msg === "AbortError" || msg.includes("aborted");
+
+    // JSON formatting failures are transient — re-queue with explicit guidance
+    // instead of immediately escalating to human review.
+    if (!aborted && isJsonParseError(msg)) {
+      const retryCount = step.attempts ?? 0;
+      if (retryCount < 2) {
+        console.warn(
+          `[orchestrator] role ${step.role} failed with JSON parse error (attempt ${retryCount + 1}/2) — ` +
+            `re-queuing with formatting guidance`,
+        );
+        step.status = "pending";
+        step.attempts = retryCount + 1;
+        createIntervention({
+          task_id: task.task_id,
+          kind: "steer_note",
+          payload_json: JSON.stringify({
+            text:
+              `[orchestrator·retry] The previous attempt failed because your JSON output was not valid — ` +
+              `there was extra text after the closing brace or bracket. When you call record_findings (or ` +
+              `output a JSON block in text mode), ensure the JSON is the ONLY content after the opening ` +
+              `brace — no commentary, no markdown, no trailing text. If using a code fence, close it ` +
+              `immediately after the final brace.`,
+          }),
+          created_by: "orchestrator",
+        });
+        updateTask(task.task_id, {
+          refinement_plan_json: JSON.stringify(plan),
+          stage: "refining",
+          paused: 0,
+        });
+        publish(task.task_id, "task_update", {
+          stage: "refining",
+          retryReason: "json-parse-error",
+          attempt: retryCount + 1,
+        });
+        return;
+      }
+      console.warn(
+        `[orchestrator] role ${step.role} JSON parse error after ${retryCount} retries — escalating`,
+      );
+    }
+
     publish(task.task_id, "role_end", { role: step.role, error: true, aborted });
     createRoleRun({
       task_id: task.task_id,

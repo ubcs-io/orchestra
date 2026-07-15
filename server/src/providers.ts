@@ -26,6 +26,19 @@ function ensureRegistry(): ModelRegistry {
   return registry;
 }
 
+/** Build a flat compat object from the connection's thinkingFormat + ModelCompat overrides. */
+function buildCompat(conn: Connection): Record<string, unknown> {
+  const c: Record<string, unknown> = { thinkingFormat: conn.thinkingFormat };
+  const m = conn.compat;
+  if (m.supportsDeveloperRole !== undefined) c.supportsDeveloperRole = m.supportsDeveloperRole;
+  if (m.supportsReasoningEffort !== undefined) c.supportsReasoningEffort = m.supportsReasoningEffort;
+  if (m.maxTokensField) c.maxTokensField = m.maxTokensField;
+  if (m.chatTemplateKwargs && Object.keys(m.chatTemplateKwargs).length > 0) {
+    c.chatTemplateKwargs = m.chatTemplateKwargs;
+  }
+  return c;
+}
+
 function modelEntry(id: string, conn: Connection) {
   return {
     id,
@@ -37,7 +50,7 @@ function modelEntry(id: string, conn: Connection) {
     reasoning: conn.reasoning,
     // thinkingFormat shapes the reasoning REQUEST; the response only splits onto a
     // separate channel if the endpoint emits `reasoning_content`.
-    compat: { thinkingFormat: conn.thinkingFormat } as Model<Api>["compat"],
+    compat: buildCompat(conn) as Model<Api>["compat"],
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: conn.contextWindow,
@@ -55,7 +68,7 @@ function modelEntry(id: string, conn: Connection) {
 export function ensureModel(modelId: string): Model<Api> {
   const conn = resolveConnection();
   const reg = ensureRegistry();
-  const sig = `${conn.baseUrl}|${conn.apiKey}|${conn.contextWindow}|${conn.maxTokens}|${conn.reasoning}|${conn.thinkingFormat}`;
+  const sig = `${conn.baseUrl}|${conn.apiKey}|${conn.contextWindow}|${conn.maxTokens}|${conn.reasoning}|${conn.thinkingFormat}|${JSON.stringify(conn.compat)}`;
   if (!registeredModelIds.has(modelId) || sig !== lastProviderSig) {
     registeredModelIds.add(modelId);
     // Always include the default so a role/task override never drops it.

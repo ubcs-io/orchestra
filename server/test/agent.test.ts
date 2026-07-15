@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createStallDetector, createThinkSplitter } from "../src/agent";
+import { createStallDetector, createThinkSplitter, extractFindingsFromText } from "../src/agent";
 
 /** Feed chunks through a splitter and concatenate the routed output. */
 function run(chunks: string[]): { text: string; thinking: string } {
@@ -140,5 +140,36 @@ describe("twoPhase contract (pure)", () => {
     const { TWO_PHASE_FORMALIZE_PROMPT } = await import("../src/roles.js");
     expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/```json/);
     expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/verdict/);
+  });
+});
+
+describe("extractFindingsFromText (salvage path)", () => {
+  it("parses a well-formed closed fence", () => {
+    const text =
+      '```json\n{"verdict":"pass","summary":"ok","open_questions":[],"coverage":[],"section_md":"# done"}\n```';
+    const findings = extractFindingsFromText(text);
+    expect(findings?.verdict).toBe("pass");
+    expect(findings?.summary).toBe("ok");
+  });
+
+  it("salvages fields from an unclosed fence containing an escaped quote without corrupting them", () => {
+    // Truncated mid-response (e.g. cut off by the pre-emptive nudge) — the closed
+    // `summary` field contains an escaped quote, and `section_md` (the last field)
+    // is cut off with no closing fence. Before the fix, the salvage regex's capture
+    // group (already valid JSON string content) was re-escaped a second time,
+    // corrupting `\"` into `\\"` and throwing inside JSON.parse.
+    const text =
+      '```json\n{"verdict":"needs_more","summary":"the \\"foo\\" case is unhandled","section_md":"trunc';
+    const findings = extractFindingsFromText(text);
+    expect(findings).not.toBeNull();
+    expect(findings?.verdict).toBe("needs_more");
+    expect(findings?.summary).toBe('the "foo" case is unhandled');
+    expect(findings?.open_questions).toEqual([]);
+    expect(findings?.coverage).toEqual([]);
+  });
+
+  it("does not throw on a value containing a lone unescaped backslash near a quote", () => {
+    const text = '```json\n{"verdict":"blocker","summary":"path is C:\\\\Users\\\\x","section_md":"trunc';
+    expect(() => extractFindingsFromText(text)).not.toThrow();
   });
 });

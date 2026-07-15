@@ -65,11 +65,32 @@ export function resolveRouterConfig(projectConfigJson: string | null): RouterCon
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/** Extract JSON from an LLM text response (handles markdown code blocks). */
+/** Extract JSON from an LLM text response (handles markdown code blocks).
+ *  Tolerates trailing text / commentary after a valid JSON root object. */
 function extractJson<T>(text: string): T {
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const raw = (jsonMatch?.[1] ?? text).trim();
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch (firstErr) {
+    // Handle trailing non-whitespace after a valid root object.
+    // Models sometimes append commentary after the JSON block.
+    if (
+      firstErr instanceof SyntaxError &&
+      firstErr.message.includes("after JSON")
+    ) {
+      // Walk backwards from the end, truncating one character at a time,
+      // until a valid parse is found. Prefer closing brace/brace-style roots.
+      for (let i = raw.length - 1; i > 0; i--) {
+        try {
+          return JSON.parse(raw.slice(0, i)) as T;
+        } catch {
+          continue;
+        }
+      }
+    }
+    throw firstErr;
+  }
 }
 
 /** Run a router LLM call through the roleRunner seam and parse the result. */

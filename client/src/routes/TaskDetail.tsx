@@ -958,17 +958,17 @@ export function TaskDetail() {
                     deepen
                   </button>
                   {t.project_id != null && (
-                    <button
+                    <Link
+                      to="/projects/$projectId/roles"
+                      params={{ projectId: String(t.project_id) }}
+                      search={{ role: r.role_key }}
                       className="small"
                       title={`View ${r.role_key} configuration`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        window.open(`/projects/${t.project_id}/roles`, "_blank");
-                      }}
-                      style={{ fontSize: 14, lineHeight: 1 }}
+                      onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                      style={{ fontSize: 14, lineHeight: 1, textDecoration: "none" }}
                     >
                       👤
-                    </button>
+                    </Link>
                   )}
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}

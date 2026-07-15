@@ -236,6 +236,22 @@ export function NetworkEditor() {
     }
   }, [currentNetwork]);
 
+  // Helper: navigate to the role config page if project is set, otherwise open inline modal
+  const handleRoleClick = useCallback(
+    (roleKey: string) => {
+      if (currentNetwork?.project_id != null) {
+        navigate({
+          to: "/projects/$projectId/roles",
+          params: { projectId: String(currentNetwork.project_id) },
+          search: { role: roleKey },
+        });
+      } else {
+        setRoleModalKey(roleKey);
+      }
+    },
+    [currentNetwork, navigate],
+  );
+
   // --- UI & modal state (must come before initialNodes which references setRoleModalKey) ---
   const [name, setName] = useState("New Network");
   const [description, setDescription] = useState("");
@@ -269,10 +285,10 @@ export function NetworkEditor() {
         roleKey: n.roleKey,
         criteriaCount: n.criteria?.length ?? 0,
         depth: n.overrides?.depth,
-        onPersonClick: () => setRoleModalKey(n.roleKey),
+        onPersonClick: () => handleRoleClick(n.roleKey),
       },
     }));
-  }, [parsedGraph, rolesQ.data]);
+  }, [parsedGraph, rolesQ.data, handleRoleClick]);
 
   const initialEdges: Edge[] = useMemo(() => {
     if (!parsedGraph?.edges) return [];
@@ -435,13 +451,13 @@ export function NetworkEditor() {
           label: rolesQ.data?.roles.find((r) => r.key === roleKey)?.title ?? roleKey,
           roleKey,
           criteriaCount: 0,
-          onPersonClick: () => setRoleModalKey(roleKey),
+          onPersonClick: () => handleRoleClick(roleKey),
         },
       };
 
       setNodes((nds) => [...nds, newNode]);
     },
-    [setNodes, rolesQ.data],
+    [setNodes, rolesQ.data, handleRoleClick],
   );
 
   // --- Edge property handlers ---
@@ -990,14 +1006,14 @@ export function NetworkEditor() {
         />
       )}
 
-      {/* Role Edit Modal */}
-      {roleModalKey && (() => {
+      {/* Role Edit Modal — only shown for global networks without a project */}
+      {roleModalKey && currentNetwork?.project_id == null && (() => {
         const role = rolesQ.data?.roles.find((r) => r.key === roleModalKey);
         if (!role) return null;
         return (
           <RoleEditModal
             role={role}
-            projectId={currentNetwork?.project_id ?? null}
+            projectId={null}
             onSave={(body) => roleSaveMutation.mutate(body)}
             onCancel={() => setRoleModalKey(null)}
             isSaving={roleSaveMutation.isPending}

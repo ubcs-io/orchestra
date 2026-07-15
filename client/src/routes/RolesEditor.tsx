@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useParams, useSearch } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Role } from "../api";
+import { api, type Role, type ModelConfig } from "../api";
 
 /** Known pi built-in tools (also serves as the dropdown suggestion list). */
 const KNOWN_TOOLS = ["read", "grep", "find", "ls", "git_history"] as const;
@@ -143,9 +143,131 @@ function TagInput({
   );
 }
 
-function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
+/** Bubble-picker dropdown for model overrides — mimics the "Get models" flow in Models. */
+function ModelPicker({
+  value,
+  onChange,
+  configs,
+  defaultConfigName,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  configs: ModelConfig[];
+  defaultConfigName: string;
+}) {
+  const [showDropdown, setShowDropdown] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown on outside click.
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setShowDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  const selectedConfig = configs.find((c) => c.name === value);
+  const displayText = value || `(default: ${defaultConfigName})`;
+
+  return (
+    <div className="model-picker" ref={containerRef}>
+      {value ? (
+        <div className="model-picker-chip">
+          <span className="model-picker-chip-label">{value}</span>
+          {selectedConfig && (
+            <span className="muted" style={{ fontSize: 10 }}>
+              {selectedConfig.default_model ?? "—"}
+            </span>
+          )}
+          <button
+            type="button"
+            className="tag-remove"
+            onClick={(e) => {
+              e.stopPropagation();
+              onChange("");
+            }}
+            tabIndex={-1}
+          >
+            ×
+          </button>
+        </div>
+      ) : (
+        <button
+          className="model-picker-trigger small"
+          onClick={() => setShowDropdown((o) => !o)}
+        >
+          {displayText}
+        </button>
+      )}
+
+      {value && (
+        <button
+          className="model-picker-change small"
+          style={{ marginLeft: 6, fontSize: 10 }}
+          onClick={() => setShowDropdown((o) => !o)}
+        >
+          change
+        </button>
+      )}
+
+      {showDropdown && (
+        <div
+          className="model-picker-dropdown"
+          style={{
+            marginTop: 6,
+            padding: "6px 8px",
+            background: "var(--bg-depth)",
+            borderRadius: 6,
+            maxHeight: 200,
+            overflowY: "auto",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 4,
+          }}
+        >
+          {configs.map((cfg) => (
+            <button
+              key={cfg.id}
+              className="small"
+              style={{
+                fontSize: 10,
+                padding: "2px 8px",
+                background: value === cfg.name ? "var(--brass)" : "var(--bg-hover)",
+                color: value === cfg.name ? "var(--bg-base)" : "inherit",
+              }}
+              onClick={() => {
+                onChange(value === cfg.name ? "" : (cfg.name ?? ""));
+                setShowDropdown(false);
+              }}
+              title={cfg.default_model ? `${cfg.name ?? cfg.key} → ${cfg.default_model}` : (cfg.name ?? cfg.key)}
+            >
+              {cfg.name ?? cfg.key}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RoleCard({
+  projectId,
+  role,
+  defaultOpen,
+  modelConfigs,
+  defaultModelConfigName,
+}: {
+  projectId: number;
+  role: Role;
+  defaultOpen: boolean;
+  modelConfigs: ModelConfig[];
+  defaultModelConfigName: string;
+}) {
   const qc = useQueryClient();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   const [prompt, setPrompt] = useState(role.system_prompt ?? "");
   const [tools, setTools] = useState<string[]>(() => {
     try {
@@ -171,7 +293,7 @@ function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
   });
 
   return (
-    <div className="panel">
+    <div className="panel" id={`role-${role.key}`}>
       <div className="row">
         <button className="small" onClick={() => setOpen((o) => !o)}>{open ? "▾" : "▸"}</button>
         <strong>{role.title ?? role.key}</strong>
@@ -190,7 +312,12 @@ function RoleCard({ projectId, role }: { projectId: number; role: Role }) {
             suggestions={KNOWN_TOOLS}
           />
           <label>Model override (optional)</label>
-          <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="(project default)" />
+          <ModelPicker
+            value={model}
+            onChange={setModel}
+            configs={modelConfigs}
+            defaultConfigName={defaultModelConfigName}
+          />
           <label>System prompt</label>
           <textarea style={{ minHeight: 250 }} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
           <div style={{ marginTop: 8 }}>
@@ -208,6 +335,25 @@ export function RolesEditor() {
   const { projectId } = useParams({ strict: false }) as { projectId: string };
   const pid = Number(projectId);
   const { data, isLoading } = useQuery({ queryKey: ["roles", pid], queryFn: () => api.roles(pid) });
+  const { role: targetRole } = useSearch({ strict: false }) as { role?: string };
+  const { data: mcData } = useQuery({
+    queryKey: ["model-configs"],
+    queryFn: api.modelConfigs,
+  });
+
+  const configs = mcData?.configs ?? [];
+  const defaultModelConfigName =
+    configs.find((c) => c.project_id === null && c.key === "default")?.name ?? "(none)";
+
+  // Scroll to the target role after data loads
+  useEffect(() => {
+    if (targetRole && data) {
+      const el = document.getElementById(`role-${targetRole}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+  }, [targetRole, data]);
 
   return (
     <div>
@@ -219,7 +365,16 @@ export function RolesEditor() {
       {isLoading ? (
         <p className="muted">Loading…</p>
       ) : (
-        data?.roles.map((r) => <RoleCard key={r.key} projectId={pid} role={r} />)
+        data?.roles.map((r) => (
+          <RoleCard
+            key={r.key}
+            projectId={pid}
+            role={r}
+            defaultOpen={r.key === targetRole}
+            modelConfigs={configs}
+            defaultModelConfigName={defaultModelConfigName}
+          />
+        ))
       )}
     </div>
   );

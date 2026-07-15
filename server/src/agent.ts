@@ -56,6 +56,8 @@ export interface ToolCallRecord {
   tool: string;
   args: unknown;
   isError: boolean;
+  /** Error text (e.g. schema validation failure) when isError is true. */
+  error?: string;
 }
 
 /** Normalized stream event forwarded to the SSE layer. */
@@ -63,7 +65,7 @@ export type RoleStreamEvent =
   | { type: "text"; delta: string }
   | { type: "thinking"; delta: string }
   | { type: "tool_start"; tool: string; args: unknown }
-  | { type: "tool_end"; tool: string; isError: boolean }
+  | { type: "tool_end"; tool: string; isError: boolean; error?: string }
   | { type: "status"; message: string };
 
 export interface RoleRunResult {
@@ -142,8 +144,8 @@ const RecordFindingsSchema = Type.Object({
     Type.Literal("needs_human"),
   ]),
   summary: Type.String(),
-  open_questions: Type.Array(Type.String()),
-  coverage: Type.Array(CoverageSchema),
+  open_questions: Type.Optional(Type.Array(Type.String())),
+  coverage: Type.Optional(Type.Array(CoverageSchema)),
   section_md: Type.String(),
   criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
 });
@@ -408,7 +410,7 @@ export function createThinkSplitter() {
  * Handles models (including markdown-fenced) and raw JSON. Returns the parsed
  * findings on success, or null if no valid JSON block is found.
  */
-function extractFindingsFromText(text: string): RoleFindings | null {
+export function extractFindingsFromText(text: string): RoleFindings | null {
   if (!text) return null;
 
   // Try ```json ... ``` fence first (most common for text-mode output).
@@ -455,7 +457,16 @@ function salvageFieldsFromPartialJson(json: string): RoleFindings | null {
     // greedy match to the next unescaped quote + comma/brace.
     const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, "i");
     const m = re.exec(json);
-    return m ? JSON.parse(`"${m[1]!.replace(/"/g, '\\"')}"`) as string : null;
+    if (!m) return null;
+    // m[1] is already valid JSON string content (the regex only accepts
+    // non-quote/backslash chars or backslash-escape pairs) — wrap it in
+    // quotes and parse directly. Do not re-escape: that would double-escape
+    // already-escaped quotes (\" -> \\") and corrupt the value.
+    try {
+      return JSON.parse(`"${m[1]}"`) as string;
+    } catch {
+      return null;
+    }
   };
   const verdict = str("verdict");
   const summary = str("summary");
@@ -716,10 +727,19 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
         // Reset pre-emptive nudge tracking on any tool call.
         answerTextLenSinceLastTool = 0;
         break;
-      case "tool_execution_end":
-        toolCalls.push({ tool: ev.toolName, args: undefined, isError: ev.isError });
-        record({ type: "tool_end", tool: ev.toolName, isError: ev.isError });
+      case "tool_execution_end": {
+        // On rejection (e.g. schema validation failure), pi wraps the error
+        // message as a text content block in `result` — surface it so failed
+        // record_findings calls are diagnosable without transcript spelunking.
+        const errText = ev.isError
+          ? (ev.result?.content as { type: string; text?: string }[] | undefined)?.find(
+              (c) => c.type === "text",
+            )?.text
+          : undefined;
+        toolCalls.push({ tool: ev.toolName, args: undefined, isError: ev.isError, error: errText });
+        record({ type: "tool_end", tool: ev.toolName, isError: ev.isError, error: errText });
         break;
+      }
       case "message_end": {
         const msg = ev.message as { usage?: { input?: number; output?: number }; stopReason?: string };
         if (msg.usage) tokens += (msg.usage.input ?? 0) + (msg.usage.output ?? 0);
@@ -875,12 +895,16 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   // ---- Remove old fallback block (logic moved above) ----
 
-  if (fallback || stopReason === "length" || stallEverDetected) {
+  const failedCalls = toolCalls.filter((tc) => tc.isError);
+  if (fallback || stopReason === "length" || stallEverDetected || failedCalls.length > 0) {
     console.warn(
       `[agent] role run: model=${params.modelId} stop=${stopReason ?? "?"} ` +
         `fallback=${fallback} stalled=${stallEverDetected} retried=${stallRetried} textMode=${textMode} twoPhase=${twoPhase} ` +
         `tokens=${tokens} answer_chars=${answerText.length} thinking_chars=${thinkingText.length}`,
     );
+    for (const tc of failedCalls) {
+      console.warn(`[agent]   tool call failed: ${tc.tool} — ${tc.error ?? "(no error text)"}`);
+    }
   }
 
   session.dispose();

@@ -18,7 +18,7 @@ const RolesEditor = React.lazy(() => import("./routes/RolesEditor").then((m) => 
 const Settings = React.lazy(() => import("./routes/Settings").then((m) => ({ default: m.Settings })));
 const TaskDetail = React.lazy(() => import("./routes/TaskDetail").then((m) => ({ default: m.TaskDetail })));
 const NetworkEditor = React.lazy(() => import("./routes/NetworkEditor").then((m) => ({ default: m.NetworkEditor })));
-
+const Models = React.lazy(() => import("./routes/Models").then((m) => ({ default: m.Models })));
 function SchedulerToggle() {
   const qc = useQueryClient();
   const { data } = useQuery({ queryKey: ["scheduler"], queryFn: api.scheduler, refetchInterval: 5000 });
@@ -53,6 +53,7 @@ function Root() {
         <h1>◆ ORCHESTRA</h1>
         <nav>
           <Link to="/">Projects</Link>
+          <Link to="/models">Models</Link>
           <Link to="/networks">Networks</Link>
           <Link to="/settings">Settings</Link>
         </nav>
@@ -74,8 +75,9 @@ const taskRoute = createRoute({ getParentRoute: () => rootRoute, path: "/tasks/$
 const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: "/settings", component: Settings });
 const networksRoute = createRoute({ getParentRoute: () => rootRoute, path: "/networks", component: NetworkEditor });
 const networkDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: "/networks/$networkId", component: NetworkEditor });
+const modelsRoute = createRoute({ getParentRoute: () => rootRoute, path: "/models", component: Models });
 
-const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute, settingsRoute, networksRoute, networkDetailRoute]);
+const routeTree = rootRoute.addChildren([indexRoute, boardRoute, rolesRoute, taskRoute, settingsRoute, networksRoute, networkDetailRoute, modelsRoute]);
 const router = createRouter({ routeTree });
 
 declare module "@tanstack/react-router" {
