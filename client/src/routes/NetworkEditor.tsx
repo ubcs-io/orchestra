@@ -308,7 +308,7 @@ export function NetworkEditor() {
     const rfEdge = edges.find((e) => e.id === edgeId);
     setEdgeLabel((rfEdge?.label as string) ?? "");
     setEdgeCondition({ type: "always" });
-  }, [selectedEdgeIds, parsedGraph, edges]);
+  }, [selectedEdgeIds]);
 
   // Sync React Flow nodes/edges whenever the parsed graph or roles data changes
   useEffect(() => {
