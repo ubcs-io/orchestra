@@ -1116,13 +1116,13 @@ export function deleteNetwork(identifier: number | string): void {
 }
 
 /** Duplicate a network (creates a new user-editable copy). */
-export function duplicateNetwork(identifier: number | string, newName?: string): AgentNetworkRow {
+export function duplicateNetwork(identifier: number | string, newName?: string, targetProjectId?: number | null): AgentNetworkRow {
   const network = getNetwork(identifier);
   if (!network) throw new Error("Network not found");
   return createNetwork({
     name: newName ?? `${network.name} (copy)`,
     description: network.description,
-    project_id: network.project_id,
+    project_id: targetProjectId !== undefined ? targetProjectId : network.project_id,
     intake_kind: network.intake_kind,
     graph_json: network.graph_json,
     is_system: false,

@@ -538,8 +538,8 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/networks/:id/duplicate", async (req: FastifyRequest, reply: FastifyReply) => {
     const network = getNetwork((req.params as { id: string }).id);
     if (!network) return bad(reply, 404, "network not found");
-    const body = (req.body ?? {}) as { name?: string };
-    const copy = duplicateNetwork((req.params as { id: string }).id, body.name);
+    const body = (req.body ?? {}) as { name?: string; project_id?: number };
+    const copy = duplicateNetwork((req.params as { id: string }).id, body.name, body.project_id);
 
     // Re-apply waterfall layout to the duplicate so it's always readable.
     try {

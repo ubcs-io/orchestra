@@ -597,13 +597,13 @@ export function seedGlobalRoles(): void {
 // Network seeding — creates system agent_networks from built-in flow templates
 // ---------------------------------------------------------------------------
 
-const NETWORKS_SEED_VERSION = 4;
+const NETWORKS_SEED_VERSION = 5;
 
 const GRID = 20;
 /** Horizontal + vertical offset per sequential node in the waterfall layout.
- *  Each node card is ~4 grid squares tall, so a 6-square diagonal step gives
- *  ~40px clearance between consecutive nodes, preventing any overlap. */
-const WATERFALL_STEP = GRID * 6; // 120px diagonal step — six grid spaces down and right
+ *  Eight grid squares gives a clean diagonal with straight edges, plenty of
+ *  clearance between consecutive node cards. */
+const WATERFALL_STEP = GRID * 8; // 160px diagonal step — eight grid spaces down and right
 const WATERFALL_ORIGIN_X = 100;
 const WATERFALL_ORIGIN_Y = 80;
 

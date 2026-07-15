@@ -16,7 +16,7 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type AgentNetworkGraph } from "../api";
+import { api, type AgentNetworkGraph, type NetworkEdge } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,172 @@ function generateId(): string {
 const nodeTypes = { networkNode: NetworkNodeCard };
 
 // ---------------------------------------------------------------------------
+// Role Edit Modal (extracted to manage its own form state)
+// ---------------------------------------------------------------------------
+
+function ProjectSelectModal({
+  projects,
+  onSelect,
+  onCancel,
+}: {
+  projects: Array<{ id: number; name: string }>;
+  onSelect: (projectId: number | null) => void;
+  onCancel: () => void;
+}) {
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+        <h3>Select Project</h3>
+        <p className="muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          Associate this template with a project, or leave unselected for a global template.
+        </p>
+        <select
+          value={selectedId ?? ""}
+          onChange={(e) => setSelectedId(e.target.value ? Number(e.target.value) : null)}
+          style={{ marginBottom: 12 }}
+        >
+          <option value="">(Global — no project)</option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <div className="modal-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={() => onSelect(selectedId)}>
+            Continue
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RoleEditModal({
+  role,
+  projectId,
+  onSave,
+  onCancel,
+  isSaving,
+}: {
+  role: {
+    key: string;
+    title: string | null;
+    enabled: number;
+    system_prompt: string | null;
+    tools_json: string | null;
+    model: string | null;
+    can_create_subtasks: number;
+  };
+  projectId: number | null;
+  onSave: (body: {
+    enabled: number;
+    can_create_subtasks: number;
+    system_prompt: string;
+    tools_json: string;
+    model?: string;
+  }) => void;
+  onCancel: () => void;
+  isSaving: boolean;
+}) {
+  const [prompt, setPrompt] = useState(role.system_prompt ?? "");
+  const [tools, setTools] = useState(() => {
+    try {
+      return (JSON.parse(role.tools_json ?? "[]") as string[]).join(", ");
+    } catch {
+      return "";
+    }
+  });
+  const [model, setModel] = useState(role.model ?? "");
+  const [enabled, setEnabled] = useState(role.enabled === 1);
+  const [canCreateSubtasks, setCanCreateSubtasks] = useState(role.can_create_subtasks === 1);
+
+  const handleSave = () => {
+    onSave({
+      enabled: enabled ? 1 : 0,
+      can_create_subtasks: canCreateSubtasks ? 1 : 0,
+      system_prompt: prompt,
+      tools_json: JSON.stringify(
+        tools
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      ),
+      model: model || undefined,
+    });
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+        <h3>
+          Edit Role — {role.title ?? role.key}
+        </h3>
+        <span className="pill dim" style={{ marginBottom: 12, display: "inline-block" }}>
+          {role.key}
+        </span>
+        {projectId != null && (
+          <span className="pill ok" style={{ marginLeft: 6, marginBottom: 12 }}>
+            project override
+          </span>
+        )}
+
+        <label>
+          <input
+            type="checkbox"
+            style={{ width: "auto", marginRight: 6 }}
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+          />{" "}
+          enabled
+        </label>
+
+        <label>
+          <input
+            type="checkbox"
+            style={{ width: "auto", marginRight: 6 }}
+            checked={canCreateSubtasks}
+            onChange={(e) => setCanCreateSubtasks(e.target.checked)}
+          />{" "}
+          Can Create Subtasks
+        </label>
+
+        <label>Tools (comma-separated pi built-ins: read, grep, find, ls)</label>
+        <input value={tools} onChange={(e) => setTools(e.target.value)} />
+
+        <label>Model override (optional)</label>
+        <input
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder={projectId != null ? "(project default)" : "(global default)"}
+        />
+
+        <label>System prompt</label>
+        <textarea
+          style={{ minHeight: 180 }}
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+        />
+
+        <p className="muted" style={{ fontSize: 11, fontStyle: "italic", marginTop: 10 }}>
+          Changes are applied globally to all networks that use this role.
+        </p>
+
+        <div className="modal-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" disabled={isSaving} onClick={handleSave}>
+            {isSaving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
 
@@ -57,6 +223,7 @@ export function NetworkEditor() {
     enabled: isEditing,
   });
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
+  const projectsQ = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
 
   // --- Parse current graph ---
   const currentNetwork = networkQ.data?.network ?? null;
@@ -68,6 +235,27 @@ export function NetworkEditor() {
       return null;
     }
   }, [currentNetwork]);
+
+  // --- UI & modal state (must come before initialNodes which references setRoleModalKey) ---
+  const [name, setName] = useState("New Network");
+  const [description, setDescription] = useState("");
+  const [intakeKind, setIntakeKind] = useState("manual");
+  const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
+  const [maxLoopbacks, setMaxLoopbacks] = useState(2);
+  const [snapToGrid, setSnapToGrid] = useState(true);
+
+  // Selection state — driven by React Flow's onSelectionChange for full
+  // multi-select support (nodes + edges, Shift+Click).
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+
+  // Role editing modal state
+  const [roleModalKey, setRoleModalKey] = useState<string | null>(null);
+
+  // Project selection modal state — shown before creating or duplicating
+  const [projectModalMode, setProjectModalMode] = useState<"create" | "duplicate" | null>(null);
+  // Pending project ID for "New Network" workflow (carried from modal to save)
+  const [pendingProjectId, setPendingProjectId] = useState<number | null>(null);
 
   // --- React Flow state ---
   const initialNodes: Node[] = useMemo(() => {
@@ -81,6 +269,7 @@ export function NetworkEditor() {
         roleKey: n.roleKey,
         criteriaCount: n.criteria?.length ?? 0,
         depth: n.overrides?.depth,
+        onPersonClick: () => setRoleModalKey(n.roleKey),
       },
     }));
   }, [parsedGraph, rolesQ.data]);
@@ -93,25 +282,33 @@ export function NetworkEditor() {
       target: e.targetNodeId,
       label: e.label,
       type: "smoothstep",
-      animated: !!e.condition,
+      animated: !e.condition,
     }));
   }, [parsedGraph]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  // --- UI state ---
-  const [name, setName] = useState("New Network");
-  const [description, setDescription] = useState("");
-  const [intakeKind, setIntakeKind] = useState("manual");
-  const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
-  const [maxLoopbacks, setMaxLoopbacks] = useState(2);
-  const [snapToGrid, setSnapToGrid] = useState(true);
+  // Working copy of edge properties for the selected edge's condition/label
+  const [edgeLabel, setEdgeLabel] = useState("");
+  const [edgeCondition, setEdgeCondition] = useState<NetworkEdge["condition"]>({ type: "always" });
 
-  // Selection state — driven by React Flow's onSelectionChange for full
-  // multi-select support (nodes + edges, Shift+Click).
-  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
-  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+  // When a single edge is selected, populate the editor from current data
+  useEffect(() => {
+    if (selectedEdgeIds.length !== 1) return;
+    const edgeId = selectedEdgeIds[0];
+    // Check parsed graph first, then React Flow state for unsaved edges
+    const stored = parsedGraph?.edges?.find((pe) => pe.id === edgeId);
+    if (stored) {
+      setEdgeLabel(stored.label ?? "");
+      setEdgeCondition(stored.condition ?? { type: "always" });
+      return;
+    }
+    // Unsaved edge – use internal label if any
+    const rfEdge = edges.find((e) => e.id === edgeId);
+    setEdgeLabel((rfEdge?.label as string) ?? "");
+    setEdgeCondition({ type: "always" });
+  }, [selectedEdgeIds]);
 
   // Sync React Flow nodes/edges whenever the parsed graph or roles data changes
   useEffect(() => {
@@ -168,11 +365,12 @@ export function NetworkEditor() {
   const onConnect = useCallback(
     (connection: Connection) => {
       setEdges((eds) =>
-        addEdge(
+          addEdge(
           {
             ...connection,
             id: `e-${generateId()}`,
             type: "smoothstep",
+            animated: true,
           },
           eds,
         ),
@@ -193,6 +391,7 @@ export function NetworkEditor() {
           source,
           target,
           type: "smoothstep",
+          animated: true,
         },
         eds,
       ),
@@ -236,12 +435,39 @@ export function NetworkEditor() {
           label: rolesQ.data?.roles.find((r) => r.key === roleKey)?.title ?? roleKey,
           roleKey,
           criteriaCount: 0,
+          onPersonClick: () => setRoleModalKey(roleKey),
         },
       };
 
       setNodes((nds) => [...nds, newNode]);
     },
     [setNodes, rolesQ.data],
+  );
+
+  // --- Edge property handlers ---
+  const updateEdgeLabel = useCallback(
+    (id: string, label: string) => {
+      setEdgeLabel(label);
+      setEdges((eds) =>
+        eds.map((e) => (e.id === id ? { ...e, label } : e)),
+      );
+    },
+    [setEdges],
+  );
+
+  const updateEdgeCondition = useCallback(
+    (id: string, condition: NetworkEdge["condition"]) => {
+      setEdgeCondition(condition);
+      // Edges with a non-"always" condition become solid (animated=false) like saved edges
+      const hasCustomCondition =
+        condition?.type !== "always" || condition?.operator || condition?.value;
+      setEdges((eds) =>
+        eds.map((e) =>
+          e.id === id ? { ...e, animated: !hasCustomCondition } : e,
+        ),
+      );
+    },
+    [setEdges],
   );
 
   // --- Delete selected elements ---
@@ -279,13 +505,20 @@ export function NetworkEditor() {
       }),
       edges: edges.map((e) => {
         const existingEdge = parsedGraph?.edges?.find((pe) => pe.id === e.id);
-        // Preserve stored condition if available, otherwise default to "always"
-        const condition = existingEdge?.condition ?? { type: "always" as const };
+        // If this edge is currently selected and being edited, use working copy
+        const isSelected =
+          selectedEdgeIds.length === 1 && selectedEdgeIds[0] === e.id;
+        const condition = isSelected
+          ? edgeCondition
+          : (existingEdge?.condition ?? { type: "always" as const });
+        const label = isSelected
+          ? (edgeLabel || undefined)
+          : ((e.label as string) || undefined);
         return {
           id: e.id,
           sourceNodeId: e.source,
           targetNodeId: e.target,
-          label: (e.label as string) || undefined,
+          label,
           condition,
         };
       }),
@@ -315,6 +548,7 @@ export function NetworkEditor() {
       return api.createNetwork({
         name,
         description,
+        project_id: pendingProjectId ?? undefined,
         intake_kind: intakeKind,
         graph_json: graphJson,
       });
@@ -332,16 +566,50 @@ export function NetworkEditor() {
     mutationFn: () => api.deleteNetwork(networkId!),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["networks"] });
-      navigate({ to: "/networks" });
+      qc.removeQueries({ queryKey: ["network", networkId] });
+      navigate({ to: "/networks", replace: true });
     },
   });
 
+  // --- Project modal handlers ---
+  const handleProjectSelectForCreate = useCallback((projectId: number | null) => {
+    setProjectModalMode(null);
+    setPendingProjectId(projectId);
+    // Navigate to a fresh /networks route — the new network editor will use pendingProjectId on save
+    navigate({ to: "/networks" });
+  }, [navigate]);
+
+  const handleProjectSelectForDuplicate = useCallback((projectId: number | null) => {
+    setProjectModalMode(null);
+    duplicateMutation.mutate(projectId ?? undefined);
+  }, []);
+
   // --- Duplicate mutation ---
   const duplicateMutation = useMutation({
-    mutationFn: () => api.duplicateNetwork(networkId!),
+    mutationFn: (projectId?: number) => api.duplicateNetwork(networkId!, undefined, projectId),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["networks"] });
       navigate({ to: "/networks/$networkId", params: { networkId: res.network.network_id } });
+    },
+  });
+
+  // --- Role save mutation ---
+  const roleSaveMutation = useMutation({
+    mutationFn: async (body: {
+      enabled: number;
+      can_create_subtasks: number;
+      system_prompt: string;
+      tools_json: string;
+      model?: string;
+    }) => {
+      if (!roleModalKey) throw new Error("No role selected");
+      // Use network's project_id if available, otherwise 0 for global
+      const pid = currentNetwork?.project_id ?? 0;
+      return api.saveRole(pid, roleModalKey, body);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["allRoles"] });
+      setRoleModalKey(null);
     },
   });
 
@@ -371,7 +639,7 @@ export function NetworkEditor() {
       {/* Left Sidebar — Network List */}
       <aside className="network-left-sidebar">
         <div className="network-sidebar-section">
-          <h3>My Networks</h3>
+          <h3>Custom Templates</h3>
           {networksQ.data?.networks
             .filter((n) => !n.is_system)
             .map((n) => (
@@ -382,6 +650,11 @@ export function NetworkEditor() {
                 className={`network-list-item ${n.network_id === networkId ? "active" : ""}`}
               >
                 <span>{n.name}</span>
+                {n.project_id != null && (
+                  <span className="muted">
+                    {projectsQ.data?.projects.find((p) => p.id === n.project_id)?.name ?? `Project #${n.project_id}`}
+                  </span>
+                )}
                 {n.is_default === 1 && <span className="pill ok">default</span>}
               </Link>
             ))}
@@ -389,17 +662,17 @@ export function NetworkEditor() {
             <button
               className="small"
               style={{ marginTop: 8, width: "100%" }}
-              onClick={() => duplicateMutation.mutate()}
+              onClick={() => setProjectModalMode("duplicate")}
             >
-              + Duplicate
+              + Duplicate Template
             </button>
           )}
           <button
             className="small primary"
             style={{ marginTop: 8, width: "100%" }}
-            onClick={() => navigate({ to: "/networks" })}
+            onClick={() => setProjectModalMode("create")}
           >
-            + New Network
+            + New Template
           </button>
         </div>
 
@@ -516,8 +789,12 @@ export function NetworkEditor() {
           >
             <Background variant={BackgroundVariant.Dots} gap={GRID} size={1} />
             <Controls />
-            <MiniMap nodeColor={(n) => (n.selected ? "var(--brass)" : "var(--bg3)")} />
-            <Panel position="top-right">
+            <MiniMap
+              nodeColor={(n) => (n.selected ? "var(--brass)" : "var(--bg3)")}
+              position="top-right"
+              style={{ width: 150, height: 113 }}
+            />
+            <Panel position="top-center">
               <div className="network-canvas-toolbar">
                 {!isReadOnly && selectedEdgeIds.length === 1 && (
                   <button className="small" onClick={deleteSelected}>
@@ -562,8 +839,119 @@ export function NetworkEditor() {
         </div>
       </main>
 
-      {/* Right Sidebar — Role Palette */}
+      {/* Right Sidebar — Edge Properties & Role Palette */}
       <aside className="network-right-sidebar">
+        {/* Edge Properties Panel — shown when exactly one edge is selected */}
+        {!isReadOnly && selectedEdgeIds.length === 1 && (() => {
+          const edgeId = selectedEdgeIds[0];
+          const rfEdge = edges.find((e) => e.id === edgeId);
+          const sourceNode = nodes.find((n) => n.id === rfEdge?.source);
+          const targetNode = nodes.find((n) => n.id === rfEdge?.target);
+          const sourceRole = rolesQ.data?.roles.find((r) => r.key === (sourceNode?.data?.roleKey as string));
+          const targetRole = rolesQ.data?.roles.find((r) => r.key === (targetNode?.data?.roleKey as string));
+
+          const condType = edgeCondition?.type ?? "always";
+          const showOperator = condType !== "always";
+          const showValue = condType === "verdict" || condType === "criteria";
+
+          return (
+            <div className="network-sidebar-section">
+              <h3>Edge Properties</h3>
+
+              {/* Source / Target info */}
+              <div className="row muted" style={{ fontSize: 12, marginBottom: 8, gap: 4 }}>
+                <span>{sourceRole?.title ?? (sourceNode?.data as any)?.roleKey as string ?? rfEdge?.source ?? "?"}</span>
+                <span>→</span>
+                <span>{targetRole?.title ?? (targetNode?.data as any)?.roleKey as string ?? rfEdge?.target ?? "?"}</span>
+              </div>
+
+              {/* Label */}
+              <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                Label
+                <input
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={edgeLabel}
+                  onChange={(e) => updateEdgeLabel(edgeId, e.target.value)}
+                  placeholder="Optional edge label"
+                />
+              </label>
+
+              {/* Condition Type */}
+              <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                Condition
+                <select
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={condType}
+                  onChange={(e) => {
+                    const newType = e.target.value as NonNullable<NetworkEdge["condition"]>["type"];
+                    if (newType === "always") {
+                      updateEdgeCondition(edgeId, { type: "always" });
+                    } else if (newType === "coverage") {
+                      updateEdgeCondition(edgeId, { type: "coverage", operator: "any_unmet" });
+                    } else if (newType === "verdict") {
+                      updateEdgeCondition(edgeId, { type: "verdict", operator: "eq", value: "pass" });
+                    } else {
+                      updateEdgeCondition(edgeId, { type: newType, operator: "any_unmet", value: "" });
+                    }
+                  }}
+                >
+                  <option value="always">Always (unconditional)</option>
+                  <option value="verdict">Verdict — pass / blocker / etc.</option>
+                  <option value="coverage">Coverage — unmet / missing</option>
+                  <option value="criteria">Criteria — unmet / missing</option>
+                </select>
+              </label>
+
+              {/* Operator (for non-"always" types) */}
+              {showOperator && (
+                <label className="muted" style={{ display: "block", marginBottom: 4 }}>
+                  Operator
+                  <select
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={edgeCondition?.operator ?? "any_unmet"}
+                    onChange={(e) =>
+                      updateEdgeCondition(edgeId, {
+                        ...edgeCondition!,
+                        operator: e.target.value as NonNullable<NetworkEdge["condition"]>["operator"],
+                      })
+                    }
+                  >
+                    {condType === "verdict" ? (
+                      <>
+                        <option value="eq">Equals (==)</option>
+                        <option value="neq">Not Equals (!=)</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="any_unmet">Any Unmet</option>
+                        <option value="any_missing">Any Missing</option>
+                      </>
+                    )}
+                  </select>
+                </label>
+              )}
+
+              {/* Value (for verdict / criteria) */}
+              {showValue && (
+                <label className="muted" style={{ display: "block", marginBottom: 8 }}>
+                  {condType === "verdict" ? "Verdict" : "Key"}
+                  <input
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={edgeCondition?.value ?? ""}
+                    onChange={(e) =>
+                      updateEdgeCondition(edgeId, {
+                        ...edgeCondition!,
+                        value: e.target.value,
+                      })
+                    }
+                    placeholder={condType === "verdict" ? "pass" : "criteria key"}
+                  />
+                </label>
+              )}
+            </div>
+          );
+        })()}
+
         <h3>Roles</h3>
         <div className="network-role-list">
           {rolesQ.data?.roles
@@ -588,6 +976,34 @@ export function NetworkEditor() {
             ))}
         </div>
       </aside>
+
+      {/* Project Select Modal */}
+      {projectModalMode && projectsQ.data && (
+        <ProjectSelectModal
+          projects={projectsQ.data.projects}
+          onSelect={
+            projectModalMode === "create"
+              ? handleProjectSelectForCreate
+              : handleProjectSelectForDuplicate
+          }
+          onCancel={() => setProjectModalMode(null)}
+        />
+      )}
+
+      {/* Role Edit Modal */}
+      {roleModalKey && (() => {
+        const role = rolesQ.data?.roles.find((r) => r.key === roleModalKey);
+        if (!role) return null;
+        return (
+          <RoleEditModal
+            role={role}
+            projectId={currentNetwork?.project_id ?? null}
+            onSave={(body) => roleSaveMutation.mutate(body)}
+            onCancel={() => setRoleModalKey(null)}
+            isSaving={roleSaveMutation.isPending}
+          />
+        );
+      })()}
     </div>
   );
 }
