@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, displayModelName } from "../api";
@@ -52,6 +52,10 @@ export function Models() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [showNewForm, setShowNewForm] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [pendingSwitchId, setPendingSwitchId] = useState<number | null>(null);
+  const [draggedId, setDraggedId] = useState<number | null>(null);
+  const [dragOverId, setDragOverId] = useState<number | null>(null);
 
   const configs = data?.configs ?? [];
   const isEmpty = configs.length === 0 && !showNewForm;
@@ -69,15 +73,83 @@ export function Models() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["model-configs"] }),
   });
 
+  const reorder = useMutation({
+    mutationFn: (ids: number[]) => api.reorderModelConfigs(ids),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["model-configs"] }),
+  });
+
+  // Discard unsaved changes and switch to the pending config
+  const handleDiscardAndSwitch = () => {
+    const targetId = pendingSwitchId;
+    setPendingSwitchId(null);
+    setDirty(false);
+    if (targetId !== null) {
+      setEditingId(targetId);
+      setSelectedId(targetId);
+      setShowNewForm(false);
+    }
+  };
+
   const handleCardClick = (id: number) => {
     if (editingId === id) {
+      // Toggle: close the current editor
       setEditingId(null);
       setSelectedId(null);
+      setDirty(false);
     } else {
+      // If editor is dirty, ask before switching
+      if (dirty) {
+        setPendingSwitchId(id);
+        return;
+      }
       setEditingId(id);
       setSelectedId(id);
       setShowNewForm(false);
+      setDirty(false);
     }
+  };
+
+  // ---- Drag-and-drop handlers ----
+  const handleDragStart = (e: React.DragEvent, id: number) => {
+    setDraggedId(id);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(id));
+  };
+
+  const handleDragOver = (e: React.DragEvent, id: number) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (id !== draggedId) {
+      setDragOverId(id);
+    }
+  };
+
+  const handleDragLeave = () => {
+    setDragOverId(null);
+  };
+
+  const handleDrop = (e: React.DragEvent, targetId: number) => {
+    e.preventDefault();
+    setDragOverId(null);
+    setDraggedId(null);
+
+    if (draggedId == null || draggedId === targetId) return;
+
+    const newConfigs = [...configs];
+    const dragIdx = newConfigs.findIndex((c) => c.id === draggedId);
+    const dropIdx = newConfigs.findIndex((c) => c.id === targetId);
+    if (dragIdx === -1 || dropIdx === -1) return;
+
+    // Move the dragged item to the target position
+    const [moved] = newConfigs.splice(dragIdx, 1);
+    newConfigs.splice(dropIdx, 0, moved);
+
+    reorder.mutate(newConfigs.map((c) => c.id));
+  };
+
+  const handleDragEnd = () => {
+    setDraggedId(null);
+    setDragOverId(null);
   };
 
   return (
@@ -105,8 +177,14 @@ export function Models() {
               return (
                 <div
                   key={cfg.id}
-                  className={`model-card${selectedId === cfg.id ? " selected" : ""}`}
+                  className={`model-card${selectedId === cfg.id ? " selected" : ""}${draggedId === cfg.id ? " dragging" : ""}${dragOverId === cfg.id ? " drag-over" : ""}`}
+                  draggable
                   onClick={() => handleCardClick(cfg.id)}
+                  onDragStart={(e) => handleDragStart(e, cfg.id)}
+                  onDragOver={(e) => handleDragOver(e, cfg.id)}
+                  onDragLeave={handleDragLeave}
+                  onDrop={(e) => handleDrop(e, cfg.id)}
+                  onDragEnd={handleDragEnd}
                 >
                   <div className="model-card-header">
                     <span className="model-card-name">
@@ -206,11 +284,14 @@ export function Models() {
 
           {(effectiveShowNew || editingId != null) && (
             <ModelEditor
+              key={editingId}
               configId={editingId}
               initialData={editingId ? (configs.find((c) => c.id === editingId) ?? null) : null}
+              onDirtyChange={setDirty}
               onDone={() => {
                 setEditingId(null);
                 setShowNewForm(false);
+                setDirty(false);
               }}
             />
           )}
@@ -221,6 +302,12 @@ export function Models() {
         configId={deletingId}
         configName={deletingId ? (configs.find((c) => c.id === deletingId)?.name ?? null) : null}
         onClose={() => setDeletingId(null)}
+      />
+
+      <DiscardChangesModal
+        configName={pendingSwitchId ? (configs.find((c) => c.id === pendingSwitchId)?.name ?? null) : null}
+        onStay={() => setPendingSwitchId(null)}
+        onDiscard={handleDiscardAndSwitch}
       />
     </div>
   );
@@ -234,10 +321,12 @@ function ModelEditor({
   configId,
   initialData,
   onDone,
+  onDirtyChange,
 }: {
   configId: number | null;
   initialData: ModelConfig | null;
   onDone: () => void;
+  onDirtyChange: (d: boolean) => void;
 }) {
   const qc = useQueryClient();
   const isNew = configId == null;
@@ -253,6 +342,11 @@ function ModelEditor({
   const [thinkingFormat, setThinkingFormat] = useState(initialData?.thinking_format ?? "qwen-chat-template");
   const extras = parseExtras(initialData?.extra_json ?? null);
   const compatRaw = parseExtras(initialData?.compat_json ?? null);
+  const budgetsRaw = parseExtras(initialData?.thinking_budgets ?? null);
+  const [thinkingBudgetMinimal, setThinkingBudgetMinimal] = useState(String(budgetsRaw.minimal ?? ""));
+  const [thinkingBudgetLow, setThinkingBudgetLow] = useState(String(budgetsRaw.low ?? ""));
+  const [thinkingBudgetMedium, setThinkingBudgetMedium] = useState(String(budgetsRaw.medium ?? ""));
+  const [thinkingBudgetHigh, setThinkingBudgetHigh] = useState(String(budgetsRaw.high ?? ""));
   const [textMode, setTextMode] = useState(initialData?.text_mode === 1);
   const [twoPhase, setTwoPhase] = useState(initialData?.two_phase === 1);
   const [temperature, setTemperature] = useState(String(extras.temperature ?? ""));
@@ -277,6 +371,81 @@ function ModelEditor({
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
+
+  // Report dirty state to parent
+  useEffect(() => {
+    if (isNew) {
+      onDirtyChange(
+        name.trim() !== "" ||
+        baseUrl.trim() !== "" ||
+        defaultModel.trim() !== "" ||
+        contextWindow !== "" ||
+        maxTokens !== "" ||
+        timeoutMs !== "" ||
+        reasoning !== false ||
+        thinkingLevel !== "medium" ||
+        thinkingFormat !== "qwen-chat-template" ||
+        textMode !== false ||
+        twoPhase !== false ||
+        temperature !== "" ||
+        topP !== "" ||
+        reasoningEffort !== "" ||
+        apiKeyTouched ||
+        supportsDeveloperRole !== undefined ||
+        supportsReasoningEffort !== undefined ||
+        maxTokensField !== "" ||
+        chatTemplateKwargs !== "",
+      );
+      return;
+    }
+
+    // Editing existing — compare to initial values
+    const extrasInit = parseExtras(initialData?.extra_json ?? null);
+    const compatInit = parseExtras(initialData?.compat_json ?? null);
+
+    const initName = initialData?.name ?? "";
+    const initBaseUrl = initialData?.base_url ?? "";
+    const initDefaultModel = initialData?.default_model ?? "";
+    const initContextWindow = String(initialData?.context_window ?? "");
+    const initMaxTokens = String(initialData?.max_tokens ?? "");
+    const initTimeoutMs = String(initialData?.request_timeout_ms ?? "");
+    const initReasoning = initialData?.reasoning === 1;
+    const initThinkingLevel = initialData?.thinking_level ?? "medium";
+    const initThinkingFormat = initialData?.thinking_format ?? "qwen-chat-template";
+    const initTextMode = initialData?.text_mode === 1;
+    const initTwoPhase = initialData?.two_phase === 1;
+    const initTemperature = String(extrasInit.temperature ?? "");
+    const initTopP = String(extrasInit.top_p ?? "");
+    const initReasoningEffort = String(extrasInit.reasoning_effort ?? "");
+    const initSupportsDevRole = compatInit.supportsDeveloperRole as boolean | undefined;
+    const initSupportsReasoning = compatInit.supportsReasoningEffort as boolean | undefined;
+    const initMaxTokensField = (compatInit.maxTokensField as string) ?? "";
+    const initChatKwargs = compatInit.chatTemplateKwargs
+      ? JSON.stringify(compatInit.chatTemplateKwargs, null, 2)
+      : "";
+
+    onDirtyChange(
+      name !== initName ||
+      baseUrl !== initBaseUrl ||
+      defaultModel !== initDefaultModel ||
+      contextWindow !== initContextWindow ||
+      maxTokens !== initMaxTokens ||
+      timeoutMs !== initTimeoutMs ||
+      reasoning !== initReasoning ||
+      thinkingLevel !== initThinkingLevel ||
+      thinkingFormat !== initThinkingFormat ||
+      textMode !== initTextMode ||
+      twoPhase !== initTwoPhase ||
+      temperature !== initTemperature ||
+      topP !== initTopP ||
+      reasoningEffort !== initReasoningEffort ||
+      apiKeyTouched ||
+      supportsDeveloperRole !== initSupportsDevRole ||
+      supportsReasoningEffort !== initSupportsReasoning ||
+      maxTokensField !== initMaxTokensField ||
+      chatTemplateKwargs !== initChatKwargs,
+    );
+  });
 
   const title = isNew ? "New Model Config" : `Edit: ${initialData?.name ?? "Unnamed"}`;
 
@@ -325,6 +494,14 @@ function ModelEditor({
       }
       const compatJson = Object.keys(compat).length > 0 ? JSON.stringify(compat) : undefined;
 
+      // Build thinking_budgets JSON string
+      const budgets: Record<string, number> = {};
+      if (thinkingBudgetMinimal) budgets.minimal = Number(thinkingBudgetMinimal);
+      if (thinkingBudgetLow) budgets.low = Number(thinkingBudgetLow);
+      if (thinkingBudgetMedium) budgets.medium = Number(thinkingBudgetMedium);
+      if (thinkingBudgetHigh) budgets.high = Number(thinkingBudgetHigh);
+      const thinkingBudgetsJson = Object.keys(budgets).length > 0 ? JSON.stringify(budgets) : undefined;
+
       const body: Record<string, unknown> = {
         name: name.trim(),
         base_url: baseUrl.trim() || undefined,
@@ -339,6 +516,7 @@ function ModelEditor({
         two_phase: twoPhase,
         ...(extraJson !== undefined ? { extra_json: extraJson } : {}),
         ...(compatJson !== undefined ? { compat_json: compatJson } : {}),
+        ...(thinkingBudgetsJson !== undefined ? { thinking_budgets: thinkingBudgetsJson } : {}),
         ...(apiKeyTouched ? { api_key: apiKey } : {}),
       };
       if (isNew) return api.createModelConfig(body as Parameters<typeof api.createModelConfig>[0]);
@@ -574,6 +752,34 @@ function ModelEditor({
             </span>
           </div>
 
+          <div style={{ marginTop: 16 }}>
+            <strong style={{ fontSize: 13, color: "var(--brass)" }}>Thinking Token Budgets</strong>
+            <p className="muted" style={{ fontSize: 11, margin: "4px 0 8px" }}>
+              Per-thinking-level caps for reasoning tokens. Providers that support token-based thinking
+              limits (e.g. hosted Anthropic/OpenAI) use these to constrain the chain-of-thought budget
+              separately from the max output tokens. Leave empty to use provider defaults.
+            </p>
+          </div>
+
+          <div className="field-grid" style={{ marginTop: 4 }}>
+            <div>
+              <label>Minimal</label>
+              <input value={thinkingBudgetMinimal} onChange={(e) => setThinkingBudgetMinimal(e.target.value)} placeholder="1024" />
+            </div>
+            <div>
+              <label>Low</label>
+              <input value={thinkingBudgetLow} onChange={(e) => setThinkingBudgetLow(e.target.value)} placeholder="4096" />
+            </div>
+            <div>
+              <label>Medium</label>
+              <input value={thinkingBudgetMedium} onChange={(e) => setThinkingBudgetMedium(e.target.value)} placeholder="8192" />
+            </div>
+            <div>
+              <label>High</label>
+              <input value={thinkingBudgetHigh} onChange={(e) => setThinkingBudgetHigh(e.target.value)} placeholder="16384" />
+            </div>
+          </div>
+
           <div className="field-grid" style={{ marginTop: 10 }}>
             <div>
               <label>Temperature (0–2)</label>
@@ -628,6 +834,39 @@ function ModelEditor({
         <button onClick={onDone}>Cancel</button>
         {save.isError && <span className="pill bad">{(save.error as Error).message}</span>}
         {save.isSuccess && <span className="pill ok">saved</span>}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Discard changes confirmation modal
+// ---------------------------------------------------------------------------
+
+function DiscardChangesModal({
+  configName,
+  onStay,
+  onDiscard,
+}: {
+  configName: string | null;
+  onStay: () => void;
+  onDiscard: () => void;
+}) {
+  if (configName == null) return null;
+
+  return (
+    <div className="modal-overlay" onClick={onStay}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>Unsaved Changes</h3>
+        <p className="muted">
+          You have unsaved changes. Discard them and switch to <strong>{configName ?? "Unnamed"}</strong>?
+        </p>
+        <div className="modal-actions">
+          <button onClick={onStay}>Stay</button>
+          <button className="warn" onClick={onDiscard}>
+            Discard & Switch
+          </button>
+        </div>
       </div>
     </div>
   );

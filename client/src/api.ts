@@ -105,6 +105,7 @@ export interface ModelConfig {
   two_phase: number | null;
   extra_json: string | null;
   compat_json: string | null;
+  thinking_budgets: string | null;
   has_api_key: boolean;
   has_env_token: boolean;
   location: string | null;
@@ -479,6 +480,8 @@ export const api = {
     req<{ ok: boolean }>(`/api/model-configs/${id}`, { method: "DELETE" }),
   duplicateModelConfig: (id: number, name?: string) =>
     req<{ config: ModelConfig }>(`/api/model-configs/${id}/duplicate`, { method: "POST", body: JSON.stringify({ name }) }),
+  reorderModelConfigs: (ids: number[]) =>
+    req<{ ok: boolean }>("/api/model-configs/reorder", { method: "POST", body: JSON.stringify({ ids }) }),
   setDefaultModelConfig: (id: number) =>
     req<{ config: ModelConfig }>(`/api/model-configs/${id}/set-default`, { method: "POST" }),
 

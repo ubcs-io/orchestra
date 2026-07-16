@@ -220,6 +220,12 @@ export function initDb(): void {
   // JSON blob for pi Model compat options (supportsDeveloperRole, supportsReasoningEffort,
   // maxTokensField, chatTemplateKwargs, etc.).
   addColumnIfMissing(d, "configs", "compat_json", "compat_json TEXT");
+  // Per-thinking-level reasoning token budgets (JSON: {"minimal": 1024, "low": 4096, …}).
+  // Passed to pi's SettingsManager so providers that support token-based thinking caps
+  // can constrain reasoning tokens separately from the max_tokens output budget.
+  addColumnIfMissing(d, "configs", "thinking_budgets", "thinking_budgets TEXT");
+  // Display ordering for model config cards (user-controlled drag-and-drop).
+  addColumnIfMissing(d, "configs", "ordering", "ordering INTEGER DEFAULT 0");
 
   // Agent network linking: custom flow template per task.
   addColumnIfMissing(d, "tasks", "network_id", "network_id TEXT");
@@ -325,6 +331,8 @@ export interface ConfigRow {
   two_phase: number | null;
   extra_json: string | null;
   compat_json: string | null;
+  thinking_budgets: string | null;
+  ordering: number;
   created_at: string;
   updated_at: string;
 }
@@ -602,6 +610,7 @@ export function upsertConfig(input: {
   two_phase?: number | null;
   extra_json?: string | null;
   compat_json?: string | null;
+  thinking_budgets?: string | null;
 }): ConfigRow {
   const d = getDb();
   const ts = now();
@@ -633,6 +642,7 @@ export function upsertConfig(input: {
       two_phase: keep(input.two_phase, base.two_phase),
       extra_json: keep(input.extra_json, base.extra_json),
       compat_json: keep(input.compat_json, base.compat_json),
+      thinking_budgets: keep(input.thinking_budgets, base.thinking_budgets),
     };
 
   if (existing) {
@@ -640,7 +650,7 @@ export function upsertConfig(input: {
       `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
-        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, compat_json=@compat_json, updated_at=@ts WHERE id=@id`,
+        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
   }
@@ -648,9 +658,9 @@ export function upsertConfig(input: {
   const info = d
     .prepare(
       `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
-         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, two_phase, extra_json, compat_json, created_at, updated_at)
+         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, two_phase, extra_json, compat_json, thinking_budgets, created_at, updated_at)
        VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
-         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @compat_json, @ts, @ts)`,
+         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @compat_json, @thinking_budgets, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
   return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
@@ -1125,10 +1135,10 @@ export function deleteNetwork(identifier: number | string): void {
   // Model Configs (named connection profiles beyond the global default)
   // ---------------------------------------------------------------------------
 
-  /** Return all model configs including the global default row. Default sorts first. */
+  /** Return all model configs including the global default row. Sorted by user ordering. */
   export function listModelConfigs(): ConfigRow[] {
     return getDb()
-      .prepare(`SELECT * FROM configs ORDER BY CASE WHEN key = 'default' THEN 0 ELSE 1 END, name ASC, id ASC`)
+      .prepare(`SELECT * FROM configs ORDER BY ordering ASC, id ASC`)
       .all() as ConfigRow[];
   }
 
@@ -1153,20 +1163,28 @@ export function deleteNetwork(identifier: number | string): void {
     two_phase?: boolean;
     extra_json?: string | null;
     compat_json?: string | null;
+    thinking_budgets?: string | null;
   }): ConfigRow {
     const d = getDb();
     const existing = d.prepare(`SELECT id FROM configs WHERE name = ?`).get(input.name) as { id: number } | undefined;
     if (existing) throw new Error(`A model config named "${input.name}" already exists.`);
     const ts = now();
     const key = `model_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Place new config at the end: ordering = max(existing) + 1
+    const maxOrd = d.prepare(
+      `SELECT COALESCE(MAX(ordering), -1) AS m FROM configs WHERE project_id IS NULL`,
+    ).get() as { m: number };
+    const ordering = maxOrd.m + 1;
+
     const info = d
       .prepare(
         `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
            context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format,
-           text_mode, two_phase, extra_json, compat_json, created_at, updated_at)
+           text_mode, two_phase, extra_json, compat_json, thinking_budgets, ordering, created_at, updated_at)
          VALUES (NULL, @key, @name, @base_url, @api_key, @api, @default_model,
            @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format,
-           @text_mode, @two_phase, @extra_json, @compat_json, @ts, @ts)`,
+           @text_mode, @two_phase, @extra_json, @compat_json, @thinking_budgets, @ordering, @ts, @ts)`,
       )
       .run({
         key,
@@ -1185,6 +1203,8 @@ export function deleteNetwork(identifier: number | string): void {
         two_phase: input.two_phase ? 1 : 0,
         extra_json: input.extra_json ?? null,
         compat_json: input.compat_json ?? null,
+        thinking_budgets: input.thinking_budgets ?? null,
+        ordering,
         ts,
       });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
@@ -1207,6 +1227,7 @@ export function deleteNetwork(identifier: number | string): void {
     two_phase?: number | null;
     extra_json?: string | null;
     compat_json?: string | null;
+    thinking_budgets?: string | null;
   }): ConfigRow {
     const d = getDb();
     const existing = getConfigById(id);
@@ -1237,6 +1258,7 @@ export function deleteNetwork(identifier: number | string): void {
       two_phase: keep(input.two_phase, existing.two_phase),
       extra_json: keep(input.extra_json, existing.extra_json),
       compat_json: keep(input.compat_json, existing.compat_json),
+      thinking_budgets: keep(input.thinking_budgets, existing.thinking_budgets),
     };
 
     const ts = now();
@@ -1245,7 +1267,7 @@ export function deleteNetwork(identifier: number | string): void {
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
         thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase,
-        extra_json=@extra_json, compat_json=@compat_json, updated_at=@ts WHERE id=@id`,
+        extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
   }
@@ -1280,6 +1302,7 @@ export function deleteNetwork(identifier: number | string): void {
       two_phase: existing.two_phase === 1,
       extra_json: existing.extra_json,
       compat_json: existing.compat_json,
+      thinking_budgets: existing.thinking_budgets,
     });
   }
 
@@ -1310,6 +1333,22 @@ export function deleteNetwork(identifier: number | string): void {
     const ts = now();
     d.prepare(`UPDATE configs SET key = 'default', updated_at = ? WHERE id = ?`).run(ts, id);
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
+  }
+
+  /**
+   * Reorder model configs. Accepts an array of config IDs in the desired order.
+   * Assigns ordering = index for each ID in a single transaction.
+   * IDs not in the list are left untouched.
+   */
+  export function reorderModelConfigs(ids: number[]): void {
+    const d = getDb();
+    const stmt = d.prepare(`UPDATE configs SET ordering = ? WHERE id = ?`);
+    const tx = d.transaction((idList: number[]) => {
+      for (let i = 0; i < idList.length; i++) {
+        stmt.run(i, idList[i]);
+      }
+    });
+    tx(ids);
   }
 
   /** Duplicate a network (creates a new user-editable copy). */

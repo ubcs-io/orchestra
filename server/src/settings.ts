@@ -18,6 +18,14 @@
 import { getConfig } from "./config.js";
 import { getGlobalConfig, getProjectConfig, upsertConfig, type ConfigRow } from "./db.js";
 
+/** Per-thinking-level reasoning token budgets (mirrors pi's ThinkingBudgets). */
+export interface ThinkingBudgets {
+  minimal?: number;
+  low?: number;
+  medium?: number;
+  high?: number;
+}
+
 /**
  * Check whether the ORCHESTRA_TOKENS env var overrides a model config's API key.
  * Returns the env token string if found, or undefined.
@@ -81,6 +89,10 @@ export interface ModelCompat {
   maxTokensField?: "max_completion_tokens" | "max_tokens";
   /** Custom kwargs for `chat-template` thinking format, e.g. `{ "thinking": { "$var": "thinking.enabled" } }`. */
   chatTemplateKwargs?: Record<string, unknown>;
+  /** Per-thinking-level reasoning token budgets: {"minimal": 1024, "low": 4096, …}.
+   *  Passed to pi's SettingsManager so providers that support token-based thinking
+   *  caps can constrain reasoning tokens separately from the max_tokens budget. */
+  thinkingBudgets?: ThinkingBudgets;
 }
 
 /** Fully resolved connection settings for a single model call. */
@@ -110,6 +122,8 @@ export interface Connection {
   twoPhase: boolean;
   /** pi Model compat overrides for this endpoint (merged from config row's compat_json). */
   compat: ModelCompat;
+  /** Per-thinking-level reasoning token budgets (merged from config row's thinking_budgets). */
+  thinkingBudgets?: ThinkingBudgets;
 }
 
 /**
@@ -160,6 +174,23 @@ function parseCompat(raw: string | null | undefined): ModelCompat {
   }
 }
 
+/** Parse a `thinking_budgets` JSON string into a ThinkingBudgets object. */
+function parseThinkingBudgets(raw: string | null | undefined): ThinkingBudgets | undefined {
+  if (!raw) return undefined;
+  try {
+    const obj = JSON.parse(raw);
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return undefined;
+    const budgets: ThinkingBudgets = {};
+    if (typeof obj.minimal === "number") budgets.minimal = obj.minimal;
+    if (typeof obj.low === "number") budgets.low = obj.low;
+    if (typeof obj.medium === "number") budgets.medium = obj.medium;
+    if (typeof obj.high === "number") budgets.high = obj.high;
+    return Object.keys(budgets).length > 0 ? budgets : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Resolve the effective connection for a project (or global when omitted).
  * Merges global ← project row, then overlays ORCHESTRA_* env for base URL/key.
@@ -194,5 +225,9 @@ export function resolveConnection(projectId?: number | null): Connection {
     textMode: pick(boolFromDb(project?.text_mode), boolFromDb(global?.text_mode)) ?? false,
     twoPhase: pick(boolFromDb(project?.two_phase), boolFromDb(global?.two_phase)) ?? false,
     compat,
+    thinkingBudgets: pick(
+      parseThinkingBudgets(project?.thinking_budgets),
+      parseThinkingBudgets(global?.thinking_budgets),
+    ),
   };
 }

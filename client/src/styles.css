@@ -81,11 +81,242 @@ header.topbar .spacer { flex: 1; }
 
 /* Task detail */
 .detail-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; align-items: start; }
-.live { background: #0d1014; border: 1px solid var(--line); border-radius: 6px; height: 300px; overflow: auto; padding: 10px; font-size: 12px; white-space: pre-wrap; position: relative; }
+.detail-grid > * { min-width: 0; overflow: hidden; }
+.live { background: #0d1014; border: 1px solid var(--line); border-radius: 6px; height: 300px; overflow: auto; padding: 10px; font-size: 12px; position: relative; overflow-wrap: anywhere; word-break: break-word; }
 .live .live-jump { position: sticky; bottom: 0; left: 0; right: 0; display: block; margin: 6px -10px -10px; padding: 6px; text-align: center; background: rgba(90, 163, 201, 0.15); border: none; border-top: 1px solid var(--accent); border-radius: 0 0 6px 6px; color: var(--accent); font-size: 12px; cursor: pointer; width: calc(100% + 20px); }
 .live .live-jump:hover { background: rgba(90, 163, 201, 0.25); }
 .live .tool { color: var(--accent); }
 .live .role { color: var(--brass); font-weight: bold; }
+
+/* ---- Live activity structured output (LineItem rendering) ---- */
+
+.live .live-role-start {
+  padding: 4px 0 2px;
+  margin-top: 6px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.live .live-role-icon {
+  color: var(--brass);
+  font-weight: bold;
+}
+.live .live-role-key {
+  color: var(--brass);
+  font-weight: bold;
+  font-size: 13px;
+}
+.live .live-role-depth {
+  color: var(--ink-dim);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.live .live-role-end {
+  padding: 4px 0 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.live .live-role-end-marker {
+  color: var(--accent);
+  font-weight: bold;
+}
+.live .live-role-arrow {
+  color: var(--ink-dim);
+  margin: 0 2px;
+}
+.live .live-role-flags {
+  color: var(--warn);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.live .live-text {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 1px 0 1px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.live .live-thinking {
+  color: var(--ink-dim);
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.5;
+  padding: 1px 0 1px 4px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  border-left: 2px solid var(--human);
+  margin: 2px 0;
+}
+.live .live-thinking-prefix {
+  color: var(--human);
+  font-style: normal;
+  margin-right: 4px;
+}
+
+.live .live-tool-start {
+  padding: 2px 0 2px 8px;
+  font-size: 12px;
+}
+.live .live-tool-end {
+  padding: 2px 0 2px 8px;
+  font-size: 12px;
+}
+.live .live-tool-icon {
+  color: var(--accent);
+  font-weight: bold;
+  margin-right: 4px;
+}
+.live .live-tool-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+.live .live-tool-repeat {
+  color: var(--ink-dim);
+  font-size: 11px;
+  margin-left: 4px;
+}
+.live .live-tool-result.ok {
+  color: var(--ok);
+  margin-left: 4px;
+  font-weight: bold;
+}
+.live .live-tool-result.error {
+  color: var(--bad);
+  margin-left: 4px;
+  font-weight: bold;
+}
+
+/* JSON block inside tool calls */
+.live .live-json {
+  margin: 4px 0 2px 12px;
+  padding: 6px 8px;
+  background: rgba(15, 18, 22, 0.6);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.live .live-status {
+  color: var(--ink-dim);
+  font-size: 11px;
+  padding: 2px 0 2px 8px;
+  font-style: italic;
+}
+
+/* ---- Markdown syntax coloring (live stream) ---- */
+
+.md-h1, .md-h2, .md-h3, .md-h4 {
+  color: var(--brass);
+  font-weight: bold;
+}
+.md-h1 { font-size: 14px; }
+.md-h2 { font-size: 13px; }
+.md-h3 { font-size: 12px; color: var(--accent); }
+.md-h4 { font-size: 12px; color: var(--ink-dim); }
+
+.md-bold {
+  color: var(--brass);
+  font-weight: bold;
+}
+.md-bold-marker {
+  color: var(--ink-dim);
+}
+.md-italic {
+  color: var(--accent);
+  font-style: italic;
+}
+.md-italic-marker {
+  color: var(--ink-dim);
+}
+
+.md-code {
+  background: rgba(15, 18, 22, 0.6);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 3px;
+  color: var(--human);
+  font-size: 11px;
+}
+
+.md-fence-open {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+.md-fence-body {
+  display: block;
+  padding: 4px 8px;
+  margin: 2px 0;
+  background: rgba(15, 18, 22, 0.4);
+  border-left: 2px solid var(--line);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  color: var(--ink);
+}
+.md-fence-close {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+
+.md-blockquote {
+  color: var(--ink-dim);
+  border-left: 2px solid var(--brass-dim);
+  padding-left: 8px;
+  font-style: italic;
+}
+
+.md-list-marker {
+  color: var(--brass-dim);
+}
+
+.md-link-bracket {
+  color: var(--ink-dim);
+}
+.md-link-text {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.md-link-url {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+
+.md-hr {
+  color: var(--ink-dim);
+}
+
+/* ---- JSON syntax coloring ---- */
+
+.json-string {
+  color: var(--ok);
+}
+.json-number {
+  color: var(--accent);
+}
+.json-keyword {
+  color: var(--human);
+}
+.json-punct {
+  color: var(--ink-dim);
+}
 .coverage { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 12px; }
 .coverage .never { color: var(--bad); }
 .coverage .considered { color: var(--ok); }
@@ -983,12 +1214,20 @@ a.clickable-role:hover {
   color: var(--brass);
 }
 
-/* ---- Role editor panel (wider + taller) ---- */
+/* ---- Role editor panel (two-column on wide screens) ---- */
 .role-editor {
-  max-width: 630px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  align-items: start;
 }
 .role-editor textarea {
   min-height: 250px;
+}
+@media (max-width: 800px) {
+  .role-editor {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ---- Model card grid ---- */
@@ -1116,4 +1355,14 @@ a.clickable-role:hover {
 }
 .model-card-field .muted {
   font-size: 11px;
+}
+
+/* Drag-and-drop visual feedback for model cards */
+.model-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+.model-card.drag-over {
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.08);
 }

@@ -74,7 +74,7 @@ const DEFAULTS: Config = {
   apiKey: "",
   defaultModelId: "deepseek-r1:latest",
   contextWindow: 128_000,
-  maxTokens: 16_384,
+  maxTokens: 32_768,
   requestTimeoutMs: 300_000,
   reasoning: true,
   thinkingLevel: "medium",

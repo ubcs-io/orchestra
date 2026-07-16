@@ -161,8 +161,26 @@ export interface ActivityState {
   tpsHistory: number[];
 }
 
+/** Structured line item for the live activity console — replaces raw strings. */
+export interface LineItem {
+  kind: "role_start" | "role_end" | "text" | "thinking" | "tool_start" | "tool_end" | "status" | "separator";
+  content: string;
+  meta?: {
+    role?: string;
+    depth?: number;
+    verdict?: string;
+    flags?: string;
+    tool?: string;
+    isError?: boolean;
+    /** Raw tool arguments for pretty-printing as JSON. */
+    jsonArgs?: unknown;
+    repeatCount?: number;
+    aborted?: boolean;
+  };
+}
+
 function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }) {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<LineItem[]>([]);
   const [activity, setActivity] = useState<ActivityState>({
     currentRole: null,
     disposition: null,
@@ -178,8 +196,6 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
   useEffect(() => {
     setLines([]);
     setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: [] });
-    // Mid-run recovery: if we connected after role_start was published but data is
-    // already streaming, recover the active role from the plan.
     const role = nextRoleRef.current;
     if (role) {
       setActivity((a) => a.currentRole ? a : { ...a, currentRole: role, disposition: "reading", roleStartTime: Date.now() });
@@ -189,7 +205,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     lastToolRef.current = "";
     repeatRef.current = 0;
     const es = new EventSource(`/api/tasks/${taskId}/stream`);
-    const push = (s: string) => setLines((prev) => [...prev.slice(-400), s]);
+    const push = (item: LineItem) => setLines((prev) => [...prev.slice(-400), item]);
 
     const flushRepeat = () => {
       lastToolRef.current = "";
@@ -198,7 +214,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
 
     es.addEventListener("role_start", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
-      push(`\n▶ ROLE ${d.role} (depth ${d.depth})`);
+      push({ kind: "role_start", content: `▶ ROLE ${d.role}`, meta: { role: d.role, depth: d.depth } });
       bufRef.current = "";
       thinkRef.current = "";
       flushRepeat();
@@ -207,11 +223,12 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     es.addEventListener("text", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       bufRef.current += d.delta ?? "";
-      thinkRef.current = ""; // answer resumed → start a fresh reasoning line next time
+      thinkRef.current = "";
       flushRepeat();
       setLines((prev) => {
-        const rest = prev[prev.length - 1]?.startsWith("  ") ? prev.slice(0, -1) : prev;
-        return [...rest, "  " + bufRef.current.slice(-1200)];
+        const last = prev[prev.length - 1];
+        const rest = last?.kind === "text" ? prev.slice(0, -1) : prev;
+        return [...rest, { kind: "text", content: bufRef.current.slice(-1200) }];
       });
       setActivity((a) => a.disposition !== "responding" ? { ...a, disposition: "responding" } : a);
     });
@@ -221,8 +238,9 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       bufRef.current = "";
       flushRepeat();
       setLines((prev) => {
-        const rest = prev[prev.length - 1]?.startsWith("💭") ? prev.slice(0, -1) : prev;
-        return [...rest, "💭 " + thinkRef.current.slice(-1200)];
+        const last = prev[prev.length - 1];
+        const rest = last?.kind === "thinking" ? prev.slice(0, -1) : prev;
+        return [...rest, { kind: "thinking", content: thinkRef.current.slice(-1200) }];
       });
       setActivity((a) => a.disposition !== "thinking" ? { ...a, disposition: "thinking" } : a);
     });
@@ -231,16 +249,14 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       if (d.tool === lastToolRef.current) {
         repeatRef.current += 1;
         if (repeatRef.current === 2) {
-          // first repeat: collapse the previous 2-line pair into one
-          setLines((prev) => [...prev.slice(0, -2).slice(-400), `  ⚙ ${d.tool} 2x`]);
+          setLines((prev) => [...prev.slice(0, -2).slice(-400), { kind: "tool_start", content: d.tool, meta: { tool: d.tool, repeatCount: 2, jsonArgs: d.args } }]);
         } else {
-          // subsequent repeat: replace the collapsed line with updated count
-          setLines((prev) => [...prev.slice(0, -1).slice(-400), `  ⚙ ${d.tool} ${repeatRef.current}x`]);
+          setLines((prev) => [...prev.slice(0, -1).slice(-400), { kind: "tool_start", content: d.tool, meta: { tool: d.tool, repeatCount: repeatRef.current, jsonArgs: d.args } }]);
         }
       } else {
         lastToolRef.current = d.tool;
         repeatRef.current = 1;
-        push(`  ⚙ ${d.tool}(${JSON.stringify(d.args).slice(0, 80)})`);
+        push({ kind: "tool_start", content: d.tool, meta: { tool: d.tool, jsonArgs: d.args } });
       }
       bufRef.current = "";
       thinkRef.current = "";
@@ -249,9 +265,9 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     es.addEventListener("tool_end", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       if (repeatRef.current > 1) {
-        setLines((prev) => [...prev.slice(0, -1).slice(-400), `  ⚙ ${d.tool} ${repeatRef.current}x ${d.isError ? "✗" : "✓"}`]);
+        setLines((prev) => [...prev.slice(0, -1).slice(-400), { kind: "tool_end", content: d.tool, meta: { tool: d.tool, repeatCount: repeatRef.current, isError: d.isError } }]);
       } else {
-        push(`  ⚙ ${d.tool} ${d.isError ? "✗" : "✓"}`);
+        push({ kind: "tool_end", content: d.tool, meta: { tool: d.tool, isError: d.isError } });
       }
     });
     es.addEventListener("role_end", (e) => {
@@ -260,7 +276,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
         d.fallback ? "no verdict" : "",
         d.stopReason === "length" ? "TRUNCATED" : "",
       ].filter(Boolean).join(", ");
-      push(`■ ${d.role} → ${d.verdict ?? (d.error ? "error" : "done")}${flags ? ` [${flags}]` : ""}`);
+      push({ kind: "role_end", content: `${d.verdict ?? (d.error ? "error" : "done")}`, meta: { role: d.role, verdict: d.verdict ?? "done", flags: flags || undefined, aborted: d.error ?? false } });
       onActivity();
       flushRepeat();
       setActivity((a) => {
@@ -288,6 +304,288 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId]);
   return { lines, activity };
+}
+
+// ---- Markdown syntax colorizer (colors syntax without rendering) ----
+
+interface MdSpan {
+  text: string;
+  cls?: string;
+}
+
+function tokenizeMarkdown(text: string): MdSpan[] {
+  const spans: MdSpan[] = [];
+  let i = 0;
+
+  while (i < text.length) {
+    // Fenced code blocks (``` ... ```) — must be checked before inline code
+    if (text.startsWith("```", i)) {
+      const fenceStart = i;
+      const end = text.indexOf("\n```", i + 3);
+      if (end >= 0) {
+        const fenceEnd = end + 4;
+        const fenceLine = text.slice(fenceStart, text.indexOf("\n", fenceStart) >= 0 ? text.indexOf("\n", fenceStart) : fenceStart + 3);
+        spans.push({ text: "\n", cls: "" });
+        spans.push({ text: fenceLine, cls: "md-fence-open" });
+        spans.push({ text: text.slice(fenceStart + fenceLine.length, fenceEnd - 3), cls: "md-fence-body" });
+        spans.push({ text: "```", cls: "md-fence-close" });
+        spans.push({ text: "\n", cls: "" });
+        i = fenceEnd;
+        continue;
+      }
+      // Unterminated — treat as inline code
+      spans.push({ text: "```", cls: "md-code" });
+      i += 3;
+      continue;
+    }
+
+    // Inline code (`code`)
+    if (text[i] === "`") {
+      const endTick = text.indexOf("`", i + 1);
+      if (endTick >= 0) {
+        spans.push({ text: text.slice(i, endTick + 1), cls: "md-code" });
+        i = endTick + 1;
+        continue;
+      }
+    }
+
+    // Bold (**text**)
+    if (text.startsWith("**", i)) {
+      const endBold = text.indexOf("**", i + 2);
+      if (endBold >= 0) {
+        spans.push({ text: "**", cls: "md-bold-marker" });
+        spans.push({ text: text.slice(i + 2, endBold), cls: "md-bold" });
+        spans.push({ text: "**", cls: "md-bold-marker" });
+        i = endBold + 2;
+        continue;
+      }
+    }
+
+    // Italic (*text*)
+    if (text[i] === "*" && text[i + 1] !== "*") {
+      const endItalic = text.indexOf("*", i + 1);
+      if (endItalic >= 0) {
+        spans.push({ text: "*", cls: "md-italic-marker" });
+        spans.push({ text: text.slice(i + 1, endItalic), cls: "md-italic" });
+        spans.push({ text: "*", cls: "md-italic-marker" });
+        i = endItalic + 1;
+        continue;
+      }
+    }
+
+    // Links [text](url)
+    if (text[i] === "[" && text.indexOf("](", i + 1) >= 0) {
+      const linkTextEnd = text.indexOf("](", i);
+      const linkUrlEnd = text.indexOf(")", linkTextEnd + 2);
+      if (linkUrlEnd >= 0) {
+        spans.push({ text: "[", cls: "md-link-bracket" });
+        spans.push({ text: text.slice(i + 1, linkTextEnd), cls: "md-link-text" });
+        spans.push({ text: "](", cls: "md-link-bracket" });
+        spans.push({ text: text.slice(linkTextEnd + 2, linkUrlEnd), cls: "md-link-url" });
+        spans.push({ text: ")", cls: "md-link-bracket" });
+        i = linkUrlEnd + 1;
+        continue;
+      }
+    }
+
+    // Heading lines (## Heading at start of line, or after newline in middle of text)
+    if ((i === 0 || text[i - 1] === "\n") && text[i] === "#") {
+      let hashEnd = i;
+      while (hashEnd < text.length && text[hashEnd] === "#") hashEnd++;
+      const hashCount = hashEnd - i;
+      if (hashCount >= 1 && hashCount <= 4 && text[hashEnd] === " ") {
+        const newlineEnd = text.indexOf("\n", hashEnd);
+        const headingEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+        const headingText = text.slice(i, headingEnd);
+        spans.push({ text: headingText, cls: `md-h${hashCount}` });
+        i = headingEnd;
+        continue;
+      }
+    }
+
+    // Blockquote lines (> ...)
+    if ((i === 0 || text[i - 1] === "\n") && text[i] === ">") {
+      const newlineEnd = text.indexOf("\n", i);
+      const lineEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+      spans.push({ text: text.slice(i, lineEnd), cls: "md-blockquote" });
+      i = lineEnd;
+      continue;
+    }
+
+    // Unordered list items (-  or *  at start of line)
+    if ((i === 0 || text[i - 1] === "\n") && (text[i] === "-" || text[i] === "*") && text[i + 1] === " ") {
+      const newlineEnd = text.indexOf("\n", i);
+      const lineEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+      spans.push({ text: text.slice(i, i + 2), cls: "md-list-marker" });
+      spans.push({ text: text.slice(i + 2, lineEnd), cls: "" });
+      i = lineEnd;
+      continue;
+    }
+
+    // Horizontal rule (---)
+    if ((i === 0 || text[i - 1] === "\n") && text.startsWith("---", i) && (i + 3 >= text.length || text[i + 3] === "\n")) {
+      spans.push({ text: "---", cls: "md-hr" });
+      i += 3;
+      continue;
+    }
+
+    // Plain text — consume until the next special character or end
+    const nextSpecial = findNextSpecial(text, i);
+    if (nextSpecial > i) {
+      spans.push({ text: text.slice(i, nextSpecial), cls: "" });
+      i = nextSpecial;
+    } else {
+      spans.push({ text: text.slice(i), cls: "" });
+      break;
+    }
+  }
+
+  return spans;
+}
+
+function findNextSpecial(text: string, start: number): number {
+  for (let j = start; j < text.length; j++) {
+    if (text[j] === "`" || text[j] === "[" || text[j] === "*" ||
+        (j === start || text[j - 1] === "\n" ? text[j] === "#" || text[j] === ">" || text[j] === "-" : false)) {
+      return j;
+    }
+  }
+  return text.length;
+}
+
+/** Apply JSON syntax coloring return React elements. */
+function jsonSpans(value: unknown): React.ReactNode {
+  const json = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const spans: MdSpan[] = [];
+  let i = 0;
+
+  while (i < json.length) {
+    // String values
+    if (json[i] === '"') {
+      const end = json.indexOf('"', i + 1);
+      // Handle escaped quotes
+      let escEnd = end;
+      while (escEnd > 0 && json[escEnd - 1] === "\\") {
+        escEnd = json.indexOf('"', escEnd + 1);
+      }
+      const actualEnd = escEnd >= 0 ? escEnd + 1 : json.length;
+      spans.push({ text: json.slice(i, actualEnd), cls: "json-string" });
+      i = actualEnd;
+      continue;
+    }
+    // Numbers
+    if (/^-?\d/.test(json[i]) && (i === 0 || /[\s:,\[\n]/.test(json[i - 1]))) {
+      let numEnd = i + 1;
+      while (numEnd < json.length && /[\d.eE+\-]/.test(json[numEnd])) numEnd++;
+      spans.push({ text: json.slice(i, numEnd), cls: "json-number" });
+      i = numEnd;
+      continue;
+    }
+    // Boolean / null
+    if (json.slice(i).match(/^(true|false|null)/)) {
+      const word = json.slice(i).match(/^(true|false|null)/)![0];
+      spans.push({ text: word, cls: "json-keyword" });
+      i += word.length;
+      continue;
+    }
+    // Keys (anything between quotes before a colon)
+    // Plain chars
+    let plainEnd = i + 1;
+    while (plainEnd < json.length && !'"-0123456789tefnul'.includes(json[plainEnd])) plainEnd++;
+    spans.push({ text: json.slice(i, plainEnd), cls: "json-punct" });
+    i = plainEnd;
+  }
+
+  return spans.map((s, idx) =>
+    s.cls ? <span key={idx} className={s.cls}>{s.text}</span> : s.text
+  );
+}
+
+/** Colorize markdown text — applies syntax coloring spans, preserving the raw text. */
+function colorizeMarkdown(text: string): React.ReactNode {
+  const spans = tokenizeMarkdown(text);
+  return spans.map((s, idx) =>
+    s.cls ? <span key={idx} className={s.cls}>{s.text}</span> : s.text
+  );
+}
+
+/** Verdict → pill class and color for role_end display. */
+function verdictStyle(verdict: string): { cls: string; color: string } {
+  switch (verdict) {
+    case "pass": return { cls: "pill ok", color: "var(--ok)" };
+    case "needs_more": return { cls: "pill warn", color: "var(--warn)" };
+    case "blocker": return { cls: "pill bad", color: "var(--bad)" };
+    case "needs_human": return { cls: "pill human", color: "var(--human)" };
+    default: return { cls: "pill dim", color: "var(--ink-dim)" };
+  }
+}
+
+function LiveLine({ item }: { item: LineItem }) {
+  switch (item.kind) {
+    case "role_start":
+      return (
+        <div className="live-role-start">
+          <span className="live-role-icon">{"▶"}</span>
+          <span className="live-role-key">{item.meta?.role}</span>
+          {item.meta?.depth != null && <span className="live-role-depth">depth {item.meta.depth}</span>}
+        </div>
+      );
+
+    case "role_end": {
+      const vs = verdictStyle(item.meta?.verdict ?? "done");
+      return (
+        <div className="live-role-end">
+          <span className="live-role-end-marker">{item.meta?.aborted ? "✕" : "■"}</span>
+          <span className="live-role-key">{item.meta?.role}</span>
+          <span className="live-role-arrow">→</span>
+          <span className={`${vs.cls}`} style={{ borderColor: vs.color, color: vs.color }}>{item.content}</span>
+          {item.meta?.flags && <span className="live-role-flags">[{item.meta.flags}]</span>}
+        </div>
+      );
+    }
+
+    case "tool_start": {
+      const rc = item.meta?.repeatCount;
+      return (
+        <div className="live-tool-start">
+          <span className="live-tool-icon">{"⚙"}</span>
+          <span className="live-tool-name">{item.content}</span>
+          {rc && rc > 1 ? (
+            <span className="live-tool-repeat">{rc}x</span>
+          ) : null}
+          {item.meta?.jsonArgs != null && (
+            <pre className="live-json">{jsonSpans(item.meta.jsonArgs)}</pre>
+          )}
+        </div>
+      );
+    }
+
+    case "tool_end": {
+      const rc = item.meta?.repeatCount;
+      return (
+        <div className="live-tool-end">
+          <span className="live-tool-icon">{"⚙"}</span>
+          <span className="live-tool-name">{item.content}</span>
+          {rc && rc > 1 ? <span className="live-tool-repeat">{rc}x</span> : null}
+          <span className={item.meta?.isError ? "live-tool-result error" : "live-tool-result ok"}>
+            {item.meta?.isError ? "✗" : "✓"}
+          </span>
+        </div>
+      );
+    }
+
+    case "text":
+      return <div className="live-text">{colorizeMarkdown(item.content)}</div>;
+
+    case "thinking":
+      return <div className="live-thinking"><span className="live-thinking-prefix">{"💭"}</span> {colorizeMarkdown(item.content)}</div>;
+
+    case "status":
+      return <div className="live-status">{item.content}</div>;
+
+    default:
+      return <div className="live-text">{item.content}</div>;
+  }
 }
 
 function TaskNetworkGraph({
@@ -707,7 +1005,7 @@ export function TaskDetail() {
             <div className="panel">
               <h2>Live activity</h2>
               <div className="live" ref={liveRef} onScroll={handleLiveScroll}>
-                {lines.length ? lines.join("\n") : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
+                {lines.length ? lines.map((item, i) => <LiveLine key={i} item={item} />) : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
                 {!pinned && (
                   <button className="live-jump" onClick={jumpToLive}>
                     ↓ latest

@@ -35,6 +35,7 @@ import {
   listRoles,
   listRoleRuns,
   listTasks,
+  reorderModelConfigs,
   resetTask,
   setDefaultModelConfig,
   setDefaultNetwork,
@@ -333,6 +334,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       thinking_level?: string;
       thinking_format?: string;
       text_mode?: boolean;
+      thinking_budgets?: string;
     };
     if (!body.name || !body.name.trim()) return bad(reply, 400, "name is required");
     if (
@@ -354,6 +356,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         thinking_level: body.thinking_level,
         thinking_format: body.thinking_format,
         text_mode: body.text_mode,
+        thinking_budgets: body.thinking_budgets,
       });
       const { api_key, ...safe } = cfg;
       const envKey = envTokenForModel(cfg.name);
@@ -402,6 +405,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       thinking_level?: string;
       thinking_format?: string;
       text_mode?: boolean;
+      thinking_budgets?: string;
     };
     if (
       body.thinking_format !== undefined &&
@@ -422,6 +426,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         thinking_level: body.thinking_level,
         thinking_format: body.thinking_format,
         text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
+        thinking_budgets: body.thinking_budgets,
       });
       const { api_key, ...safe } = cfg;
       const envKey = envTokenForModel(cfg.name);
@@ -468,6 +473,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     } catch (err) {
       return bad(reply, 409, (err as Error).message);
     }
+  });
+
+  // Reorder model configs by ID array.
+  app.post("/api/model-configs/reorder", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as { ids?: number[] };
+    if (!body.ids || !Array.isArray(body.ids) || body.ids.length === 0) {
+      return bad(reply, 400, "ids must be a non-empty array of config IDs");
+    }
+    reorderModelConfigs(body.ids);
+    return { ok: true };
   });
 
   // Set a model config as the global default.

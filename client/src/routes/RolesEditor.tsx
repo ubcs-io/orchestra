@@ -303,27 +303,31 @@ function RoleCard({
       </div>
       {open && (
         <div className="role-editor" style={{ marginTop: 10 }}>
-          <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> enabled</label>
-          <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={canCreateSubtasks} onChange={(e) => setCanCreateSubtasks(e.target.checked)} /> Can Create Subtasks</label>
-          <label>Tools</label>
-          <TagInput
-            value={tools}
-            onChange={setTools}
-            suggestions={KNOWN_TOOLS}
-          />
-          <label>Model override (optional)</label>
-          <ModelPicker
-            value={model}
-            onChange={setModel}
-            configs={modelConfigs}
-            defaultConfigName={defaultModelConfigName}
-          />
-          <label>System prompt</label>
-          <textarea style={{ minHeight: 250 }} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
-          <div style={{ marginTop: 8 }}>
-            <button className="primary" disabled={save.isPending} onClick={() => save.mutate()}>
-              {save.isPending ? "Saving…" : "Save project override"}
-            </button>
+          <div>
+            <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> enabled</label>
+            <label><input type="checkbox" style={{ width: "auto", marginRight: 6 }} checked={canCreateSubtasks} onChange={(e) => setCanCreateSubtasks(e.target.checked)} /> Can Create Subtasks</label>
+            <label>Tools</label>
+            <TagInput
+              value={tools}
+              onChange={setTools}
+              suggestions={KNOWN_TOOLS}
+            />
+            <label>Model override (optional)</label>
+            <ModelPicker
+              value={model}
+              onChange={setModel}
+              configs={modelConfigs}
+              defaultConfigName={defaultModelConfigName}
+            />
+          </div>
+          <div>
+            <label>System prompt</label>
+            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+            <div style={{ marginTop: 8 }}>
+              <button className="primary" disabled={save.isPending} onClick={() => save.mutate()}>
+                {save.isPending ? "Saving…" : "Save project override"}
+              </button>
+            </div>
           </div>
         </div>
       )}

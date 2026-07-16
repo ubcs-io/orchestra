@@ -21,6 +21,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { appendArtifactSection, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
+import { resolveConnection } from "./settings.js";
 import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.js";
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
@@ -625,7 +626,10 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       ? TEXT_MODE_INSTRUCTION
       : TOOL_CALL_DISCIPLINE;
 
-  const settingsManager = SettingsManager.inMemory();
+  const conn = resolveConnection();
+  const settingsManager = SettingsManager.inMemory(
+    conn.thinkingBudgets ? { thinkingBudgets: conn.thinkingBudgets } : undefined,
+  );
   const loader = new DefaultResourceLoader({
     cwd: params.repoPath,
     agentDir: getAgentDir(),
