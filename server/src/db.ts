@@ -258,6 +258,14 @@ export function initDb(): void {
   // Set on a decomposition child when a later answer invalidates a guess its
   // parent task made — flagged for human triage, never cleared automatically.
   addColumnIfMissing(d, "tasks", "stale_reason", "stale_reason TEXT");
+  // The task's dedicated git worktree directory — lets each task's role steps
+  // run against their own working tree instead of sharing the project's.
+  addColumnIfMissing(d, "tasks", "git_worktree_path", "git_worktree_path TEXT");
+  // Outcome of merging the task's branch back into its base branch on
+  // completion. null = not yet attempted (task predates this feature, or
+  // hasn't reached a terminal role yet).
+  addColumnIfMissing(d, "tasks", "reconcile_status", "reconcile_status TEXT");
+  addColumnIfMissing(d, "tasks", "reconcile_detail", "reconcile_detail TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -339,6 +347,9 @@ export interface TaskRow {
   git_branch: string | null;
   git_base_branch: string | null;
   stale_reason: string | null;
+  git_worktree_path: string | null;
+  reconcile_status: string | null;
+  reconcile_detail: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -839,6 +850,9 @@ const TASK_UPDATABLE = new Set([
   "git_branch",
   "git_base_branch",
   "stale_reason",
+  "git_worktree_path",
+  "reconcile_status",
+  "reconcile_detail",
 ]);
 
 export function updateTask(
@@ -913,6 +927,9 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       coverage_json = NULL,
       artifact_path = NULL,
       workspace = NULL,
+      git_worktree_path = NULL,
+      reconcile_status = NULL,
+      reconcile_detail = NULL,
       parent_task_id = NULL,
       task_type = 'root',
       step_number = NULL,

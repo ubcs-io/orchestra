@@ -41,16 +41,18 @@ import {
   checkoutBranch,
   commitArtifacts,
   currentBranch,
-  ensureBranch,
+  ensureWorktree,
   headSha,
   moveArtifact,
   planningRoot,
+  reconcileBranch,
   refineCommitMessage,
   removeFile,
   resetHardTo,
   sanitizePath,
   scaffoldPlanning,
   scanIntake,
+  worktreePath,
   writeArtifact,
 } from "./git.js";
 import {
@@ -518,38 +520,42 @@ function taskBranchName(task: TaskRow): string {
 }
 
 /**
- * Create (once) and check out this task's dedicated checkpoint branch, off the
- * project's base branch — captured lazily from whatever's checked out the first
- * time any task in the project needs one. Idempotent: once `git_branch` is set
- * this just re-checks-it-out, which is necessary before every role step since
- * the scheduler round-robins steps across tasks sharing the same repo
- * (`pickNextTask`) and another task's step may have switched branches since.
+ * Create (once) this task's dedicated git worktree — its own working
+ * directory, checked out onto its own branch off the project's base branch
+ * (captured lazily from whatever's checked out in `project.repo_path` the
+ * first time any task in the project needs one). Idempotent: once
+ * `git_worktree_path` is set, `ensureWorktree` just re-asserts the worktree
+ * still exists (recreating it if a reset/cleanup removed it, reusing the
+ * same branch) rather than doing anything expensive.
  *
- * Best-effort like the rest of this module's git usage (see `commitArtifacts`):
- * a failure (dirty tree, git error) is logged and swallowed rather than
- * crashing the scheduler tick — the task simply keeps working on whatever
- * branch is currently checked out, same as before this feature existed.
+ * Unlike the old shared-checkout scheme, this does NOT swallow failures —
+ * a worktree is a precondition for the task to do any work at all, so a
+ * failure here must block the task's step rather than silently falling back
+ * to a shared checkout, which would reintroduce the cross-task races
+ * per-task worktrees exist to remove.
  */
-function ensureTaskBranch(task: TaskRow, project: ProjectRow): TaskRow {
-  try {
-    if (task.git_branch) {
-      checkoutBranch(project.repo_path, task.git_branch);
-      return task;
-    }
-    let baseBranch = project.main_branch;
-    if (!baseBranch) {
-      baseBranch = currentBranch(project.repo_path);
-      updateProject(project.id, { main_branch: baseBranch });
-    }
-    const branch = taskBranchName(task);
-    ensureBranch(project.repo_path, branch, baseBranch);
-    return updateTask(task.task_id, { git_branch: branch, git_base_branch: baseBranch }) ?? task;
-  } catch (err) {
-    console.warn(
-      `[git] checkpoint branch skipped for task ${task.task_id.slice(0, 8)}: ${(err as Error).message}`,
-    );
+function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow {
+  let baseBranch = task.git_base_branch ?? project.main_branch;
+  if (!baseBranch) {
+    baseBranch = currentBranch(project.repo_path);
+    updateProject(project.id, { main_branch: baseBranch });
+  }
+  const branch = task.git_branch ?? taskBranchName(task);
+  const dir = worktreePath(project.repo_path, task.task_id);
+  ensureWorktree(project.repo_path, dir, branch, baseBranch);
+  if (task.git_worktree_path === dir && task.git_branch === branch && task.git_base_branch === baseBranch) {
     return task;
   }
+  return (
+    updateTask(task.task_id, { git_worktree_path: dir, git_branch: branch, git_base_branch: baseBranch }) ?? task
+  );
+}
+
+/** Where this task's own git/filesystem operations should run: its dedicated
+ *  worktree once `ensureTaskWorkspace` has created one, else the project's
+ *  shared checkout (covers tasks that predate this feature). */
+function taskRepoPath(task: TaskRow, project: ProjectRow): string {
+  return task.git_worktree_path ?? project.repo_path;
 }
 
 /** Scan every project's INTAKE folder and create tasks for new files. */

@@ -9,5 +9,6 @@
   "maxTokens": 8192,
   "requestTimeoutMs": 300000,
   "schedulerIdleMs": 3000,
-  "roleToolBudget": 40
+  "roleToolBudget": 40,
+  "maxConcurrentTasks": 3
 }

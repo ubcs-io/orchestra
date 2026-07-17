@@ -1469,6 +1469,17 @@ a.clickable-role:hover {
   color: var(--brass);
 }
 
+/* ---- Role card header (distinguish type vs. software equivalent) ---- */
+.role-card-title {
+  color: var(--accent);
+  font-size: 14px;
+}
+.role-card-key {
+  color: var(--brass-dim);
+  font-size: 11px;
+  border-color: var(--brass-dim);
+}
+
 /* ---- Role editor panel (two-column on wide screens) ---- */
 .role-editor {
   display: grid;

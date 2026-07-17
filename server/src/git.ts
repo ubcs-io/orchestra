@@ -306,3 +306,154 @@ export function resetHardTo(repoPath: string, sha: string): void {
   }
   git(repoPath, ["reset", "--hard", sha]);
 }
+
+// ---------------------------------------------------------------------------
+// Worktrees: per-task working directories sharing one object store
+// ---------------------------------------------------------------------------
+
+const WORKTREES_DIR = ".orchestra-worktrees";
+
+/** The dedicated worktree directory for a task, nested under the project repo. */
+export function worktreePath(repoPath: string, taskId: string): string {
+  return path.join(repoPath, WORKTREES_DIR, taskId);
+}
+
+function worktreeRegistered(repoPath: string, worktreeDir: string): boolean {
+  try {
+    const list = git(repoPath, ["worktree", "list", "--porcelain"]);
+    const target = path.resolve(worktreeDir);
+    return list
+      .split("\n")
+      .some((line) => line.startsWith("worktree ") && path.resolve(line.slice("worktree ".length)) === target);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Create (once) this task's dedicated worktree, checked out onto `branch` —
+ * creating `branch` off `baseBranch` if it doesn't exist yet. Idempotent: a
+ * worktree already registered at `worktreeDir` is left alone.
+ *
+ * Unlike `ensureBranch`, this throws on failure rather than swallowing it —
+ * a worktree is a precondition for a task to do any work at all, so silently
+ * continuing would mean falling back to a shared checkout and reintroducing
+ * the exact cross-task races worktrees exist to remove.
+ */
+export function ensureWorktree(repoPath: string, worktreeDir: string, branch: string, baseBranch: string): void {
+  if (worktreeRegistered(repoPath, worktreeDir)) return;
+  fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
+  if (branchExists(repoPath, branch)) {
+    git(repoPath, ["worktree", "add", worktreeDir, branch]);
+  } else {
+    git(repoPath, ["worktree", "add", "-b", branch, worktreeDir, baseBranch]);
+  }
+}
+
+/**
+ * Remove a task's worktree. Best-effort like `commitArtifacts` — a cleanup
+ * failure (already deleted, git refuses due to untracked files) is logged
+ * and swallowed rather than thrown, since it must never block the caller
+ * (task delete/reset) from completing.
+ */
+export function removeWorktree(repoPath: string, worktreeDir: string): void {
+  try {
+    git(repoPath, ["worktree", "remove", "--force", worktreeDir]);
+  } catch (err) {
+    console.warn(`[git] worktree remove failed for "${worktreeDir}", falling back to rm: ${(err as Error).message}`);
+    try {
+      fs.rmSync(worktreeDir, { recursive: true, force: true });
+      git(repoPath, ["worktree", "prune"]);
+    } catch (err2) {
+      console.warn(`[git] worktree cleanup failed for "${worktreeDir}": ${(err2 as Error).message}`);
+    }
+  }
+}
+
+/** Sweep stale worktree registrations (e.g. after a crash left directories half-removed). */
+export function pruneWorktrees(repoPath: string): void {
+  try {
+    git(repoPath, ["worktree", "prune"]);
+  } catch (err) {
+    console.warn(`[git] worktree prune failed for "${repoPath}": ${(err as Error).message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Branch reconciliation
+// ---------------------------------------------------------------------------
+
+export interface ReconcileResult {
+  status: "merged" | "up_to_date" | "conflict" | "error";
+  detail?: string;
+}
+
+/**
+ * Reconcile a finished task's branch back into `baseBranch`. Never throws —
+ * the outcome is carried entirely in the return value so a reconciliation
+ * failure can be recorded and surfaced without ever crashing the scheduler
+ * tick that's completing the task.
+ *
+ * Two-step: first merge `baseBranch` into `branch` (from `repoPath`, which is
+ * expected to already be checked out to `branch` — a task's own worktree) so
+ * any conflict resolution happens on the disposable task branch, never on
+ * `baseBranch` itself. If that's clean, merge `branch` into `baseBranch` in
+ * the shared repo root, where `baseBranch` lives.
+ */
+export function reconcileBranch(repoPath: string, branch: string, baseBranch: string): ReconcileResult {
+  try {
+    git(repoPath, ["merge", "--no-edit", baseBranch]);
+  } catch (err) {
+    const conflicted = conflictedFiles(repoPath);
+    if (conflicted.length) {
+      try {
+        git(repoPath, ["merge", "--abort"]);
+      } catch {
+        // best-effort: leave as-is if even the abort fails
+      }
+      return { status: "conflict", detail: conflicted.join(", ") };
+    }
+    return { status: "error", detail: (err as Error).message };
+  }
+
+  const repoRoot = repoRootOf(repoPath) ?? repoPath;
+  try {
+    const beforeSha = git(repoRoot, ["rev-parse", baseBranch]);
+    checkoutBranch(repoRoot, baseBranch);
+    git(repoRoot, ["merge", "--no-ff", "--no-edit", branch]);
+    const afterSha = git(repoRoot, ["rev-parse", baseBranch]);
+    return { status: beforeSha === afterSha ? "up_to_date" : "merged" };
+  } catch (err) {
+    const conflicted = conflictedFiles(repoRoot);
+    if (conflicted.length) {
+      try {
+        git(repoRoot, ["merge", "--abort"]);
+      } catch {
+        // best-effort
+      }
+      return { status: "conflict", detail: conflicted.join(", ") };
+    }
+    return { status: "error", detail: (err as Error).message };
+  }
+}
+
+function conflictedFiles(repoPath: string): string[] {
+  try {
+    return git(repoPath, ["diff", "--name-only", "--diff-filter=U"])
+      .split("\n")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** The repo root that `repoPath` (possibly a worktree) shares its object store with. */
+function repoRootOf(repoPath: string): string | undefined {
+  try {
+    const commonDir = git(repoPath, ["rev-parse", "--git-common-dir"]);
+    const resolved = path.isAbsolute(commonDir) ? commonDir : path.resolve(repoPath, commonDir);
+    return path.dirname(resolved);
+  } catch {
+    return undefined;
+  }
+}

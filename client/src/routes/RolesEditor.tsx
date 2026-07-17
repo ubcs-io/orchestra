@@ -293,6 +293,13 @@ function RoleCard({
   const [enabled, setEnabled] = useState(role.enabled === 1);
   const [canCreateSubtasks, setCanCreateSubtasks] = useState(role.can_create_subtasks === 1);
 
+  // Parse title to separate the role type name from its software equivalent.
+  // Titles look like "Requirements Analyst (Product Manager)" — the parenthetical
+  // part is the human-job equivalent; the part before it is the role type.
+  const titleMatch = (role.title ?? "").match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+  const displayTitle = titleMatch ? titleMatch[1]! : (role.title ?? role.key);
+  const softwareEquivalent = titleMatch ? titleMatch[2]! : null;
+
   const save = useMutation({
     mutationFn: () =>
       api.saveRole(projectId, role.key, {
@@ -309,8 +316,8 @@ function RoleCard({
     <div className="panel" id={`role-${role.key}`}>
       <div className="row">
         <button className="small" onClick={() => setOpen((o) => !o)}>{open ? "▾" : "▸"}</button>
-        <strong>{role.title ?? role.key}</strong>
-        <span className="pill dim">{role.key}</span>
+        <strong className="role-card-title">{displayTitle}</strong>
+        <span className="pill dim role-card-key">{softwareEquivalent ?? role.key}</span>
         {role.project_id != null && <span className="pill ok">project override</span>}
         {!enabled && <span className="pill bad">disabled</span>}
       </div>
