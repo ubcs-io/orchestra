@@ -26,11 +26,25 @@ import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
 export type CoverageStatus = "considered" | "skipped" | "out_of_scope";
+export type QuestionConfidence = "low" | "medium" | "high";
+/** Lifecycle of a role's best-effort guess: set once when recorded, then updated
+ *  when a human's later answer is compared against it (see orchestrator.ts). */
+export type QuestionResolution = "assumed" | "confirmed" | "invalidated";
 
 export interface CoverageItem {
   concern: string;
   status: CoverageStatus;
   note?: string;
+}
+
+/** An open question a role could not fully resolve, together with its own
+ *  best-effort guess — recorded so the pipeline can proceed past it instead of
+ *  stalling, and so a later human answer can be checked against the guess. */
+export interface OpenQuestion {
+  question: string;
+  assumed_answer: string;
+  confidence: QuestionConfidence;
+  resolved: QuestionResolution;
 }
 
 /** Whether a counter-reviewer judged an acceptance criterion satisfied. */
@@ -46,7 +60,7 @@ export interface CriteriaResult {
 export interface RoleFindings {
   verdict: Verdict;
   summary: string;
-  open_questions: string[];
+  open_questions: OpenQuestion[];
   coverage: CoverageItem[];
   section_md: string;
   /** Present only for counter-reviewer roles; one entry per acceptance criterion. */
@@ -147,6 +161,17 @@ const CriteriaResultSchema = Type.Object({
   note: Type.Optional(Type.String()),
 });
 
+const OpenQuestionSchema = Type.Object({
+  question: Type.String(),
+  assumed_answer: Type.String({
+    description:
+      "Your own best-effort guess at the answer. Never leave this empty — a low-" +
+      "confidence guess still lets the pipeline keep moving; a human can confirm or " +
+      "correct it later.",
+  }),
+  confidence: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
+});
+
 const RecordFindingsSchema = Type.Object({
   verdict: Type.Union([
     Type.Literal("pass"),
@@ -155,7 +180,7 @@ const RecordFindingsSchema = Type.Object({
     Type.Literal("needs_human"),
   ]),
   summary: Type.String(),
-  open_questions: Type.Optional(Type.Array(Type.String())),
+  open_questions: Type.Optional(Type.Array(OpenQuestionSchema)),
   coverage: Type.Optional(Type.Array(CoverageSchema)),
   section_md: Type.String(),
   criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
@@ -225,7 +250,7 @@ const STALL_REPEAT_THRESHOLD = 5;
 const STALL_MIN_SENTENCE_LEN = 20;
 
 export const TOOL_CALL_DISCIPLINE =
-  "\n\nWhen you are ready to use a tool, invoke it directly as a function call — never describe or " +
+  "When you are ready to use a tool, invoke it directly as a function call — never describe or " +
   'narrate the call in plain text (e.g. do not write "Let me call record_findings now" or similar). ' +
   "Plain text should contain your analysis, not announcements of tool use.\n\n" +
   "When you are done, call the `record_findings` tool EXACTLY ONCE with the fields described in " +
@@ -278,7 +303,7 @@ output your findings as a single JSON code block using EXACTLY this format:
 {
   "verdict": "pass",
   "summary": "One or two sentences capturing your key takeaway.",
-  "open_questions": [],
+  "open_questions": [{"question": "...", "assumed_answer": "your best guess", "confidence": "medium"}],
   "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}],
   "section_md": "## My Role\\n\\nFindings with concrete file references..."
 }
@@ -286,7 +311,7 @@ output your findings as a single JSON code block using EXACTLY this format:
 
 - **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
 - **summary**: brief key takeaway
-- **open_questions**: array of strings (empty if none)
+- **open_questions**: array of { question, assumed_answer, confidence } (empty if none). For EVERY open question, give your own best-effort guess at the answer plus a confidence ("low" | "medium" | "high") — never leave assumed_answer empty. Reserve "blocker"/"needs_human" ONLY for questions where no reasonable guess is possible at all; an ordinary open question with a guess attached should still get "pass" or "needs_more".
 - **coverage**: array of { concern, status, note } — status is "considered", "skipped", or "out_of_scope". Draw concerns from: correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs. Be honest about what you did NOT examine.
 - **section_md**: a markdown section (start with "## Your Role" heading) with concrete file references. This will be appended to the task's planning artifact.
 
@@ -467,6 +492,38 @@ export function extractFindingsFromText(text: string): RoleFindings | null {
   return tryParseFindings(text.trim());
 }
 
+/** Coerce loosely-typed model output into OpenQuestion[] — tolerates the old
+ *  plain-string form (models that ignore the updated instructions) alongside
+ *  the current { question, assumed_answer, confidence } shape. Not schema-
+ *  validated input (unlike the record_findings tool path), so every field is
+ *  checked defensively. */
+function normalizeOpenQuestions(raw: unknown): OpenQuestion[] {
+  if (!Array.isArray(raw)) return [];
+  const out: OpenQuestion[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      if (item.trim()) {
+        out.push({ question: item, assumed_answer: "", confidence: "low", resolved: "assumed" });
+      }
+    } else if (item && typeof item === "object") {
+      const o = item as Record<string, unknown>;
+      if (typeof o.question === "string" && o.question.trim()) {
+        const confidence =
+          o.confidence === "high" || o.confidence === "medium" || o.confidence === "low"
+            ? o.confidence
+            : "low";
+        out.push({
+          question: o.question,
+          assumed_answer: typeof o.assumed_answer === "string" ? o.assumed_answer : "",
+          confidence,
+          resolved: "assumed",
+        });
+      }
+    }
+  }
+  return out;
+}
+
 /** Best-effort extraction of RoleFindings fields from malformed/partial JSON
  *  by matching quoted field values with regex. Only returns a result when at
  *  least verdict and summary can be extracted. */
@@ -519,9 +576,7 @@ function tryParseFindings(json: string): RoleFindings | null {
     return {
       verdict,
       summary: obj.summary,
-      open_questions: Array.isArray(obj.open_questions)
-        ? obj.open_questions.filter((q): q is string => typeof q === "string")
-        : [],
+      open_questions: normalizeOpenQuestions(obj.open_questions),
       coverage: Array.isArray(obj.coverage)
         ? (obj.coverage as CoverageItem[])
         : [],
@@ -604,7 +659,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       captured = {
         verdict: p.verdict,
         summary: p.summary,
-        open_questions: p.open_questions ?? [],
+        open_questions: (p.open_questions ?? []).map((q) => ({ ...q, resolved: "assumed" as const })),
         coverage: (p.coverage ?? []) as CoverageItem[],
         section_md: p.section_md,
         criteria_results: (p.criteria_results ?? []) as CriteriaResult[],
@@ -662,7 +717,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     cwd: params.repoPath,
     agentDir: getAgentDir(),
     settingsManager,
-    systemPrompt: params.systemPrompt + disciplineSuffix,
+    systemPrompt: params.systemPrompt + "\n\n" + disciplineSuffix,
     noExtensions: true,
     noSkills: true,
     noPromptTemplates: true,

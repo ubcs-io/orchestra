@@ -16,7 +16,7 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type AgentNetworkGraph, type NetworkEdge, type ModelConfig } from "../api";
+import { api, type AgentNetworkGraph, type NetworkEdge, type ModelConfig, type Role } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelPicker } from "./RolesEditor";
 
@@ -207,6 +207,72 @@ function RoleEditModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar Role Card (collapsed by default)
+// ---------------------------------------------------------------------------
+
+function RoleCardSidebar({
+  role,
+  onRoleClick,
+}: {
+  role: Role;
+  onRoleClick: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div
+      className="network-role-card"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData("application/orchestra-role", role.key);
+        e.dataTransfer.effectAllowed = "move";
+      }}
+    >
+      <div className="network-role-card-header">
+        <button
+          className="small"
+          style={{ padding: "0 3px", fontSize: 10, lineHeight: 1, flexShrink: 0 }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen((o) => !o);
+          }}
+          tabIndex={-1}
+        >
+          {open ? "▾" : "▸"}
+        </button>
+        <span className="network-role-key">{role.key}</span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 4, fontSize: 12 }}>
+          {role.title && <div><span className="muted">title: </span>{role.title}</div>}
+          {role.system_prompt && (
+            <div>
+              <span className="muted">prompt: </span>
+              <span className="muted" style={{ fontSize: 11 }}>
+                {role.system_prompt.slice(0, 80)}{role.system_prompt.length > 80 ? "…" : ""}
+              </span>
+            </div>
+          )}
+          <div style={{ marginTop: 4, display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+            {role.can_create_subtasks === 1 && <span className="pill dim">terminal</span>}
+            <button
+              className="small"
+              style={{ fontSize: 10 }}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRoleClick();
+              }}
+            >
+              edit
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -996,22 +1062,11 @@ export function NetworkEditor() {
           {rolesQ.data?.roles
             .filter((r) => r.enabled !== 0)
             .map((role) => (
-              <div
+              <RoleCardSidebar
                 key={role.key}
-                className="network-role-card"
-                draggable
-                onDragStart={(e) => {
-                  e.dataTransfer.setData("application/orchestra-role", role.key);
-                  e.dataTransfer.effectAllowed = "move";
-                }}
-                title={role.system_prompt?.slice(0, 100) ?? ""}
-              >
-                <div className="network-role-card-header">
-                  <span className="network-role-key">{role.key}</span>
-                </div>
-                <span className="muted">{role.title}</span>
-                {role.can_create_subtasks === 1 && <span className="pill dim">terminal</span>}
-              </div>
+                role={role}
+                onRoleClick={() => handleRoleClick(role.key)}
+              />
             ))}
         </div>
       </aside>

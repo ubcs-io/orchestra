@@ -16,6 +16,9 @@
  * Call Point 3 — Borderline Gate Assessment (partial criteria, near-exhaustion)
  * Call Point 4 — Second Review (authoritative synthesis of a step's primary run
  *                 + its adversarial critique, run after every critiqued step)
+ * Call Point 5 — Answer Match Assessment (a human's later answer to a role's
+ *                 recorded best-effort guess — confirms it, or contradicts it
+ *                 and should roll the task back to right after the guess)
  */
 
 import type { RoleRunner, PlanStep, CoverageMap as OrchestratorCoverageMap } from "./orchestrator.js";
@@ -39,6 +42,9 @@ export interface RouterConfig {
   borderlineGateAssessment: boolean;
   /** Call Point 4: authoritative second review synthesizing a step's primary run + critique. */
   secondReview: boolean;
+  /** Call Point 5: compare a human's later answer against a role's recorded guess,
+   *  and roll the task back to right after the guess if it was wrong. */
+  answerReincorporation: boolean;
   /** Override model for router calls (falls back to project connection default). */
   model?: string;
   /** Token budget per router call. Default 1024. */
@@ -53,6 +59,7 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   escalationAssessment: false,
   borderlineGateAssessment: false,
   secondReview: false,
+  answerReincorporation: false,
 };
 
 /** Resolve router config from a project's config_json or return defaults. */
@@ -626,6 +633,90 @@ async function defaultAssessSecondReview(
 }
 
 // ---------------------------------------------------------------------------
+// Call Point 5: Answer Match Assessment
+// ---------------------------------------------------------------------------
+
+export interface AnswerMatchInput {
+  question: string;
+  assumedAnswer: string;
+  confidence: "low" | "medium" | "high";
+  humanAnswer: string;
+}
+
+export type AnswerMatchDecision = "confirms" | "contradicts";
+
+export interface AnswerMatchResult {
+  decision: AnswerMatchDecision;
+  reasoning: string;
+}
+
+const ANSWER_MATCH_SYSTEM_PROMPT = `You are comparing a human's answer to a question against the best-effort guess an automated role made earlier, in order to decide whether that guess's downstream work still stands or needs to be redone.
+
+Available decisions:
+- "confirms": The human's answer is consistent with (or a more specific version of) the guessed answer. Downstream work built on the guess is still valid.
+- "contradicts": The human's answer conflicts with the guessed answer in a way that would change downstream conclusions. The work needs to be redone with the corrected answer.
+
+Guidelines:
+- Minor wording differences that don't change the substance are still "confirms".
+- Only decide "contradicts" when acting on the human's answer would actually produce a different result than acting on the guess did.
+- When genuinely unsure, prefer "contradicts" — re-doing unaffected work is cheap, but silently keeping wrong conclusions is not.
+
+Respond ONLY with valid JSON matching this schema — no markdown, no explanation outside the JSON:
+{
+  "decision": "confirms" | "contradicts",
+  "reasoning": "brief explanation of the decision"
+}`;
+
+function buildAnswerMatchPrompt(input: AnswerMatchInput): string {
+  return `Question: ${input.question}
+
+## Role's earlier best-effort guess (confidence: ${input.confidence})
+${input.assumedAnswer || "(no guess was recorded)"}
+
+## Human's actual answer
+${input.humanAnswer}
+
+Does the human's answer confirm the guess, or contradict it?`;
+}
+
+async function defaultAssessAnswerMatch(
+  input: AnswerMatchInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+): Promise<AnswerMatchResult> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const json = await routerCall<AnswerMatchResult>(
+      roleRunner,
+      repoPath,
+      planningDir,
+      modelId,
+      ANSWER_MATCH_SYSTEM_PROMPT,
+      buildAnswerMatchPrompt(input),
+      controller.signal,
+    );
+
+    clearTimeout(timeout);
+
+    if (!["confirms", "contradicts"].includes(json.decision)) {
+      throw new Error(`invalid decision: ${json.decision}`);
+    }
+    return json;
+  } catch (err) {
+    console.warn(`[router] answer match assessment failed: ${(err as Error).message}`);
+    // Fall back conservatively: never silently keep a possibly-wrong guess.
+    return {
+      decision: "contradicts",
+      reasoning: "Router assessment failed — treating as a mismatch so the answer isn't silently dropped.",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Injector seam (same pattern as orchestrator's setRoleRunner)
 // ---------------------------------------------------------------------------
 
@@ -661,26 +752,38 @@ type SecondReviewParams = [
   modelId: string,
 ];
 
+type AnswerMatchParams = [
+  input: AnswerMatchInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+];
+
 export type DistillFn = (...args: DistillParams) => Promise<DistillationResult>;
 export type EscalationFn = (...args: EscalationParams) => Promise<EscalationAssessmentResult>;
 export type BorderlineFn = (...args: BorderlineParams) => Promise<BorderlineAssessmentResult>;
 export type SecondReviewFn = (...args: SecondReviewParams) => Promise<SecondReviewResult>;
+export type AnswerMatchFn = (...args: AnswerMatchParams) => Promise<AnswerMatchResult>;
 
 let _distill: DistillFn = defaultDistill;
 let _assessEscalation: EscalationFn = defaultAssessEscalation;
 let _assessBorderline: BorderlineFn = defaultAssessBorderline;
 let _assessSecondReview: SecondReviewFn = defaultAssessSecondReview;
+let _assessAnswerMatch: AnswerMatchFn = defaultAssessAnswerMatch;
 
 export function setDistillFn(fn: DistillFn): void { _distill = fn; }
 export function setEscalationFn(fn: EscalationFn): void { _assessEscalation = fn; }
 export function setBorderlineFn(fn: BorderlineFn): void { _assessBorderline = fn; }
 export function setSecondReviewFn(fn: SecondReviewFn): void { _assessSecondReview = fn; }
+export function setAnswerMatchFn(fn: AnswerMatchFn): void { _assessAnswerMatch = fn; }
 
 export function resetRouterFns(): void {
   _distill = defaultDistill;
   _assessEscalation = defaultAssessEscalation;
   _assessBorderline = defaultAssessBorderline;
   _assessSecondReview = defaultAssessSecondReview;
+  _assessAnswerMatch = defaultAssessAnswerMatch;
 }
 
 /** Public entry points that tests can override via the seam. */
@@ -688,3 +791,4 @@ export const distillQuestions: DistillFn = (...args) => _distill(...args);
 export const assessEscalation: EscalationFn = (...args) => _assessEscalation(...args);
 export const assessBorderline: BorderlineFn = (...args) => _assessBorderline(...args);
 export const assessSecondReview: SecondReviewFn = (...args) => _assessSecondReview(...args);
+export const assessAnswerMatch: AnswerMatchFn = (...args) => _assessAnswerMatch(...args);

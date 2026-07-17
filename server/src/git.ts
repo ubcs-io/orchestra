@@ -229,3 +229,80 @@ export function refineCommitMessage(role: string, taskName: string, purpose: str
   const trimmed = purpose.replace(/\s+/g, " ").trim().slice(0, 100);
   return `refine(${role}): ${taskName}${trimmed ? ` — ${trimmed}` : ""}`;
 }
+
+// ---------------------------------------------------------------------------
+// Checkpointing: per-task branches + restore
+// ---------------------------------------------------------------------------
+
+/** The branch currently checked out in `repoPath`. */
+export function currentBranch(repoPath: string): string {
+  return git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+}
+
+/** The commit SHA currently at HEAD in `repoPath`. */
+export function headSha(repoPath: string): string {
+  return git(repoPath, ["rev-parse", "HEAD"]);
+}
+
+function branchExists(repoPath: string, branch: string): boolean {
+  try {
+    git(repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checkout `branch` in `repoPath`. Relies on git's own refusal to switch
+ * branches over conflicting uncommitted changes — this throws in that case
+ * rather than forcing past it, so callers must surface the error instead of
+ * swallowing it (unlike the best-effort `commitArtifacts`).
+ */
+export function checkoutBranch(repoPath: string, branch: string): void {
+  git(repoPath, ["checkout", branch]);
+}
+
+/**
+ * Checkout `baseBranch`, then switch to `branch` — creating it off `baseBranch`
+ * if it doesn't exist yet, or just checking it out if it does (idempotent, so
+ * it's safe to call on every task-start even for a task that already has a
+ * branch). Same non-forcing failure semantics as `checkoutBranch`.
+ */
+export function ensureBranch(repoPath: string, branch: string, baseBranch: string): void {
+  checkoutBranch(repoPath, baseBranch);
+  if (branchExists(repoPath, branch)) {
+    checkoutBranch(repoPath, branch);
+  } else {
+    git(repoPath, ["checkout", "-b", branch]);
+  }
+}
+
+/**
+ * Whether `repoPath` has uncommitted changes to *tracked* files (staged or
+ * unstaged). Untracked files (`??` in porcelain output — build artifacts,
+ * Orchestra's own not-yet-added `.gitkeep` scaffolding, etc.) are deliberately
+ * excluded: `git reset --hard` never touches them, so they pose no risk of
+ * being silently discarded and would otherwise make this check misfire
+ * constantly in a real project directory.
+ */
+export function hasUncommittedChanges(repoPath: string): boolean {
+  return git(repoPath, ["status", "--porcelain"])
+    .split("\n")
+    .some((line) => line.length > 0 && !line.startsWith("??"));
+}
+
+/**
+ * Hard-reset `repoPath`'s current branch to `sha` — used to restore a task
+ * checkpoint. Unlike `checkout`, `reset --hard` does not refuse on a dirty
+ * working tree, so this checks first and throws rather than silently
+ * discarding uncommitted work.
+ */
+export function resetHardTo(repoPath: string, sha: string): void {
+  if (hasUncommittedChanges(repoPath)) {
+    throw new Error(
+      `refusing to restore: "${repoPath}" has uncommitted changes — commit, stash, or discard them first`,
+    );
+  }
+  git(repoPath, ["reset", "--hard", sha]);
+}

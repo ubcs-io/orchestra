@@ -14,6 +14,7 @@ export function Projects() {
   const [pinging, setPinging] = useState(false);
   const [pingResults, setPingResults] = useState<PingResult[] | null>(null);
   const [pingError, setPingError] = useState("");
+  const [hoveredConfigId, setHoveredConfigId] = useState<number | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const closeStream = useCallback(() => {
@@ -64,7 +65,7 @@ export function Projects() {
 
     es.addEventListener("init", (e) => {
       const data = JSON.parse((e as MessageEvent).data) as {
-        configs: Array<{ config_id: number; name: string; base_url: string }>;
+        configs: Array<{ config_id: number; name: string; base_url: string; location?: string | null }>;
       };
       // Immediately show the full list with "checking" status
       setPingResults(
@@ -72,6 +73,7 @@ export function Projects() {
           config_id: c.config_id,
           name: c.name,
           base_url: c.base_url,
+          location: c.location ?? null,
           available: false,
           status: "checking" as const,
         })),
@@ -198,10 +200,25 @@ export function Projects() {
             </p>
             <div className="ping-results">
               {pingResults.map((r) => (
-                <div key={r.config_id} className={`ping-node ${r.status === "checking" ? "ping-checking" : r.available ? "ping-ok" : "ping-down"}`}>
+                <div
+                  key={r.config_id}
+                  className={`ping-node ${r.status === "checking" ? "ping-checking" : r.available ? "ping-ok" : "ping-down"}`}
+                  onMouseEnter={() => setHoveredConfigId(r.config_id)}
+                  onMouseLeave={() => setHoveredConfigId(null)}
+                >
                   <span className={`ping-dot ${r.status === "checking" ? "ping-dot--checking" : r.available ? "ok" : "bad"}`} />
                   <span className="ping-name">{r.name}</span>
-                  <span className="muted" style={{ fontSize: 11 }}>{r.base_url}</span>
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {(() => {
+                      // While pinging, always show the full URL
+                      if (pinging) return r.base_url;
+                      // Done pinging — obfuscate local addresses unless hovered, using server-provided location
+                      if (r.location === "local") {
+                        return hoveredConfigId === r.config_id ? r.base_url : <span className="pill dim">[local]</span>;
+                      }
+                      return r.base_url;
+                    })()}
+                  </span>
                   {r.status === "checking" && (
                     <span className="pill dim" style={{ fontSize: 10 }}>checking…</span>
                   )}

@@ -13,9 +13,12 @@ import {
   createIntervention,
   createRoleRun,
   createTask,
+  deleteRoleRunsAfter,
+  deleteUnconsumedInterventionsAfter,
   getNetwork,
   getProject,
   getRole,
+  getRoleRun,
   getTask,
   listInterventions,
   listProjects,
@@ -23,6 +26,8 @@ import {
   listTasks,
   listUnconsumedInterventions,
   markInterventionConsumed,
+  setRoleRunCommitSha,
+  setRoleRunOpenQuestions,
   updateProject,
   updateTask,
   upsertRole,
@@ -33,11 +38,16 @@ import {
 import { publish } from "./bus.js";
 import {
   appendArtifactSection,
+  checkoutBranch,
   commitArtifacts,
+  currentBranch,
+  ensureBranch,
+  headSha,
   moveArtifact,
   planningRoot,
   refineCommitMessage,
   removeFile,
+  resetHardTo,
   sanitizePath,
   scaffoldPlanning,
   scanIntake,
@@ -59,6 +69,7 @@ import {
   type CoverageItem,
   type CoverageStatus,
   type CriteriaResult,
+  type OpenQuestion,
   type RoleFindings,
   type RoleRunResult,
   type RunRoleParams,
@@ -72,6 +83,7 @@ import {
   assessEscalation,
   assessBorderline,
   assessSecondReview,
+  assessAnswerMatch,
   type RouterConfig,
   type SecondReviewResult,
 } from "./router.js";
@@ -413,7 +425,7 @@ export function applyPlanMutation(
       if (termIdx >= 0) plan.steps.splice(termIdx, 0, step);
       else plan.steps.push(step);
     }
-  } else if (kind === "rerun_role" || kind === "deepen") {
+  } else if (kind === "deepen") {
     const last = [...plan.steps].reverse().find((s) => s.role === role);
     if (last) {
       last.status = "pending";
@@ -495,6 +507,51 @@ export function artifactName(task: TaskRow): string {
   return `${base}-${shortId}.md`;
 }
 
+/** Derive this task's dedicated checkpoint branch name (stable, content-free). */
+function taskBranchName(task: TaskRow): string {
+  const slug = (task.name ?? "task")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return `orchestra/${slug || "task"}-${task.task_id.slice(0, 8)}`;
+}
+
+/**
+ * Create (once) and check out this task's dedicated checkpoint branch, off the
+ * project's base branch — captured lazily from whatever's checked out the first
+ * time any task in the project needs one. Idempotent: once `git_branch` is set
+ * this just re-checks-it-out, which is necessary before every role step since
+ * the scheduler round-robins steps across tasks sharing the same repo
+ * (`pickNextTask`) and another task's step may have switched branches since.
+ *
+ * Best-effort like the rest of this module's git usage (see `commitArtifacts`):
+ * a failure (dirty tree, git error) is logged and swallowed rather than
+ * crashing the scheduler tick — the task simply keeps working on whatever
+ * branch is currently checked out, same as before this feature existed.
+ */
+function ensureTaskBranch(task: TaskRow, project: ProjectRow): TaskRow {
+  try {
+    if (task.git_branch) {
+      checkoutBranch(project.repo_path, task.git_branch);
+      return task;
+    }
+    let baseBranch = project.main_branch;
+    if (!baseBranch) {
+      baseBranch = currentBranch(project.repo_path);
+      updateProject(project.id, { main_branch: baseBranch });
+    }
+    const branch = taskBranchName(task);
+    ensureBranch(project.repo_path, branch, baseBranch);
+    return updateTask(task.task_id, { git_branch: branch, git_base_branch: baseBranch }) ?? task;
+  } catch (err) {
+    console.warn(
+      `[git] checkpoint branch skipped for task ${task.task_id.slice(0, 8)}: ${(err as Error).message}`,
+    );
+    return task;
+  }
+}
+
 /** Scan every project's INTAKE folder and create tasks for new files. */
 function ingestProject(project: ProjectRow): number {
   const planningDir = project.planning_dir || "PLANNING";
@@ -503,7 +560,7 @@ function ingestProject(project: ProjectRow): number {
   let created = 0;
   for (const f of files) {
     const kind = inferIntakeKind(f.fileName, f.content);
-    const task = createTask({
+    let task = createTask({
       name: f.fileName,
       content: f.content,
       project_id: project.id,
@@ -512,6 +569,9 @@ function ingestProject(project: ProjectRow): number {
       intake_kind: kind,
       exit_kind: EXIT_KIND_BY_INTAKE[kind],
     });
+    // Give the task its own checkpoint branch before writing anything, so the
+    // intake commit below lands in the right isolated history from the start.
+    task = ensureTaskBranch(task, project);
     // Seed the REFINING artifact and remove the INTAKE original (dedupe = move).
     const artName = artifactName(task);
     const relArtifact = path.join(planningDir, "REFINING", artName);
@@ -569,7 +629,6 @@ function consumeInterventions(task: TaskRow, plan: RefinementPlan): { plan: Refi
         updateTask(task.task_id, { paused: 0 });
         break;
       case "inject_role":
-      case "rerun_role":
       case "deepen":
         applyPlanMutation(plan, iv.kind, p, (r) => isTerminalRole(task, r));
         break;
@@ -644,6 +703,23 @@ function answeredQuestions(taskId: string): Array<{ question: string; answer: st
       return { question: p.question?.trim() ?? "", answer: p.answer?.trim() ?? "" };
     })
     .filter((qa) => qa.question && qa.answer);
+}
+
+/** Parse a role_run's open_questions_json, tolerating the legacy plain-string
+ *  form stored before questions carried a guess/confidence/resolution. */
+function parseOpenQuestions(json: string | null): OpenQuestion[] {
+  if (!json) return [];
+  try {
+    const raw = JSON.parse(json) as unknown[];
+    if (!Array.isArray(raw)) return [];
+    return raw.map((q): OpenQuestion =>
+      typeof q === "string"
+        ? { question: q, assumed_answer: "", confidence: "low", resolved: "assumed" }
+        : (q as OpenQuestion),
+    );
+  } catch {
+    return [];
+  }
 }
 
 /** Resolve router config for a project, returning null if the router is disabled. */
@@ -740,7 +816,7 @@ function maybeDistillQuestions(
   task: TaskRow,
   project: ProjectRow,
   runId: number,
-  rawQuestions: string[],
+  rawQuestions: OpenQuestion[],
   routerCfg: RouterConfig,
 ): void {
   if (!rawQuestions.length) return;
@@ -754,15 +830,10 @@ function maybeDistillQuestions(
   const allPrior: Array<{ question: string; answer: string | null }> = [...priorQA];
   for (const run of listRoleRuns(task.task_id)) {
     if (run.id === runId) continue; // skip the run we just created
-    try {
-      const qs = JSON.parse(run.open_questions_json ?? "[]") as string[];
-      for (const q of qs) {
-        if (!allPrior.some((p) => p.question === q)) {
-          allPrior.push({ question: q, answer: null });
-        }
+    for (const q of parseOpenQuestions(run.open_questions_json)) {
+      if (!allPrior.some((p) => p.question === q.question)) {
+        allPrior.push({ question: q.question, answer: null });
       }
-    } catch {
-      /* skip */
     }
   }
 
@@ -777,7 +848,7 @@ function maybeDistillQuestions(
       taskName: task.name ?? task.task_id.slice(0, 8),
       intakeKind: task.intake_kind ?? "manual",
       roleKey: "", // filled from the run that was just created
-      rawQuestions,
+      rawQuestions: rawQuestions.map((q) => q.question),
       priorQuestions: allPrior.slice(0, 50), // cap at 50 prior questions
     },
     roleRunner,
@@ -823,6 +894,10 @@ function isJsonParseError(message: string): boolean {
 // ---------------------------------------------------------------------------
 
 async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, plan: RefinementPlan): Promise<void> {
+  // Re-assert this task's branch before touching the repo — the scheduler
+  // round-robins role-steps across tasks sharing this repo, so another task's
+  // step may have switched branches since this one last ran.
+  task = ensureTaskBranch(task, project);
   const planningDir = project.planning_dir || "PLANNING";
   const role = getRole(project.id, step.role) ?? getRole(null, step.role);
   if (!role || !role.system_prompt) {
@@ -858,7 +933,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     return data;
   };
 
-  publish(task.task_id, "role_start", { role: step.role, depth: step.depth });
+  publish(task.task_id, "role_start", { role: step.role, depth: step.depth, model: modelId });
 
   let result;
   const ac = new AbortController();
@@ -925,7 +1000,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       );
     }
 
-    publish(task.task_id, "role_end", { role: step.role, error: true, aborted });
+    publish(task.task_id, "role_end", { role: step.role, error: true, aborted, model: modelId });
     createRoleRun({
       task_id: task.task_id,
       role_key: step.role,
@@ -989,13 +1064,21 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     maybeDistillQuestions(task, project, run.id, findings.open_questions, routerCfg);
   }
 
-  // Append the section to the artifact + commit.
+  // Append the section to the artifact + commit. On success, the resulting
+  // commit is this run's checkpoint — restore resets task.git_branch to it.
   appendArtifactSection(absArtifact, findings.section_md);
-  commitArtifacts(
+  const committed = commitArtifacts(
     project.repo_path,
     [relArtifact],
     refineCommitMessage(step.role, task.name ?? task.task_id, findings.summary),
   );
+  if (committed) {
+    try {
+      setRoleRunCommitSha(run.id, headSha(project.repo_path));
+    } catch (err) {
+      console.warn(`[git] could not read checkpoint SHA for run ${run.id}: ${(err as Error).message}`);
+    }
+  }
 
   // Roll coverage up.
   const coverage = rollupCoverage(task.task_id);
@@ -1007,6 +1090,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     fallback: result.fallback,
     stopReason: result.stopReason,
     tokens: result.tokens,
+    model: result.model,
   });
 
   // ---- Adversarial critique + orchestrator second review ----
@@ -1897,7 +1981,21 @@ async function applyGate(
         }
       }
       if ((level === "epic" || level === "story") && roleCfg?.can_create_subtasks) {
+        // Runs before the base-branch checkout below: each child gets its own
+        // branch created off base, which would otherwise leave the repo on the
+        // last child's branch instead of back where the parent task started.
         createDecompositionChildren(task, project);
+      }
+    }
+    // Accepted — return the repo to the branch the task started from. The task
+    // branch is left in place, untouched, for reference; nothing is merged.
+    if (task.git_base_branch) {
+      try {
+        checkoutBranch(project.repo_path, task.git_base_branch);
+      } catch (err) {
+        console.warn(
+          `[git] could not return to base branch "${task.git_base_branch}" after accepting ${task.task_id.slice(0, 8)}: ${(err as Error).message}`,
+        );
       }
     }
     publish(task.task_id, "task_update", { stage: "ready" });
@@ -1937,7 +2035,7 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
 
   for (const node of parseDecompositionTree(decomp.output_md)) {
     // Seed content from the bullet text so the triage role has grounding.
-    const child = createTask({
+    let child = createTask({
       name: node.name,
       content: node.name,
       project_id: task.project_id,
@@ -1950,6 +2048,9 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
       step_number: step++,
       status: "active",
     });
+    // Same isolated-branch treatment as top-level intake — a decomposition
+    // child is its own checkpointable task, not a continuation of the parent's.
+    child = ensureTaskBranch(child, project);
 
     // Write a minimal intake artifact so the child follows the normal pipeline.
     const artName = artifactName(child);
@@ -1981,19 +2082,203 @@ function pickNextTask(): { task: TaskRow; project: ProjectRow } | undefined {
 }
 
 /**
- * Serialize every tick — the scheduler loop AND manual /api/tick calls funnel
- * through one chain so no two role steps ever run concurrently (single-worker
- * sequential semantics, regardless of caller).
+ * Serialize every tick — the scheduler loop, manual /api/tick calls, and
+ * checkpoint restores all funnel through one chain so no two role steps (or a
+ * step and a restore) ever run concurrently (single-worker sequential
+ * semantics, regardless of caller).
  */
 let tickChain: Promise<void> = Promise.resolve();
 
-export function tick(): Promise<boolean> {
-  let result = false;
+function serialize<T>(fn: () => Promise<T>): Promise<T> {
+  let result: T;
   const run = tickChain.then(async () => {
-    result = await tickOnce();
+    result = await fn();
   });
   tickChain = run.catch(() => {});
-  return run.then(() => result);
+  return run.then(() => result!);
+}
+
+export function tick(): Promise<boolean> {
+  return serialize(() => tickOnce());
+}
+
+/**
+ * Roll a task back to the checkpoint left by one of its primary role runs:
+ * hard-resets the task's branch to that run's commit, discards every role_run
+ * (and unconsumed intervention) recorded after it, and recomputes the plan's
+ * step statuses from what survives — so the task resumes right after the
+ * restored-to role, as if everything after it never happened.
+ *
+ * Serialized through `tickChain` so a restore can never race a concurrent
+ * scheduler tick mutating the same task's plan/branch.
+ */
+export function restoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
+  return serialize(() => doRestoreCheckpoint(taskId, roleRunId));
+}
+
+async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
+  const run = getRoleRun(roleRunId);
+  if (!run || run.task_id !== taskId) throw new Error("checkpoint not found for this task");
+  if (run.run_kind !== "primary") throw new Error("can only restore to a primary role run");
+  if (!run.git_commit_sha) throw new Error("this run has no checkpoint commit to restore to");
+
+  const task = getTask(taskId);
+  if (!task) throw new Error("task not found");
+  if (!task.git_branch) throw new Error("task has no checkpoint branch to restore");
+  const project = task.project_id != null ? getProject(task.project_id) : undefined;
+  if (!project) throw new Error("project not found for task");
+
+  checkoutBranch(project.repo_path, task.git_branch);
+  resetHardTo(project.repo_path, run.git_commit_sha);
+
+  deleteRoleRunsAfter(taskId, run.id);
+  deleteUnconsumedInterventionsAfter(taskId, run.created_at);
+
+  // Recompute step status/attempts from the surviving primary runs rather than
+  // mutating the plan array positionally — robust against loopback re-runs,
+  // which reuse a step entry instead of appending a new one.
+  const survivorCounts = new Map<string, number>();
+  for (const r of listRoleRuns(taskId)) {
+    if (r.run_kind === "primary") survivorCounts.set(r.role_key, (survivorCounts.get(r.role_key) ?? 0) + 1);
+  }
+  const plan = readPlan(task);
+  if (plan) {
+    for (const step of plan.steps) {
+      const count = survivorCounts.get(step.role) ?? 0;
+      step.status = count > 0 ? "done" : "pending";
+      step.attempts = count > 0 ? count - 1 : undefined;
+    }
+  }
+
+  updateTask(taskId, {
+    refinement_plan_json: plan ? JSON.stringify(plan) : null,
+    stage: "refining",
+    exit_state: null,
+    review_reason: null,
+    recap_md: null,
+    paused: 0,
+  });
+
+  createIntervention({
+    task_id: taskId,
+    kind: "restore_checkpoint",
+    payload_json: JSON.stringify({ role_run_id: run.id, role_key: run.role_key }),
+    created_by: "user",
+  });
+
+  publish(taskId, "task_update", { stage: "refining", restored: true });
+}
+
+/**
+ * Auto-reincorporation: called whenever a `question_answer` intervention is
+ * recorded for a task already sitting at `stage: review`. A task still
+ * `refining` doesn't need this — its next role step reads answered questions
+ * as ordinary context (see `answeredQuestions`) with no rollback involved.
+ *
+ * Finds the role_run whose guessed `open_questions` contains a matching
+ * question still marked "assumed", and asks the router (Call Point 5) whether
+ * the human's answer confirms or contradicts that guess:
+ *  - confirms: mark the guess "confirmed" — a silent no-op otherwise, since the
+ *    downstream work built on it is still valid.
+ *  - contradicts: mark it "invalidated" and roll the task back to right after
+ *    that guess via the existing checkpoint-restore machinery, with the real
+ *    answer injected as a steer note for the re-run.
+ *
+ * Only ever restores the ONE task the question belongs to — per-project
+ * decomposition children spawned off this task are left untouched, just
+ * flagged (`markChildrenStale`) for a human to triage.
+ *
+ * Serialized through `tickChain` so this can never race a scheduler tick or a
+ * manual restore mutating the same task.
+ */
+export function reincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
+  return serialize(() => doReincorporateAnswer(taskId, question, answer));
+}
+
+async function doReincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
+  const task = getTask(taskId);
+  if (!task || task.stage !== "review") return; // manual restore required first once "ready"
+  const project = task.project_id != null ? getProject(task.project_id) : undefined;
+  if (!project) return;
+
+  const routerCfg = getRouterCfg(project);
+  if (!routerCfg?.answerReincorporation) return;
+
+  const norm = question.trim().toLowerCase();
+  if (!norm) return;
+
+  // Most-recent-first: a re-asked question resolves against its latest guess.
+  const runs = listRoleRuns(taskId);
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const run = runs[i]!;
+    const questions = parseOpenQuestions(run.open_questions_json);
+    const idx = questions.findIndex(
+      (q) => q.resolved === "assumed" && q.question.trim().toLowerCase() === norm,
+    );
+    if (idx === -1) continue;
+
+    const guess = questions[idx]!;
+    const { modelId } = resolveConnectionForModel(task.model || project.default_model || null, project.id);
+
+    let matches: boolean;
+    try {
+      const assessment = await assessAnswerMatch(
+        { question: guess.question, assumedAnswer: guess.assumed_answer, confidence: guess.confidence, humanAnswer: answer },
+        roleRunner,
+        project.repo_path,
+        project.planning_dir || "PLANNING",
+        modelId,
+      );
+      matches = assessment.decision === "confirms";
+    } catch (err) {
+      console.warn(
+        `[orchestrator] answer-match assessment failed for task ${taskId.slice(0, 8)}: ${(err as Error).message}`,
+      );
+      matches = false; // never silently keep a possibly-wrong guess on assessment failure
+    }
+
+    questions[idx] = { ...guess, resolved: matches ? "confirmed" : "invalidated" };
+    setRoleRunOpenQuestions(run.id, JSON.stringify(questions));
+
+    if (!matches && run.git_commit_sha) {
+      // Restore FIRST — it discards every unconsumed intervention created after
+      // this run (including the very question_answer that triggered this), so
+      // the corrected-answer steer note must be created only after it settles.
+      await doRestoreCheckpoint(taskId, run.id);
+      createIntervention({
+        task_id: taskId,
+        kind: "steer_note",
+        payload_json: JSON.stringify({
+          text:
+            `[auto-reincorporation] "${guess.question}" was answered "${answer}", which contradicts ` +
+            `the earlier guess ("${guess.assumed_answer || "(no guess recorded)"}"). Use the corrected ` +
+            `answer, not the earlier guess.`,
+        }),
+        created_by: "router",
+      });
+      markChildrenStale(task, run.role_key);
+    }
+    return;
+  }
+}
+
+/**
+ * Flag any already-spawned decomposition children of `task` as possibly stale
+ * after an auto-restore invalidated an assumption `raisingRole` made — most
+ * relevant when that role was the `decomposition` step itself, since children
+ * are independent tasks with no dependency edge back to the parent's plan, so
+ * they can't be rolled back automatically. Surfaced for human triage only; see
+ * client's stale-child banner.
+ */
+function markChildrenStale(task: TaskRow, raisingRole: string): void {
+  const children = listTasks({ parentTaskId: task.task_id });
+  if (!children.length) return;
+  for (const child of children) {
+    updateTask(child.task_id, {
+      stale_reason: `Parent task's "${raisingRole}" assumption changed after a later answer — re-check this child is still accurate.`,
+    });
+    publish(child.task_id, "task_update", { stage: child.stage, stale: true });
+  }
 }
 
 /** Do one unit of work. Returns true if work was performed (caller loops fast). */

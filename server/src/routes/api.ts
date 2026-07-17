@@ -70,6 +70,8 @@ import {
   artifactName,
   isSchedulerRunning,
   isSchedulerStopping,
+  reincorporateAnswer,
+  restoreCheckpoint,
   startScheduler,
   stopScheduler,
   tick,
@@ -747,6 +749,24 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     return { task: updated };
   });
 
+  // Restore a task to the checkpoint left by one of its role runs — discards
+  // every run after it and resets the branch/plan/task state to that point.
+  app.post("/api/tasks/:id/restore", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "task not found");
+
+    const body = (req.body ?? {}) as { role_run_id?: number };
+    if (typeof body.role_run_id !== "number") return bad(reply, 400, "role_run_id is required");
+
+    try {
+      await restoreCheckpoint(taskId, body.role_run_id);
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
+    return taskDetail(taskId);
+  });
+
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.
   app.post("/api/projects/:id/intake", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
@@ -990,7 +1010,23 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       kind: body.kind,
       payload_json: body.payload ? JSON.stringify(body.payload) : null,
     });
-    return { intervention: iv };
+    // A question_answer on a task already in review has no scheduler pass
+    // coming to consume it (pickNextTask only selects intake/refining tasks) —
+    // trigger reincorporation directly so answering a question there isn't a
+    // silent no-op. No-ops itself if the router's answerReincorporation call
+    // point is disabled, the task isn't at stage:review, or the question
+    // doesn't match a recorded guess.
+    if (body.kind === "question_answer" && task.stage === "review") {
+      const p = (body.payload ?? {}) as { question?: string; answer?: string };
+      if (p.question && p.answer) {
+        try {
+          await reincorporateAnswer(task.task_id, p.question, p.answer);
+        } catch (err) {
+          console.warn(`[api] reincorporateAnswer failed: ${(err as Error).message}`);
+        }
+      }
+    }
+    return { intervention: iv, task: getTask(task.task_id) };
   });
 
   // ---- Agent Networks (visual flow templates) ----
@@ -1662,6 +1698,36 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     return { stats };
   });
 
+  // ---- Ping single model config — returns health status for one config ----
+  app.get("/api/ping-model/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as Record<string, string>).id);
+    if (!id || isNaN(id)) return bad(reply, 400, "Missing or invalid :id");
+    const cfg = getConfigById(id);
+    if (!cfg) return bad(reply, 404, "Config not found");
+
+    const baseUrl = (cfg.base_url ?? "").trim();
+    if (!baseUrl) {
+      return { config_id: id, available: false, error: "No base URL configured" };
+    }
+
+    try {
+      const url = baseUrl.replace(/\/+$/, "") + "/models";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8_000);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const apiKey = cfg.api_key?.trim();
+      const envKey = envTokenForModel(cfg.name);
+      const authKey = apiKey || envKey;
+      if (authKey) headers.Authorization = `Bearer ${authKey}`;
+      const res = await fetch(url, { headers, signal: controller.signal });
+      clearTimeout(timer);
+      return { config_id: id, available: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+    } catch (err) {
+      const msg = (err as Error).message;
+      return { config_id: id, available: false, error: msg === "This operation was aborted" ? "aborted" : msg };
+    }
+  });
+
   // ---- Ping network: SSE stream — sends full list immediately, then updates as each ping returns ----
   app.get("/api/ping-network/stream", async (req: FastifyRequest, reply: FastifyReply) => {
     const configs = listModelConfigs();
@@ -1684,6 +1750,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         config_id: cfg.id,
         name: cfg.name ?? cfg.key,
         base_url: (cfg.base_url ?? "").trim(),
+        location: locationLabel(cfg.base_url),
       })),
     });
 
@@ -1715,10 +1782,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
           error: res.ok ? undefined : `HTTP ${res.status}`,
         });
       } catch (err) {
+        const msg = (err as Error).message;
         send("result", {
           config_id: cfg.id,
           available: false,
-          error: (err as Error).message,
+          error: msg === "This operation was aborted" ? "aborted" : msg,
         });
       }
     });

@@ -245,6 +245,19 @@ export function initDb(): void {
   // Links a "decompose question" child task back to the question that spawned it.
   addColumnIfMissing(d, "tasks", "origin_role_key", "origin_role_key TEXT");
   addColumnIfMissing(d, "tasks", "origin_question", "origin_question TEXT");
+  // Checkpointing: the task's dedicated git branch, and the branch to return to
+  // once the task is accepted.
+  addColumnIfMissing(d, "tasks", "git_branch", "git_branch TEXT");
+  addColumnIfMissing(d, "tasks", "git_base_branch", "git_base_branch TEXT");
+  // Lazily captured the first time a task in this project needs a branch —
+  // whatever branch was checked out at that moment.
+  addColumnIfMissing(d, "projects", "main_branch", "main_branch TEXT");
+  // The commit created immediately after this primary run's artifact commit —
+  // the checkpoint that "restore" resets the task's branch back to.
+  addColumnIfMissing(d, "role_runs", "git_commit_sha", "git_commit_sha TEXT");
+  // Set on a decomposition child when a later answer invalidates a guess its
+  // parent task made — flagged for human triage, never cleared automatically.
+  addColumnIfMissing(d, "tasks", "stale_reason", "stale_reason TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -272,6 +285,7 @@ export interface ProjectRow {
   default_model: string | null;
   default_provider: string | null;
   config_json: string | null;
+  main_branch: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -322,6 +336,9 @@ export interface TaskRow {
   network_id: string | null;
   origin_role_key: string | null;
   origin_question: string | null;
+  git_branch: string | null;
+  git_base_branch: string | null;
+  stale_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -378,6 +395,7 @@ export interface RoleRunRow {
   depth: number;
   model: string | null;
   tokens: number | null;
+  git_commit_sha: string | null;
   created_at: string;
 }
 
@@ -459,6 +477,7 @@ const PROJECT_UPDATABLE = new Set([
   "default_model",
   "default_provider",
   "config_json",
+  "main_branch",
 ]);
 
 export function updateProject(id: number, fields: Record<string, unknown>): ProjectRow | undefined {
@@ -817,6 +836,9 @@ const TASK_UPDATABLE = new Set([
   "recap_md",
   "paused",
   "network_id",
+  "git_branch",
+  "git_base_branch",
+  "stale_reason",
 ]);
 
 export function updateTask(
@@ -985,11 +1007,35 @@ export function listRoleRuns(taskId: string): RoleRunRow[] {
     .all(taskId) as RoleRunRow[];
 }
 
+export function getRoleRun(id: number): RoleRunRow | undefined {
+  return getDb().prepare(`SELECT * FROM role_runs WHERE id = ?`).get(id) as RoleRunRow | undefined;
+}
+
 /** Critique/second-review runs recorded against a specific primary run. */
 export function listCritiquesForRun(runId: number): RoleRunRow[] {
   return getDb()
     .prepare(`SELECT * FROM role_runs WHERE target_run_id = ? ORDER BY id ASC`)
     .all(runId) as RoleRunRow[];
+}
+
+/** Record the checkpoint commit created right after a primary run's artifact commit. */
+export function setRoleRunCommitSha(id: number, sha: string): void {
+  getDb().prepare(`UPDATE role_runs SET git_commit_sha = ? WHERE id = ?`).run(sha, id);
+}
+
+/** Update a run's open_questions_json — used to mark a guess "confirmed"/"invalidated"
+ *  once a human's later answer has been compared against it. */
+export function setRoleRunOpenQuestions(id: number, openQuestionsJson: string): void {
+  getDb().prepare(`UPDATE role_runs SET open_questions_json = ? WHERE id = ?`).run(openQuestionsJson, id);
+}
+
+/**
+ * Checkpoint restore: drop every role_runs row (primary, critique, second_review)
+ * created after the checkpoint being restored to. Ids are creation-ordered, so
+ * `id > id` captures everything that happened after it regardless of run_kind.
+ */
+export function deleteRoleRunsAfter(taskId: string, id: number): void {
+  getDb().prepare(`DELETE FROM role_runs WHERE task_id = ? AND id > ?`).run(taskId, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1081,14 @@ export function listInterventions(taskId: string): InterventionRow[] {
 
 export function markInterventionConsumed(id: number): void {
   getDb().prepare(`UPDATE interventions SET consumed_at = ? WHERE id = ?`).run(now(), id);
+}
+
+/** Checkpoint restore: discard unconsumed interventions from after the checkpoint
+ *  so they can't fire against a plan/run history that no longer exists. */
+export function deleteUnconsumedInterventionsAfter(taskId: string, createdAt: string): void {
+  getDb()
+    .prepare(`DELETE FROM interventions WHERE task_id = ? AND consumed_at IS NULL AND created_at > ?`)
+    .run(taskId, createdAt);
 }
 
 // ---------------------------------------------------------------------------
