@@ -136,7 +136,10 @@ export async function discoverModels(): Promise<string[]> {
     if (!res.ok) return [];
     const data = (await res.json()) as { data?: Array<{ id?: string }> } | Array<{ id?: string }>;
     const list = Array.isArray(data) ? data : (data.data ?? []);
-    return list.map((m) => m.id).filter((id): id is string => typeof id === "string");
+    return list
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === "string")
+      .map((id) => id.replace(/^.*[/\\]/, ""));
   } catch {
     return [];
   }

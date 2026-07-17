@@ -171,7 +171,10 @@ async function discoverModelsFrom(baseUrl: string, apiKey?: string): Promise<str
     if (!res.ok) return [];
     const data = (await res.json()) as { data?: Array<{ id?: string }> } | Array<{ id?: string }>;
     const list = Array.isArray(data) ? data : (data.data ?? []);
-    return list.map((m) => m.id).filter((id): id is string => typeof id === "string");
+    return list
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === "string")
+      .map((id) => id.replace(/^.*[/\\]/, ""));
   } catch {
     return [];
   }
@@ -863,7 +866,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       const network = getNetworkByIntakeKind(project.id, "question");
       const digest = buildQuestionDigest(parent, body.role_key, body.question);
       const question = body.question;
-      const name = `Q: ${question.length > 70 ? `${question.slice(0, 70)}…` : question}`;
+      const words = question.split(/\s+/);
+      const shortTitle = words.slice(0, 6).join(" ");
+      const name = `Q: ${shortTitle}${words.length > 6 ? "…" : ""}`;
 
       const child = createTask({
         name,
@@ -1215,22 +1220,35 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     num_experts?: number;
     active_per_token?: number;
   }> = [
-    // OpenAI (dense)
+    // ── OpenAI ── GPT-4 figures are the SemiAnalysis/leaked-architecture consensus
+    // (1.8T total, 16 experts x ~111B, 2 routed + ~55B shared attention ≈ 280B active).
+    // Everything past GPT-4 is undisclosed; reusing the GPT-4 estimate is a placeholder,
+    // not a verified figure.
+    { pattern: "gpt-5.1-nano", total_b: 8 },
+    { pattern: "gpt-5-nano", total_b: 8 },
+    { pattern: "gpt-5.1-mini", total_b: 80 },
+    { pattern: "gpt-5-mini", total_b: 80 },
+    { pattern: "gpt-5.1", total_b: 1800, active_b: 460 },
+    { pattern: "gpt-5", total_b: 1800, active_b: 460 },
     { pattern: "gpt-4.1-nano", total_b: 8 },
     { pattern: "gpt-4.1-mini", total_b: 70 },
-    { pattern: "gpt-4.1", total_b: 1760, active_b: 440 },
+    { pattern: "gpt-4.1", total_b: 1760, active_b: 280 },
     { pattern: "gpt-4o-mini", total_b: 8 },
-    { pattern: "gpt-4o", total_b: 1760, active_b: 440 },
-    { pattern: "gpt-4-turbo", total_b: 1760, active_b: 440 },
+    { pattern: "gpt-4o", total_b: 1760, active_b: 280 },
+    { pattern: "gpt-4-turbo", total_b: 1760, active_b: 280 },
+    { pattern: "gpt-4", total_b: 1760, active_b: 280, num_experts: 16, active_per_token: 2 },
     { pattern: "gpt-3.5-turbo", total_b: 20 },
-    { pattern: "o4-mini", total_b: 20 },
-    { pattern: "o3-mini", total_b: 20 },
     { pattern: "o1-mini", total_b: 20 },
-    { pattern: "o1", total_b: 1760, active_b: 440 },
-    { pattern: "o3", total_b: 1760, active_b: 440 },
-    { pattern: "o4", total_b: 1760, active_b: 440 },
-    // Anthropic (dense)
+    { pattern: "o3-mini", total_b: 20 },
+    { pattern: "o4-mini", total_b: 20 },
+    { pattern: "o1", total_b: 1760, active_b: 280 },
+    { pattern: "o3", total_b: 1760, active_b: 280 },
+    { pattern: "o4", total_b: 1760, active_b: 280 },
+
+    // ── Anthropic ── Undisclosed; order-of-magnitude placeholders only (public
+    // estimates for these range from ~20B to several trillion depending on source).
     { pattern: "claude-opus-4", total_b: 2000 },
+    { pattern: "claude-sonnet-4.5", total_b: 1000 },
     { pattern: "claude-sonnet-4", total_b: 1000 },
     { pattern: "claude-haiku-4", total_b: 200 },
     { pattern: "claude-3.5-sonnet", total_b: 1000 },
@@ -1238,23 +1256,34 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "claude-3-opus", total_b: 2000 },
     { pattern: "claude-3-sonnet", total_b: 1000 },
     { pattern: "claude-3-haiku", total_b: 200 },
-    // Google (dense)
+
+    // ── Google Gemini ── Undisclosed; placeholders.
+    { pattern: "gemini-3-pro", total_b: 2000 },
+    { pattern: "gemini-3-flash", total_b: 300 },
     { pattern: "gemini-2.5-pro", total_b: 2000 },
     { pattern: "gemini-2.5-flash", total_b: 200 },
     { pattern: "gemini-2.0-flash", total_b: 100 },
     { pattern: "gemini-1.5-pro", total_b: 1000 },
     { pattern: "gemini-1.5-flash", total_b: 100 },
-    // DeepSeek (MoE)
-    { pattern: "deepseek-v4", total_b: 1600, active_b: 49, num_experts: 256, active_per_token: 8 },
+
+    // ── DeepSeek (MoE) ──
+    { pattern: "deepseek-v4-pro", total_b: 1600, active_b: 49 },
+    { pattern: "deepseek-v4-flash", total_b: 284, active_b: 13 },
+    { pattern: "deepseek-v4", total_b: 1600, active_b: 49 },
     { pattern: "deepseek-r1", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
     { pattern: "deepseek-v3", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
+    { pattern: "deepseek-v2-lite", total_b: 16, active_b: 2.4, num_experts: 64, active_per_token: 6 },
+    { pattern: "deepseek-v2", total_b: 236, active_b: 21, num_experts: 160, active_per_token: 6 },
+    { pattern: "deepseek-coder-v2-lite", total_b: 16, active_b: 2.4, num_experts: 64, active_per_token: 6 },
     { pattern: "deepseek-coder-v2", total_b: 236, active_b: 21, num_experts: 160, active_per_token: 6 },
     { pattern: "deepseek-chat", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
     { pattern: "deepseek-reasoner", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
-    // Meta — Llama 4 (MoE)
+
+    // ── Meta — Llama 4 (MoE) ──
+    { pattern: "llama-4-behemoth", total_b: 2000, active_b: 288, num_experts: 16, active_per_token: 1 },
     { pattern: "llama-4-maverick", total_b: 400, active_b: 17, num_experts: 128, active_per_token: 1 },
     { pattern: "llama-4-scout", total_b: 109, active_b: 17, num_experts: 16, active_per_token: 1 },
-    // Meta — Llama 3 (dense)
+    // ── Meta — Llama 3 (dense) ──
     { pattern: "llama-3.3-70b", total_b: 70 },
     { pattern: "llama-3.1-405b", total_b: 405 },
     { pattern: "llama-3.1-70b", total_b: 70 },
@@ -1263,46 +1292,197 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "llama-3.2-11b", total_b: 11 },
     { pattern: "llama-3.2-3b", total_b: 3 },
     { pattern: "llama-3.2-1b", total_b: 1 },
-    // Mistral — Mixtral (MoE)
+    { pattern: "llama-3-70b", total_b: 70 },
+    { pattern: "llama-3-8b", total_b: 8 },
+    { pattern: "llama-2-70b", total_b: 70 },
+    { pattern: "llama-2-13b", total_b: 13 },
+    { pattern: "llama-2-7b", total_b: 7 },
+    { pattern: "codellama-70b", total_b: 70 },
+    { pattern: "codellama-34b", total_b: 34 },
+    { pattern: "codellama-13b", total_b: 13 },
+    { pattern: "codellama-7b", total_b: 7 },
+
+    // ── Mistral — Large 3 / Mixtral (MoE) ──
+    { pattern: "mistral-large-3", total_b: 675, active_b: 41 },
     { pattern: "mixtral-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
     { pattern: "mixtral-8x7b", total_b: 46.7, active_b: 12.9, num_experts: 8, active_per_token: 2 },
-    // Mistral (dense)
-    { pattern: "mistral-large", total_b: 123 },
+    // ── Mistral (dense) ──
+    { pattern: "mistral-large-2", total_b: 123 },
+    { pattern: "mistral-large", total_b: 675, active_b: 41 },
     { pattern: "mistral-medium", total_b: 70 },
-    { pattern: "mistral-small", total_b: 22 },
+    { pattern: "ministral-14b", total_b: 14 },
+    { pattern: "ministral-8b", total_b: 8 },
+    { pattern: "ministral-3b", total_b: 3 },
+    { pattern: "mistral-small-3", total_b: 24 },
+    { pattern: "mistral-small", total_b: 24 },
+    { pattern: "mistral-nemo", total_b: 12 },
+    { pattern: "pixtral-large", total_b: 123 },
+    { pattern: "pixtral", total_b: 12 },
     { pattern: "codestral", total_b: 22 },
-    // Qwen (dense)
+    { pattern: "mistral-7b", total_b: 7 },
+
+    // ── Qwen 3.5 (MoE, 2026) ──
+    { pattern: "qwen3.5-397b", total_b: 397, active_b: 17, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3.5-122b", total_b: 122, active_b: 10 },
+    { pattern: "qwen3.5-35b", total_b: 35, active_b: 3 },
+    { pattern: "qwen3.5-27b", total_b: 27 },
+    { pattern: "qwen3.5", total_b: 397, active_b: 17, num_experts: 128, active_per_token: 8 },
+    // ── Qwen 3 ──
+    { pattern: "qwen3-235b", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3-30b-a3b", total_b: 30, active_b: 3, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3-32b", total_b: 32 },
+    { pattern: "qwen3-14b", total_b: 14 },
+    { pattern: "qwen3-8b", total_b: 8 },
+    { pattern: "qwen3-4b", total_b: 4 },
+    { pattern: "qwen3-1.7b", total_b: 1.7 },
+    { pattern: "qwen3-0.6b", total_b: 0.6 },
+    { pattern: "qwen3", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
+    // ── Qwen 2.5 ──
     { pattern: "qwen2.5-max", total_b: 72 },
     { pattern: "qwen2.5-72b", total_b: 72 },
     { pattern: "qwen2.5-32b", total_b: 32 },
     { pattern: "qwen2.5-14b", total_b: 14 },
     { pattern: "qwen2.5-7b", total_b: 7 },
-    // Qwen MoE
-    { pattern: "qwen2.5-57b-a14b", total_b: 57, active_b: 14, num_experts: 16, active_per_token: 4 },
-    { pattern: "qwen3", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
-    // Qwen QwQ (reasoning, dense)
+    { pattern: "qwen2.5-3b", total_b: 3 },
+    { pattern: "qwen2.5-1.5b", total_b: 1.5 },
+    { pattern: "qwen2.5-0.5b", total_b: 0.5 },
+    // ── Qwen 2 (dense + MoE) ──
+    { pattern: "qwen2-57b-a14b", total_b: 57, active_b: 14, num_experts: 16, active_per_token: 4 },
+    { pattern: "qwen2-72b", total_b: 72 },
+    { pattern: "qwen2-7b", total_b: 7 },
+    { pattern: "qwen2-1.5b", total_b: 1.5 },
+    { pattern: "qwen2-0.5b", total_b: 0.5 },
+    // ── Qwen QwQ (reasoning, dense) ──
     { pattern: "qwq-32b", total_b: 32 },
-    // DBRX (Databricks, MoE)
+
+    // ── Google Gemma ──
+    { pattern: "gemma-4-26b", total_b: 26, active_b: 4, num_experts: 8, active_per_token: 1 },
+    { pattern: "gemma-4-31b", total_b: 31 },
+    { pattern: "gemma-4-e4b", total_b: 4.5 },
+    { pattern: "gemma-4-e2b", total_b: 2.3 },
+    { pattern: "gemma-4", total_b: 31 },
+    { pattern: "gemma-3-27b", total_b: 27 },
+    { pattern: "gemma-3-12b", total_b: 12 },
+    { pattern: "gemma-3-4b", total_b: 4 },
+    { pattern: "gemma-3-1b", total_b: 1 },
+    { pattern: "gemma-2-27b", total_b: 27 },
+    { pattern: "gemma-2-9b", total_b: 9 },
+    { pattern: "gemma-2-2b", total_b: 2 },
+    { pattern: "gemma-7b", total_b: 7 },
+    { pattern: "gemma-2b", total_b: 2 },
+    { pattern: "codegemma", total_b: 7 },
+
+    // ── Microsoft Phi ──
+    { pattern: "phi-3.5-moe", total_b: 42, active_b: 6.6, num_experts: 16, active_per_token: 2 },
+    { pattern: "phi-3.5-mini", total_b: 3.8 },
+    { pattern: "phi-3.5-vision", total_b: 4.2 },
+    { pattern: "phi-3-medium", total_b: 14 },
+    { pattern: "phi-3-small", total_b: 7 },
+    { pattern: "phi-3-mini", total_b: 3.8 },
+    { pattern: "phi-4-mini", total_b: 3.8 },
+    { pattern: "phi-4", total_b: 14 },
+    { pattern: "phi-2", total_b: 2.7 },
+    { pattern: "phi-1", total_b: 1.3 },
+
+    // ── GLM (Zhipu AI / Z.ai) ──
+    { pattern: "glm-5.2", total_b: 744, active_b: 40 },
+    { pattern: "glm-5", total_b: 744, active_b: 40 },
+    { pattern: "glm-4.6", total_b: 355, active_b: 32, num_experts: 160, active_per_token: 8 },
+    { pattern: "glm-4.5-air", total_b: 106, active_b: 12 },
+    { pattern: "glm-4.5", total_b: 355, active_b: 32, num_experts: 160, active_per_token: 8 },
+    { pattern: "glm-4", total_b: 130 },
+
+    // ── Yi (01.AI) ──
+    { pattern: "yi-1.5-34b", total_b: 34 },
+    { pattern: "yi-1.5-9b", total_b: 9 },
+    { pattern: "yi-1.5-6b", total_b: 6 },
+    { pattern: "yi-34b", total_b: 34 },
+    { pattern: "yi-9b", total_b: 9 },
+    { pattern: "yi-6b", total_b: 6 },
+
+    // ── InternLM (Shanghai AI Lab) ──
+    { pattern: "internlm2-20b", total_b: 20 },
+    { pattern: "internlm2-7b", total_b: 7 },
+
+    // ── DBRX (Databricks, MoE) ──
     { pattern: "dbrx", total_b: 132, active_b: 36, num_experts: 16, active_per_token: 4 },
-    // Snowflake Arctic (MoE)
+    // ── Snowflake Arctic (MoE) ──
     { pattern: "arctic", total_b: 480, active_b: 17, num_experts: 128, active_per_token: 2 },
-    // AI21 Jamba (MoE)
+    // ── AI21 Jamba (MoE) ──
     { pattern: "jamba-1.5-large", total_b: 398, active_b: 94, num_experts: 8, active_per_token: 2 },
     { pattern: "jamba-1.5-mini", total_b: 52, active_b: 12, num_experts: 8, active_per_token: 2 },
-    // Microsoft Phi MoE
-    { pattern: "phi-3.5-moe", total_b: 42, active_b: 6.6, num_experts: 16, active_per_token: 2 },
-    { pattern: "phi-4", total_b: 14 },
-    // Allen AI OLMoE
-    { pattern: "olmoe-7b", total_b: 7, active_b: 1, num_experts: 64, active_per_token: 8 },
-    // Ornith / OrnithAI
-    { pattern: "ornith-122b", total_b: 122, active_b: 10, num_experts: 16, active_per_token: 2 },
-    { pattern: "ornith-38b", total_b: 38, active_b: 5.5, num_experts: 8, active_per_token: 2 },
-    // xAI
-    { pattern: "grok-3", total_b: 314 },
-    { pattern: "grok-2", total_b: 314 },
-    // Cohere
+
+    // ── Allen AI OLMo ──
+    { pattern: "olmo-2-32b", total_b: 32 },
+    { pattern: "olmo-2-13b", total_b: 13 },
+    { pattern: "olmo-2-7b", total_b: 7 },
+    { pattern: "olmoe", total_b: 7, active_b: 1, num_experts: 64, active_per_token: 8 },
+
+    // ── IBM Granite ──
+    { pattern: "granite-3-8b", total_b: 8 },
+    { pattern: "granite-3-2b", total_b: 2 },
+
+    // ── BigCode StarCoder2 ──
+    { pattern: "starcoder2-15b", total_b: 15 },
+    { pattern: "starcoder2-7b", total_b: 7 },
+    { pattern: "starcoder2-3b", total_b: 3 },
+    { pattern: "starcoder", total_b: 15.5 },
+
+    // ── TII Falcon (dense) ──
+    { pattern: "falcon-180b", total_b: 180 },
+    { pattern: "falcon-40b", total_b: 40 },
+    { pattern: "falcon-7b", total_b: 7 },
+
+    // ── DeepReinforce Ornith 1.0 ──
+    { pattern: "ornith-1.0-397b", total_b: 397, active_b: 34 },
+    { pattern: "ornith-1.0-35b", total_b: 35, active_b: 3 },
+    { pattern: "ornith-1.0-31b", total_b: 31 },
+    { pattern: "ornith-1.0-9b", total_b: 9 },
+    { pattern: "ornith", total_b: 35, active_b: 3 },
+
+    // ── xAI Grok ── Grok-1 is the only vendor-confirmed figure; 2/3/4 are
+    // rough community estimates (undisclosed).
+    { pattern: "grok-1", total_b: 314, active_b: 86, num_experts: 8, active_per_token: 2 },
+    { pattern: "grok-4", total_b: 3000, active_b: 400 },
+    { pattern: "grok-3", total_b: 2800, active_b: 400 },
+    { pattern: "grok-2", total_b: 300 },
+
+    // ── Cohere ──
+    { pattern: "command-a", total_b: 111 },
     { pattern: "command-r-plus", total_b: 104 },
     { pattern: "command-r", total_b: 35 },
+    { pattern: "aya-expanse-32b", total_b: 32 },
+    { pattern: "aya-expanse-8b", total_b: 8 },
+    { pattern: "aya-23-35b", total_b: 35 },
+    { pattern: "aya-23-8b", total_b: 8 },
+
+    // ── Small / local-friendly models ──
+    { pattern: "solar-10.7b", total_b: 10.7 },
+    { pattern: "stablelm-2", total_b: 1.6 },
+    { pattern: "smollm2-1.7b", total_b: 1.7 },
+    { pattern: "smollm2-360m", total_b: 0.36 },
+    { pattern: "smollm2-135m", total_b: 0.135 },
+    { pattern: "tinyllama", total_b: 1.1 },
+    { pattern: "minicpm3-4b", total_b: 4 },
+    { pattern: "minicpm", total_b: 2.4 },
+    { pattern: "baichuan2-13b", total_b: 13 },
+    { pattern: "baichuan2-7b", total_b: 7 },
+    { pattern: "chatglm3-6b", total_b: 6 },
+    { pattern: "exaone-3.5-32b", total_b: 32 },
+    { pattern: "exaone-3.5-7.8b", total_b: 7.8 },
+    { pattern: "exaone-3.5-2.4b", total_b: 2.4 },
+    { pattern: "exaone", total_b: 7.8 },
+
+    // ── NVIDIA Nemotron ──
+    { pattern: "nemotron-4-340b", total_b: 340 },
+    { pattern: "nemotron", total_b: 70 },
+
+    // ── Fine-tune families that reuse a Mixtral base (MoE) ──
+    { pattern: "wizardlm-2-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
+    { pattern: "wizardlm-2-70b", total_b: 70 },
+    { pattern: "wizardlm-2", total_b: 7 },
+    { pattern: "dolphin-mixtral-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
+    { pattern: "dolphin-mixtral", total_b: 46.7, active_b: 12.9, num_experts: 8, active_per_token: 2 },
   ];
 
   /** Look up a model in the known-sizes table. */

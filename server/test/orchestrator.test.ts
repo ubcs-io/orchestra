@@ -473,4 +473,48 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
     const runs = listRoleRuns(t.task_id);
     expect(runs.filter((r) => r.role_key === "explorer" && r.run_kind === "primary").length).toBe(1);
   });
+
+  it("does not treat a non-reviewer step's own routine \"needs_more\" self-verdict as an adversarial flag", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    // intake_triage reports its own routine "needs_more" self-assessment — an
+    // expected, everyday verdict per the output contract, not a flag. error_file's
+    // reviewDepth is "terminal_only", so critique never even runs on intake_triage.
+    setRoleRunner(async (params) => {
+      const isIntakeTriage = params.systemPrompt.includes("You normalize a raw intake");
+      const verdict: Verdict = isIntakeTriage ? "needs_more" : "pass";
+      return {
+        findings: {
+          verdict,
+          summary: isIntakeTriage ? "scope is a little underspecified, but workable" : "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\n- [epic] Epic\n- [task] implement the fix\n",
+          criteria_results: allMet("error_file"),
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+      };
+    });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    expect(t.exit_state).toBe("ready_for_work");
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.find((r) => r.role_key === "intake_triage")?.verdict).toBe("needs_more");
+    expect(runs.filter((r) => r.role_key === "intake_triage" && r.run_kind === "primary").length).toBe(1);
+    // Only the reviewer step is critiqued under "terminal_only" — intake_triage
+    // never went through the critic.
+    expect(runs.filter((r) => r.role_key === "critic").length).toBe(1);
+  });
 });

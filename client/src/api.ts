@@ -571,9 +571,10 @@ export interface ModelStat {
   historical_avg_tokens_per_run: number;
 }
 
-/** Strip GGUF shard suffixes like "-00001-of-00003.gguf" for display purposes. */
+/** Strip leading paths and GGUF shard suffixes like "-00001-of-00003.gguf" for display purposes. */
 export function displayModelName(name: string): string {
-  return name.replace(/-(\d{5})-of-(\d{5})\.gguf$/i, "");
+  const basename = name.replace(/^.*[/\\]/, "");
+  return basename.replace(/-(\d+)-of-(\d+)\.gguf$/i, "");
 }
 
 export const STAGES = ["intake", "refining", "ready", "review"] as const;

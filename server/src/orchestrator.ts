@@ -1028,12 +1028,18 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   let effectiveVerdict: string = findings.verdict;
   let verdictNote: string | undefined;
+  // Whether effectiveVerdict was actually set by the critique/second-review
+  // machinery, as opposed to just carrying forward the primary role's own
+  // self-reported verdict. A plain "needs_more" self-assessment is routine
+  // for a producer role and must not be treated as an adversarial flag.
+  let flaggedByReview = false;
 
   if (shouldCritique) {
     const critique = await runCritiquePass(task, project, step, run, findings);
     if (critique && VERDICT_RANK[critique.verdict]! > VERDICT_RANK[effectiveVerdict]!) {
       effectiveVerdict = critique.verdict;
       verdictNote = `[critic] ${critique.summary}`;
+      flaggedByReview = true;
     }
 
     if (routerCfg?.secondReview) {
@@ -1042,19 +1048,23 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
         case "escalate":
           effectiveVerdict = "blocker";
           verdictNote = `[second review] ${decision.reasoning}`;
+          flaggedByReview = true;
           break;
         case "loopback":
           effectiveVerdict = "needs_more";
           verdictNote = `[second review] ${decision.steer_note || decision.reasoning}`;
+          flaggedByReview = true;
           break;
         case "accept":
           // Authoritative downgrade of a critique false-positive back to the primary verdict.
           effectiveVerdict = findings.verdict;
           verdictNote = undefined;
+          flaggedByReview = false;
           break;
         case "accept_with_note":
           effectiveVerdict = findings.verdict;
           verdictNote = `[second review] ${decision.steer_note || decision.reasoning}`;
+          flaggedByReview = false;
           break;
       }
     }
@@ -1070,7 +1080,18 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   }
 
   // Gate.
-  await applyGate(task, project, plan, step, effectiveVerdict, coverage, findings.criteria_results ?? [], routerCfg, verdictNote);
+  await applyGate(
+    task,
+    project,
+    plan,
+    step,
+    effectiveVerdict,
+    coverage,
+    findings.criteria_results ?? [],
+    routerCfg,
+    verdictNote,
+    flaggedByReview,
+  );
 }
 
 /** Verdict severity ranking used to fold a critique's verdict into the primary
@@ -1610,6 +1631,12 @@ async function applyGate(
    *  orchestrator's second review, a short explanation appended to escalation
    *  reasons and used as the steer note for a non-reviewer-step loop-back. */
   verdictNote?: string,
+  /** True only when `verdict` was actually set by the critique/second-review
+   *  machinery (not just carried forward from the primary role's own
+   *  self-reported verdict). Gates the non-reviewer-step retry/escalate path
+   *  below so a routine "needs_more" self-assessment isn't mistaken for an
+   *  adversarial flag. */
+  flaggedByReview = false,
 ): Promise<void> {
   const planningDir = project.planning_dir || "PLANNING";
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
@@ -1694,7 +1721,7 @@ async function applyGate(
   // flow's static-criteria reviewerRole gate below). Bounded to one retry,
   // distinct from the reviewer's own flow.maxLoopbacks.
   const NON_REVIEWER_CRITIQUE_RETRY_LIMIT = 1;
-  if (verdict === "needs_more" && step.role !== flow.reviewerRole) {
+  if (flaggedByReview && verdict === "needs_more" && step.role !== flow.reviewerRole) {
     const attempts = step.attempts ?? 0;
     if (attempts < NON_REVIEWER_CRITIQUE_RETRY_LIMIT) {
       step.status = "pending";
