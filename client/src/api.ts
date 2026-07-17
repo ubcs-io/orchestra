@@ -44,6 +44,10 @@ export interface RoleRun {
   depth: number;
   model: string | null;
   open_questions_json: string | null;
+  /** The primary run this critiques/second-reviews, if this is not itself a primary run. */
+  target_run_id: number | null;
+  /** "primary" | "critique" | "second_review". */
+  run_kind: string;
   created_at: string;
 }
 
@@ -197,6 +201,9 @@ export interface NetworkNode {
     depth?: number;
   };
   criteria?: NetworkNodeCriterion[];
+  /** Role keys that critique this node's output (groundwork for a future
+   *  all-roles-critique-all-nodes option; today always ["critic"] or unset). */
+  critics?: string[];
 }
 
 export interface NetworkNodeCriterion {
@@ -228,6 +235,10 @@ export interface AgentNetworkGraph {
     maxLoopbacks: number;
     mandatoryConcerns: string[];
     reviewerRole?: string;
+    /** How often the adversarial `critic` role checks a step's output: "none"
+     *  (off), "terminal_only" (at the reviewer step only), "every_step" (after
+     *  every non-exempt producer step). */
+    reviewDepth?: "none" | "terminal_only" | "every_step";
   };
 }
 

@@ -268,6 +268,7 @@ export function NetworkEditor() {
   const [intakeKind, setIntakeKind] = useState("manual");
   const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
   const [maxLoopbacks, setMaxLoopbacks] = useState(2);
+  const [reviewDepth, setReviewDepth] = useState<"none" | "terminal_only" | "every_step">("terminal_only");
   const [snapToGrid, setSnapToGrid] = useState(true);
 
   // Selection state — driven by React Flow's onSelectionChange for full
@@ -355,6 +356,7 @@ export function NetworkEditor() {
     if (parsedGraph) {
       setRigor(parsedGraph.metadata?.rigor ?? "standard");
       setMaxLoopbacks(parsedGraph.metadata?.maxLoopbacks ?? 2);
+      setReviewDepth(parsedGraph.metadata?.reviewDepth ?? "terminal_only");
       setSnapToGrid(parsedGraph.layout?.snapToGrid ?? true);
     }
   }, [currentNetwork, parsedGraph]);
@@ -554,10 +556,11 @@ export function NetworkEditor() {
         maxLoopbacks,
         mandatoryConcerns: parsedGraph?.metadata?.mandatoryConcerns ?? [],
         reviewerRole: parsedGraph?.metadata?.reviewerRole,
+        reviewDepth,
       },
     };
     return JSON.stringify(graph);
-  }, [nodes, edges, snapToGrid, rigor, maxLoopbacks, parsedGraph]);
+  }, [nodes, edges, snapToGrid, rigor, maxLoopbacks, reviewDepth, parsedGraph]);
 
   // --- Save mutation ---
   const saveMutation = useMutation({
@@ -769,6 +772,16 @@ export function NetworkEditor() {
                 disabled={isReadOnly}
               />
             </label>
+            <select
+              value={reviewDepth}
+              onChange={(e) => setReviewDepth(e.target.value as "none" | "terminal_only" | "every_step")}
+              disabled={isReadOnly}
+              title="How often the adversarial critic checks a step's output for a domain violation before the gate runs"
+            >
+              <option value="none">Critique: Off</option>
+              <option value="terminal_only">Critique: Reviewer step only</option>
+              <option value="every_step">Critique: Every step</option>
+            </select>
             <div className="row">
               {!isReadOnly && (
                 <button

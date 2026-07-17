@@ -1145,23 +1145,26 @@ export function TaskDetail() {
             </div>
           )}
 
-          {d.runs.length > 0 && (
-            <div className="row" style={{ marginBottom: 8 }}>
-              <button
-                className="small"
-                onClick={() => {
-                  if (collapsedRuns.size === d.runs.length) {
-                    setCollapsedRuns(new Set());
-                  } else {
-                    setCollapsedRuns(new Set(d.runs.map((r) => r.id)));
-                  }
-                }}
-              >
-                {collapsedRuns.size === d.runs.length ? "expand all" : "collapse all"}
-              </button>
-            </div>
-          )}
-          {d.runs.map((r) => {
+          {(() => {
+            const primaryRuns = d.runs.filter((r) => !r.run_kind || r.run_kind === "primary");
+            return primaryRuns.length > 0 && (
+              <div className="row" style={{ marginBottom: 8 }}>
+                <button
+                  className="small"
+                  onClick={() => {
+                    if (collapsedRuns.size === primaryRuns.length) {
+                      setCollapsedRuns(new Set());
+                    } else {
+                      setCollapsedRuns(new Set(primaryRuns.map((r) => r.id)));
+                    }
+                  }}
+                >
+                  {collapsedRuns.size === primaryRuns.length ? "expand all" : "collapse all"}
+                </button>
+              </div>
+            );
+          })()}
+          {d.runs.filter((r) => !r.run_kind || r.run_kind === "primary").map((r) => {
             const isCollapsed = collapsedRuns.has(r.id);
             const toggle = () =>
               setCollapsedRuns((prev) => {
@@ -1224,6 +1227,26 @@ export function TaskDetail() {
                     <pre className="reasoning-body muted" style={{ whiteSpace: "pre-wrap", overflowWrap: "break-word", fontSize: 12, marginTop: 6 }}>{r.thinking_md}</pre>
                   </details>
                 )}
+                {!isCollapsed && (() => {
+                  const critiques = d.runs.filter((cr) => cr.target_run_id === r.id);
+                  if (!critiques.length) return null;
+                  return (
+                    <div style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--line)" }}>
+                      {critiques.map((cr) => (
+                        <div key={cr.id} className="row" style={{ alignItems: "flex-start", gap: 6, marginBottom: 6 }}>
+                          <span
+                            className="pill dim"
+                            title={cr.run_kind === "second_review" ? "Orchestrator second review" : "Adversarial critique"}
+                          >
+                            {cr.run_kind === "second_review" ? "second review" : "critic"}
+                          </span>
+                          <span className={`pill ${verdictClass(cr.verdict)}`}>{cr.verdict ?? "?"}</span>
+                          {cr.summary && <span className="muted" style={{ fontSize: 13 }}>{cr.summary}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}

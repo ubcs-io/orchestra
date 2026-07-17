@@ -26,7 +26,7 @@ function TaskCard({ task }: { task: Task }) {
     >
       <div className="title">{task.name ?? task.task_id.slice(0, 8)}</div>
       <div className="meta">
-        <span className="pill dim">{task.level}</span>
+        <span className="pill dim">{task.intake_kind ?? task.level}</span>
         <span>{planProgress(task)}</span>
         {task.paused === 1 && <span className="pill warn">paused</span>}
         {task.exit_state && (

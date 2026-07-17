@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Verdict } from "../src/agent";
-import { closeDb, createProject, getTask, listRoleRuns, listTasks, updateTask, type TaskRow } from "../src/db";
+import { closeDb, createProject, getTask, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
@@ -18,10 +18,12 @@ import {
   tick,
 } from "../src/orchestrator";
 import type { RoleRunner } from "../src/orchestrator";
+import { resetRouterFns, setSecondReviewFn } from "../src/router";
 import { freshDb, tempGitRepo } from "./helpers";
 
 afterEach(() => {
   resetRoleRunner();
+  resetRouterFns();
   closeDb();
 });
 
@@ -248,8 +250,10 @@ describe("orchestrator loop (integration)", () => {
     expect(t.intake_kind).toBe("error_file");
     expect(t.stage).toBe("ready");
     expect(t.exit_state).toBe("ready_for_work");
-    // Every planned role ran exactly once (no loop-back).
-    expect(listRoleRuns(t.task_id).length).toBe(ROUTING_TEMPLATES.error_file.length);
+    // Every planned role ran exactly once (no loop-back), plus one adversarial
+    // critique run at the reviewer step (error_file's reviewDepth is "terminal_only").
+    expect(listRoleRuns(t.task_id).length).toBe(ROUTING_TEMPLATES.error_file.length + 1);
+    expect(listRoleRuns(t.task_id).filter((r) => r.role_key === "critic").length).toBe(1);
     // Artifact moved into READY and exists on disk.
     expect(t.artifact_path).toContain("READY");
     expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
@@ -365,5 +369,108 @@ describe("orchestrator loop (integration)", () => {
     expect(first.fallback).toBe(1);
     expect(first.stop_reason).toBe("length");
     expect(first.thinking_md).toBe("the model was thinking hard");
+  });
+});
+
+describe("counter-review overhaul: adversarial critique + second review", () => {
+  it("critiques every non-exempt step when reviewDepth is every_step, linking each critique to its primary run", async () => {
+    const { repo, projectId } = setupProject();
+    // "security" content triggers the security flow, whose reviewDepth is "every_step".
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "security-report.md"), "Reflected XSS in the search box");
+    setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: allMet("security") }));
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.intake_kind).toBe("security");
+    expect(t.stage).toBe("ready");
+
+    const runs = listRoleRuns(t.task_id);
+    const primaryRuns = runs.filter((r) => r.run_kind === "primary");
+    const critiqueRuns = runs.filter((r) => r.run_kind === "critique");
+    // Every step in the flow (including the reviewer and terminal roles) gets
+    // critiqued under "every_step".
+    expect(critiqueRuns.length).toBe(ROUTING_TEMPLATES.security.length);
+    for (const c of critiqueRuns) {
+      expect(c.role_key).toBe("critic");
+      expect(c.target_run_id).not.toBeNull();
+      expect(primaryRuns.some((r) => r.id === c.target_run_id)).toBe(true);
+    }
+  });
+
+  it("escalates when the adversarial critique flags a producer step, even though the flow's reviewer step never ran", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "security-report.md"), "Reflected XSS in the search box");
+    // Every primary run passes; the critique on the "explorer" step alone flags a blocker.
+    setRoleRunner(async (params) => {
+      const isCritique = params.context.includes("Step under review:");
+      const verdict: Verdict = isCritique && params.context.includes("Step under review: explorer") ? "blocker" : "pass";
+      return {
+        findings: {
+          verdict,
+          summary: isCritique ? "critic flags a domain violation" : "pass from producer",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\n- [epic] Epic\n- [task] implement the fix\n",
+          criteria_results: allMet("security"),
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+      };
+    });
+
+    await drainTicks(projectId, (t) => t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_review");
+    expect(t.review_reason).toContain("explorer");
+    const runs = listRoleRuns(t.task_id);
+    // The flow's own reviewer step never had to run — the critique on an
+    // earlier producer step escalated first.
+    expect(runs.some((r) => r.role_key === "security_review_adversary")).toBe(false);
+    expect(runs.filter((r) => r.role_key === "critic" && r.verdict === "blocker").length).toBe(1);
+  });
+
+  it("lets the orchestrator's second review downgrade a critique false-positive back to accept (no loop-back)", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, { config_json: JSON.stringify({ router: { enabled: true, secondReview: true } }) });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "security-report.md"), "Reflected XSS in the search box");
+    setRoleRunner(async (params) => {
+      const isCritique = params.context.includes("Step under review:");
+      const verdict: Verdict = isCritique && params.context.includes("Step under review: explorer") ? "blocker" : "pass";
+      return {
+        findings: {
+          verdict,
+          summary: isCritique ? "critic false alarm" : "pass from producer",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\n- [epic] Epic\n- [task] implement the fix\n",
+          criteria_results: allMet("security"),
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+      };
+    });
+    setSecondReviewFn(async () => ({ decision: "accept", reasoning: "false positive, proceed" }));
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    // The second review downgraded the critique's blocker back to the primary
+    // verdict — the task is not escalated and "explorer" was not re-run.
+    expect(t.stage).toBe("ready");
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.filter((r) => r.role_key === "explorer" && r.run_kind === "primary").length).toBe(1);
   });
 });

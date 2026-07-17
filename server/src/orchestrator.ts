@@ -47,18 +47,22 @@ import {
   CONCERN_TAXONOMY,
   EXIT_KIND_BY_INTAKE,
   flowForIntake,
+  isCritiqueExempt,
   TERMINAL_ROLE,
   type ExitKind,
   type FlowTemplate,
   type IntakeKind,
+  type ReviewDepth,
 } from "./roles.js";
 import {
   runRole as defaultRunRole,
   type CoverageItem,
   type CoverageStatus,
   type CriteriaResult,
+  type RoleFindings,
   type RoleRunResult,
   type RunRoleParams,
+  type Verdict,
 } from "./agent.js";
 import { getConfig } from "./config.js";
 import { resolveConnectionForModel } from "./settings.js";
@@ -67,7 +71,9 @@ import {
   distillQuestions,
   assessEscalation,
   assessBorderline,
+  assessSecondReview,
   type RouterConfig,
+  type SecondReviewResult,
 } from "./router.js";
 
 // ---------------------------------------------------------------------------
@@ -146,6 +152,7 @@ function flowForTask(task: TaskRow): FlowTemplate {
         maxLoopbacks?: number;
         mandatoryConcerns?: string[];
         reviewerRole?: string;
+        reviewDepth?: ReviewDepth;
       };
       nodes?: Array<{
         roleKey: string;
@@ -178,6 +185,7 @@ function flowForTask(task: TaskRow): FlowTemplate {
       criteria: graphCriteria.length > 0 ? graphCriteria : base.criteria,
       mandatoryConcerns: meta.mandatoryConcerns ?? base.mandatoryConcerns,
       maxLoopbacks: meta.maxLoopbacks ?? base.maxLoopbacks,
+      reviewDepth: meta.reviewDepth ?? base.reviewDepth,
     };
   } catch {
     return base;
@@ -1001,8 +1009,155 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     tokens: result.tokens,
   });
 
+  // ---- Adversarial critique + orchestrator second review ----
+  // A high-bar "would I reject a PR for this?" check, separate from the flow's
+  // static-criteria reviewerRole gate. Fires at the reviewer step only
+  // ("terminal_only") or after every non-exempt step ("every_step"), per the
+  // flow's reviewDepth. The critique's own verdict always has teeth (folds into
+  // the effective verdict below, never silently); the optional second-review
+  // call adds an authoritative LLM-mediated synthesis on top when enabled, and
+  // can downgrade a critique false-positive or independently escalate.
+  const flow = flowForTask(task);
+  const isReviewerStep = step.role === flow.reviewerRole;
+  const shouldCritique =
+    flow.reviewDepth === "every_step"
+      ? !isCritiqueExempt(step.role)
+      : flow.reviewDepth === "terminal_only"
+        ? isReviewerStep
+        : false;
+
+  let effectiveVerdict: string = findings.verdict;
+  let verdictNote: string | undefined;
+
+  if (shouldCritique) {
+    const critique = await runCritiquePass(task, project, step, run, findings);
+    if (critique && VERDICT_RANK[critique.verdict]! > VERDICT_RANK[effectiveVerdict]!) {
+      effectiveVerdict = critique.verdict;
+      verdictNote = `[critic] ${critique.summary}`;
+    }
+
+    if (routerCfg?.secondReview) {
+      const decision = await maybeSecondReview(task, project, step, findings, critique, coverage, routerCfg);
+      switch (decision.decision) {
+        case "escalate":
+          effectiveVerdict = "blocker";
+          verdictNote = `[second review] ${decision.reasoning}`;
+          break;
+        case "loopback":
+          effectiveVerdict = "needs_more";
+          verdictNote = `[second review] ${decision.steer_note || decision.reasoning}`;
+          break;
+        case "accept":
+          // Authoritative downgrade of a critique false-positive back to the primary verdict.
+          effectiveVerdict = findings.verdict;
+          verdictNote = undefined;
+          break;
+        case "accept_with_note":
+          effectiveVerdict = findings.verdict;
+          verdictNote = `[second review] ${decision.steer_note || decision.reasoning}`;
+          break;
+      }
+    }
+
+    if (verdictNote) {
+      createIntervention({
+        task_id: task.task_id,
+        kind: "steer_note",
+        payload_json: JSON.stringify({ text: `${verdictNote} (re: ${step.role})` }),
+        created_by: "critic",
+      });
+    }
+  }
+
   // Gate.
-  await applyGate(task, project, plan, step, findings.verdict, coverage, findings.criteria_results ?? [], routerCfg);
+  await applyGate(task, project, plan, step, effectiveVerdict, coverage, findings.criteria_results ?? [], routerCfg, verdictNote);
+}
+
+/** Verdict severity ranking used to fold a critique's verdict into the primary
+ *  one without ever silently downgrading (pass < needs_more < blocker ~ needs_human). */
+const VERDICT_RANK: Record<string, number> = { pass: 0, needs_more: 1, blocker: 2, needs_human: 2 };
+
+/** Pure: scope a critique's context to just the one step's output being judged. */
+function buildCritiqueContext(task: TaskRow, roleKey: string, findings: RoleFindings): string {
+  const parts: string[] = [];
+  parts.push(`# Task: ${task.name ?? task.task_id}`);
+  parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
+  parts.push(`\n## Step under review: ${roleKey}`);
+  parts.push(`- Verdict: ${findings.verdict}`);
+  parts.push(`- Summary: ${findings.summary}`);
+  parts.push(`\n${findings.section_md}`);
+  parts.push(
+    `\n## Your task now\nYou are the **critic**. Judge ONLY this one step's output above — not ` +
+      `the whole task. Would you reject a PR implementing this, because it violates a domain ` +
+      `(security, privacy, legal/compliance, irreversible data safety) so badly that it matters — ` +
+      `not because it could be improved? If yes, set verdict "blocker" (or "needs_human" if ` +
+      `ambiguous but serious) and say concretely why. Otherwise set verdict "pass" — silence is the ` +
+      `expected outcome. Then finish by invoking \`record_findings\` directly as a tool call.`,
+  );
+  return parts.join("\n");
+}
+
+/** Run the adversarial critic role against one step's just-completed output and
+ *  persist it as a `run_kind: "critique"` role_run linked via target_run_id.
+ *  Returns undefined (rather than throwing) if the critic role is missing or the
+ *  call fails — a critique failure must never wedge the primary pipeline. */
+async function runCritiquePass(
+  task: TaskRow,
+  project: ProjectRow,
+  step: PlanStep,
+  run: RoleRunRow,
+  findings: RoleFindings,
+): Promise<{ verdict: Verdict; summary: string } | undefined> {
+  const criticRole = getRole(project.id, "critic") ?? getRole(null, "critic");
+  if (!criticRole || !criticRole.system_prompt) return undefined;
+
+  const tools: string[] = criticRole.tools_json ? (JSON.parse(criticRole.tools_json) as string[]) : [];
+  const modelRef = criticRole.model || task.model || project.default_model || null;
+  const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
+
+  try {
+    const result = await roleRunner({
+      repoPath: project.repo_path,
+      planningDir: project.planning_dir || "PLANNING",
+      artifactAbsPath: "",
+      modelId,
+      systemPrompt: criticRole.system_prompt,
+      tools,
+      context: buildCritiqueContext(task, step.role, findings),
+      thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
+      textMode: connection.textMode,
+      twoPhase: connection.twoPhase,
+      thinkingBudgets: connection.thinkingBudgets,
+      connection,
+      signal: new AbortController().signal,
+    });
+
+    createRoleRun({
+      task_id: task.task_id,
+      role_key: "critic",
+      verdict: result.findings.verdict,
+      summary: result.findings.summary,
+      output_md: result.findings.section_md,
+      coverage_json: JSON.stringify(result.findings.coverage ?? []),
+      tool_calls_json: JSON.stringify(result.toolCalls),
+      transcript_jsonl: result.transcriptJsonl,
+      stop_reason: result.stopReason ?? null,
+      fallback: result.fallback ? 1 : 0,
+      stalled: result.stalled ? 1 : 0,
+      thinking_md: result.thinkingText || null,
+      open_questions_json: JSON.stringify(result.findings.open_questions ?? []),
+      target_run_id: run.id,
+      run_kind: "critique",
+      depth: step.depth,
+      model: result.model,
+      tokens: result.tokens,
+    });
+
+    return { verdict: result.findings.verdict, summary: result.findings.summary };
+  } catch (err) {
+    console.warn(`[orchestrator] critique pass failed for role ${step.role}: ${(err as Error).message}`);
+    return undefined;
+  }
 }
 
 /** Pure: build a context document for the orchestrator recap call. */
@@ -1388,6 +1543,60 @@ async function maybeAssessBorderline(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Call Point 4: Second Review (authoritative synthesis of primary + critique)
+// ---------------------------------------------------------------------------
+
+/**
+ * The orchestrator's own authoritative second opinion on a step, synthesizing
+ * the primary run's verdict with the adversarial critique's verdict (if one
+ * ran). Unlike Call Points 2/3, this is not merely advisory — its decision is
+ * what reaches applyGate, so it can downgrade a critique false-positive back
+ * to "accept" or independently escalate a finding the critique missed.
+ */
+async function maybeSecondReview(
+  task: TaskRow,
+  project: ProjectRow,
+  step: PlanStep,
+  findings: RoleFindings,
+  critique: { verdict: Verdict; summary: string } | undefined,
+  coverage: CoverageMap,
+  routerCfg: RouterConfig,
+): Promise<SecondReviewResult> {
+  const { modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
+
+  try {
+    const result = await assessSecondReview(
+      {
+        taskName: task.name ?? task.task_id.slice(0, 8),
+        intakeKind: task.intake_kind ?? "manual",
+        roleKey: step.role,
+        primaryVerdict: findings.verdict,
+        primarySummary: findings.summary,
+        critiqueVerdict: critique?.verdict,
+        critiqueSummary: critique?.summary,
+        coverageMap: coverage,
+      },
+      roleRunner,
+      project.repo_path,
+      project.planning_dir || "PLANNING",
+      modelId,
+    );
+
+    console.log(
+      `[router] second review for task ${task.task_id.slice(0, 8)} role=${step.role}: ` +
+        `decision=${result.decision} reasoning=${result.reasoning}`,
+    );
+    return result;
+  } catch (err) {
+    console.warn(`[router] second review failed: ${(err as Error).message}`);
+    return { decision: "accept", reasoning: "Second review call failed — accepting the primary verdict as-is." };
+  }
+}
+
 async function applyGate(
   task: TaskRow,
   project: ProjectRow,
@@ -1397,6 +1606,10 @@ async function applyGate(
   coverage: CoverageMap,
   criteriaResults: CriteriaResult[] = [],
   routerCfg: RouterConfig | null = null,
+  /** When the verdict was overridden by the adversarial critique or the
+   *  orchestrator's second review, a short explanation appended to escalation
+   *  reasons and used as the steer note for a non-reviewer-step loop-back. */
+  verdictNote?: string,
 ): Promise<void> {
   const planningDir = project.planning_dir || "PLANNING";
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
@@ -1449,7 +1662,9 @@ async function applyGate(
       );
       if (overridden) return;
     }
-    escalate(`Role ${step.role} flagged an ambiguity requiring human judgement.`);
+    escalate(
+      `Role ${step.role} flagged an ambiguity requiring human judgement.${verdictNote ? ` ${verdictNote}` : ""}`,
+    );
     triggerRecap(coverage, criteriaResults);
     return;
   }
@@ -1467,7 +1682,35 @@ async function applyGate(
       );
       if (overridden) return;
     }
-    escalate(`Role ${step.role} reported a blocker.`);
+    escalate(`Role ${step.role} reported a blocker.${verdictNote ? ` ${verdictNote}` : ""}`);
+    triggerRecap(coverage, criteriaResults);
+    return;
+  }
+
+  const flow = flowForTask(task);
+
+  // Non-reviewer-step critique/second-review loop-back: a producer step whose
+  // output was flagged by the adversarial critique or second review (not the
+  // flow's static-criteria reviewerRole gate below). Bounded to one retry,
+  // distinct from the reviewer's own flow.maxLoopbacks.
+  const NON_REVIEWER_CRITIQUE_RETRY_LIMIT = 1;
+  if (verdict === "needs_more" && step.role !== flow.reviewerRole) {
+    const attempts = step.attempts ?? 0;
+    if (attempts < NON_REVIEWER_CRITIQUE_RETRY_LIMIT) {
+      step.status = "pending";
+      step.attempts = attempts + 1;
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        coverage_json: coverageJson,
+        stage: "refining",
+      });
+      publish(task.task_id, "task_update", { stage: "refining", loopback: attempts + 1 });
+      return;
+    }
+    escalate(
+      `Role ${step.role}'s output was flagged and could not be resolved after ` +
+        `${NON_REVIEWER_CRITIQUE_RETRY_LIMIT} retry.${verdictNote ? ` ${verdictNote}` : ""}`,
+    );
     triggerRecap(coverage, criteriaResults);
     return;
   }
@@ -1475,7 +1718,6 @@ async function applyGate(
   // Counter-reviewer gate: verify prior output against the flow's acceptance
   // criteria. On failure, re-route (bounded loop-back) to the responsible roles;
   // once loop-backs are exhausted, escalate to a human.
-  const flow = flowForTask(task);
   if (step.role === flow.reviewerRole) {
     const statusById = new Map(criteriaResults.map((r) => [r.id, r.status]));
     const unmetMust = flow.criteria.filter(

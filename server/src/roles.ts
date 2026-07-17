@@ -94,6 +94,8 @@ export interface Criterion {
   concern?: string;
 }
 
+export type ReviewDepth = "none" | "terminal_only" | "every_step";
+
 export interface FlowTemplate {
   /** Shared label for a family of intake kinds, e.g. "bug", "security". */
   key: string;
@@ -107,6 +109,11 @@ export interface FlowTemplate {
   mandatoryConcerns: string[];
   /** Loop-back attempts before escalating to human REVIEW. */
   maxLoopbacks: number;
+  /** How often the adversarial `critic` role checks a step's output for a domain
+   *  violation ("would I reject a PR for this?") before the deterministic gate
+   *  runs: "none" (off), "terminal_only" (at the reviewer step only, alongside
+   *  its criteria check), "every_step" (after every non-exempt producer step). */
+  reviewDepth: ReviewDepth;
 }
 
 const BUG_CRITERIA: Criterion[] = [
@@ -161,51 +168,51 @@ const RESEARCH_CRITERIA: Criterion[] = [
 export const FLOW_TEMPLATES: Record<IntakeKind, FlowTemplate> = {
   error_file: {
     key: "bug", rigor: "standard", reviewerRole: "bug_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA,
+    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "bug_investigator", "architecture_review", "test_strategy", "bug_review", "decomposition"],
   },
   bug: {
     key: "bug", rigor: "standard", reviewerRole: "bug_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA,
+    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "bug_investigator", "architecture_review", "test_strategy", "bug_review", "decomposition"],
   },
   security: {
     key: "security", rigor: "high", reviewerRole: "security_review_adversary", maxLoopbacks: 1,
-    mandatoryConcerns: ["security", "privacy"], criteria: SECURITY_CRITERIA,
+    mandatoryConcerns: ["security", "privacy"], criteria: SECURITY_CRITERIA, reviewDepth: "every_step",
     steps: ["intake_triage", "explorer", "security_review", "privacy_review", "architecture_review", "test_strategy", "security_review_adversary", "decomposition"],
   },
   feature: {
     key: "feature", rigor: "standard", reviewerRole: "spec_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "security", "tests"], criteria: FEATURE_CRITERIA,
+    mandatoryConcerns: ["correctness", "security", "tests"], criteria: FEATURE_CRITERIA, reviewDepth: "every_step",
     steps: ["intake_triage", "requirements_analyst", "explorer", "architecture_review", "api_design", "data_schema_review", "security_review", "test_strategy", "spec_review", "decomposition"],
   },
   manual: {
     key: "spec", rigor: "standard", reviewerRole: "spec_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness"], criteria: MANUAL_CRITERIA,
+    mandatoryConcerns: ["correctness"], criteria: MANUAL_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "requirements_analyst", "architecture_review", "test_strategy", "spec_review", "decomposition"],
   },
   chore: {
     key: "chore", rigor: "low", reviewerRole: "spec_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: CHORE_CRITERIA,
+    mandatoryConcerns: [], criteria: CHORE_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "style_conventions", "test_strategy", "spec_review", "decomposition"],
   },
   spike: {
     key: "spike", rigor: "low", reviewerRole: "spec_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: SPIKE_CRITERIA,
+    mandatoryConcerns: [], criteria: SPIKE_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "options_exploration", "architecture_review", "spec_review", "decomposition"],
   },
   research: {
     key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
+    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "user_research", "options_exploration", "edge_case_analysis", "brief_review", "research_synthesis"],
   },
   ux: {
     key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
+    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "ux_review", "user_research", "options_exploration", "edge_case_analysis", "brief_review", "research_synthesis"],
   },
   question: {
-    key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
+    key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1, reviewDepth: "terminal_only",
     mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
     steps: ["intake_triage", "explorer", "options_exploration", "brief_review", "research_synthesis"],
   },
@@ -214,6 +221,11 @@ export const FLOW_TEMPLATES: Record<IntakeKind, FlowTemplate> = {
 /** Resolve the flow for an intake kind (falls back to the manual flow). */
 export function flowForIntake(kind: IntakeKind): FlowTemplate {
   return FLOW_TEMPLATES[kind] ?? FLOW_TEMPLATES.manual;
+}
+
+/** Whether a role is excluded from "every_step" adversarial critique (see RoleSeed.critiqueExempt). */
+export function isCritiqueExempt(roleKey: string): boolean {
+  return DEFAULT_ROLES.find((r) => r.key === roleKey)?.critiqueExempt ?? false;
 }
 
 /**
@@ -239,6 +251,9 @@ export interface RoleSeed {
   appliesTo: IntakeKind[];
   persona: string;
   can_create_subtasks?: boolean;
+  /** Excluded from "every_step" adversarial critique — for pure administrative/
+   *  synthesis roles where a domain-violation check isn't meaningful. */
+  critiqueExempt?: boolean;
 }
 
 const ALL: IntakeKind[] = [
@@ -397,6 +412,15 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: NO_TOOLS,
     appliesTo: ["feature", "manual", "chore"],
     persona: `You clarify user-facing intent and write crisp acceptance criteria. Surface ambiguities explicitly; when a requirement is genuinely underspecified and cannot be safely assumed, set verdict "needs_human" so it routes to human review rather than being guessed.`,
+    critiqueExempt: true,
+  },
+  {
+    key: "critic",
+    title: "Critic (Adversarial Domain Reviewer)",
+    ordering: 15,
+    tools: NO_TOOLS,
+    appliesTo: ALL,
+    persona: `You review ONE finished step's output, not the whole task. Your bar is deliberately extreme: does this specific finding/decision violate a domain you're responsible for so badly that you would reject a PR implementing it — not "could be better," not "I'd have done it differently." Silence is the default and expected outcome; only speak up for genuine, concrete, high-severity violations (e.g., exposing PII, an authz bypass, an irreversible data-loss migration, a legal/compliance breach). Set verdict "blocker" only for such a violation, "needs_human" if it's ambiguous but serious enough that a person must decide, and "pass" otherwise — if in doubt, pass.`,
   },
   {
     key: "architecture_review",
@@ -628,7 +652,7 @@ export function seedGlobalRoles(): void {
 // Network seeding — creates system agent_networks from built-in flow templates
 // ---------------------------------------------------------------------------
 
-const NETWORKS_SEED_VERSION = 5;
+const NETWORKS_SEED_VERSION = 6;
 
 const GRID = 20;
 /** Horizontal + vertical offset per sequential node in the waterfall layout.
@@ -646,10 +670,24 @@ const WATERFALL_ORIGIN_Y = 80;
  */
 export interface NetworkGraph {
   version: number;
-  nodes: { id: string; roleKey: string; position: { x: number; y: number }; criteria?: unknown[] }[];
+  nodes: {
+    id: string;
+    roleKey: string;
+    position: { x: number; y: number };
+    criteria?: unknown[];
+    /** Role keys that critique this node's output (groundwork for a future
+     *  all-roles-critique-all-nodes option; today always ["critic"] or unset). */
+    critics?: string[];
+  }[];
   edges: unknown[];
   layout: { gridSize: number; snapToGrid: boolean };
-  metadata: { rigor?: string; maxLoopbacks?: number; mandatoryConcerns?: string[]; reviewerRole?: string };
+  metadata: {
+    rigor?: string;
+    maxLoopbacks?: number;
+    mandatoryConcerns?: string[];
+    reviewerRole?: string;
+    reviewDepth?: ReviewDepth;
+  };
 }
 
 export function applyWaterfallLayout(graph: NetworkGraph): NetworkGraph {
@@ -717,6 +755,8 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
     // a single unreadably wide horizontal row.
     const ORIGIN_X = 100;
     const ORIGIN_Y = 80;
+    const critics =
+      template.reviewDepth === "none" || isTerminal || isReviewer ? undefined : ["critic"];
     return {
       id: `n${i + 1}`,
       roleKey,
@@ -725,6 +765,7 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
         y: snap(ORIGIN_Y + i * STEP, GRID),
       },
       criteria: nodeCriteria,
+      critics,
     };
   });
 
@@ -760,6 +801,7 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
       maxLoopbacks: template.maxLoopbacks,
       mandatoryConcerns: template.mandatoryConcerns,
       reviewerRole: template.reviewerRole,
+      reviewDepth: template.reviewDepth,
     },
   };
 

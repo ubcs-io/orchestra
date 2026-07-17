@@ -208,6 +208,11 @@ export function initDb(): void {
   addColumnIfMissing(d, "role_runs", "thinking_md", "thinking_md TEXT");
   // Open questions from record_findings (JSON array of strings).
   addColumnIfMissing(d, "role_runs", "open_questions_json", "open_questions_json TEXT");
+  // Audit-trail spine for the counter-review overhaul: a "critique" or
+  // "second_review" run points back at the primary run it judged via
+  // target_run_id; run_kind distinguishes the three kinds of role_runs row.
+  addColumnIfMissing(d, "role_runs", "target_run_id", "target_run_id INTEGER");
+  addColumnIfMissing(d, "role_runs", "run_kind", "run_kind TEXT DEFAULT 'primary'");
   // Orchestrator recap call — synthesized final disposition after all roles finish.
   addColumnIfMissing(d, "tasks", "recap_md", "recap_md TEXT");
   // Reasoning-model connection settings (editable per profile).
@@ -251,6 +256,7 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_agent_networks_project ON agent_networks(project_id);
     CREATE INDEX IF NOT EXISTS idx_agent_networks_intake ON agent_networks(intake_kind);
     CREATE INDEX IF NOT EXISTS idx_task_chat_messages_task ON task_chat_messages(task_id);
+    CREATE INDEX IF NOT EXISTS idx_role_runs_target ON role_runs(target_run_id);
   `);
 }
 
@@ -367,6 +373,8 @@ export interface RoleRunRow {
   stalled: number | null;
   thinking_md: string | null;
   open_questions_json: string | null;
+  target_run_id: number | null;
+  run_kind: string;
   depth: number;
   model: string | null;
   tokens: number | null;
@@ -927,6 +935,10 @@ export function createRoleRun(input: {
   stalled?: number | null;
   thinking_md?: string | null;
   open_questions_json?: string | null;
+  /** The primary run this critiques/second-reviews, if this is not itself a primary run. */
+  target_run_id?: number | null;
+  /** "primary" (default) | "critique" | "second_review". */
+  run_kind?: string;
   depth?: number;
   model?: string | null;
   tokens?: number | null;
@@ -937,10 +949,10 @@ export function createRoleRun(input: {
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
          criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, stalled, thinking_md,
-         open_questions_json, depth, model, tokens, created_at)
+         open_questions_json, target_run_id, run_kind, depth, model, tokens, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
          @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @stalled, @thinking_md,
-         @open_questions_json, @depth, @model, @tokens, @ts)`,
+         @open_questions_json, @target_run_id, @run_kind, @depth, @model, @tokens, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -957,6 +969,8 @@ export function createRoleRun(input: {
       stalled: input.stalled ?? 0,
       thinking_md: input.thinking_md ?? null,
       open_questions_json: input.open_questions_json ?? null,
+      target_run_id: input.target_run_id ?? null,
+      run_kind: input.run_kind ?? "primary",
       depth: input.depth ?? 1,
       model: input.model ?? null,
       tokens: input.tokens ?? null,
@@ -969,6 +983,13 @@ export function listRoleRuns(taskId: string): RoleRunRow[] {
   return getDb()
     .prepare(`SELECT * FROM role_runs WHERE task_id = ? ORDER BY id ASC`)
     .all(taskId) as RoleRunRow[];
+}
+
+/** Critique/second-review runs recorded against a specific primary run. */
+export function listCritiquesForRun(runId: number): RoleRunRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM role_runs WHERE target_run_id = ? ORDER BY id ASC`)
+    .all(runId) as RoleRunRow[];
 }
 
 // ---------------------------------------------------------------------------
