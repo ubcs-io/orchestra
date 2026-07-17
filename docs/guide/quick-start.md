@@ -76,5 +76,6 @@ The production process serves both the API and the built SPA from a single Node 
 ## Next Steps
 
 - [How It Works](/guide/how-it-works) — understand the refinement pipeline
-- [Roles Catalog](/reference/roles) — learn about all 23 role agents
+- [Roles Catalog](/reference/roles) — learn about all 24 role agents, including the adversarial `critic`
 - [Agent Networks](/guide/networks) — create custom visual agent graphs
+- Visit `/models` in the UI to set up named model configs, compare them, and ping your endpoints for connectivity

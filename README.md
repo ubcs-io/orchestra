@@ -23,7 +23,8 @@ INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY 
 2. **Ingest.** The orchestrator picks it up, creates a task, infers its kind (a `.log`/traceback → `error_file`), seeds a markdown artifact in `PLANNING/REFINING/`, and commits it.
 3. **Plan.** A routing template (flow) for the intake kind becomes the task's ordered list of roles. Each flow includes a **counter-reviewer** — a gate role that verifies prior output against predefined acceptance criteria — plus configurable loop-back and rigor settings.
 4. **Run.** One role at a time runs as a pi agent session: it reads/greps the real repo, then records a structured verdict + a **coverage** declaration (which concerns it examined vs. skipped) + a markdown section, which is appended to the artifact and committed (`refine(<role>): <task> — <purpose>`). Roles that support unreliable models can run in **two-phase** mode (exploration → formalization) or **text mode** (JSON output via markdown instead of native tool calls).
-5. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). Spec tasks also spawn an epic→story→task child tree.
+5. **Critique.** Depending on the flow's `reviewDepth` (`none` / `terminal_only` / `every_step`), a scoped adversarial **`critic`** role runs immediately after a step to check that single step's output for a domain-ending violation (PII exposure, authz bypass, irreversible data loss, etc.) — silence is the expected outcome, so it only speaks up for genuine, high-severity issues. Its verdict is folded into the step's effective verdict (never silently downgraded), and it's stored as its own `role_runs` row (`run_kind: "critique"`, linked via `target_run_id`) rather than replacing the primary run.
+6. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). A step-level critique blocker can also trigger a bounded loop-back independent of the flow's own reviewer. Spec tasks also spawn an epic→story→task child tree.
 
 State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirrors it on disk so the refinement history is version-controlled and PR-able.
 
@@ -49,9 +50,10 @@ Ten intake kinds are supported, each with a dedicated flow:
 - **research_brief** (`research`, `ux`, `question`) → ends in `research_synthesis` → a decision brief.
 
 ### Live visibility & steering
-- **Live pane** — Server-Sent Events stream the active role's reasoning and every file it reads, in real time.
+- **Live pane** — Server-Sent Events stream the active role's reasoning and every file it reads, in real time, as structured typed events (role/tool boundaries, thinking, text, status) with inline markdown highlighting — not just a raw log.
 - **Coverage map** — each role declares which concerns (correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs) it examined, skipped, or ignored, so *omissions are visible* (you can see privacy was never looked at).
-- **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, create child **subtasks**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
+- **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, create child **subtasks**, mark a task **won't do**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
+- **Review CTA & question decomposition** — the Task Detail page surfaces a review call-to-action distilled from the artifact's action items, coverage gaps, and open questions raised by roles; any open question can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), which itself gets a full task page (and can recursively decompose its own open questions) plus an inline chat box on the parent for quick follow-up without leaving the page.
 
 ### Agent Networks
 
@@ -63,6 +65,23 @@ Beyond the built-in flow templates, you can author custom **agent networks** —
 - **Import / Export** — networks can be exported to and imported from JSON, making them portable across projects and Orchestra instances. Export from the canvas toolbar; import via the API (`POST /api/networks/import`).
 
 Networks are stored in SQLite alongside projects and are resolved by intake kind: when a task enters the orchestrator, the default network for its intake kind is loaded. If no custom network is set, the built-in flow template is used as a fallback.
+
+### Model dashboard & network ping
+
+The **`/models`** page manages named model configs — reusable endpoint + model profiles (base URL, model ID, context/max-tokens, reasoning/thinking settings, text/two-phase mode, and "tier-1 compat" quirks like `supportsDeveloperRole`, `supportsReasoningEffort`, and stall-nudge thresholds) that a project or role can opt into by referencing the config's name, independent of the single global connection profile. From this page you can:
+
+- **Compare models** — a radar chart and sortable stats table plot each config across context window, max tokens, reasoning, quantization score, effective parameter count, and (log) parameter count, alongside historical usage (runs, total tokens, avg tokens/run) pulled from actual role-run history.
+- **Reorder, duplicate, set default** — drag-and-drop cards to set model priority, duplicate a config as a starting point, or promote one to the global default.
+- **Ping Network** — from the Projects page, check live connectivity to every configured model endpoint over an SSE stream (`GET /api/ping-network/stream`): each node streams in as `checking → ok/down` with a running "N/M available" count, so you can see at a glance which of your local/tailnet/cloud endpoints are reachable.
+
+### Strategic LLM routing advisors (experimental)
+
+Beyond the deterministic router, `server/src/router.ts` provides four **optional, narrowly-scoped advisory LLM calls** at decision points where heuristics are weakest. Each call point is independently toggleable, off by default, has a hard timeout, and falls back to the heuristic default on failure or when disabled — the orchestrator always owns the final decision:
+
+1. **Question distillation** — after a role produces open questions, distill and de-duplicate them.
+2. **Escalation assessment** — before escalating to human REVIEW, decide whether to actually `escalate`, `reroute`, `rerun`, or `close`.
+3. **Borderline gate assessment** — for partial-criteria or near-loopback-exhaustion gate decisions, choose `loopback`, `proceed`, `proceed_with_note`, `escalate`, or `narrow_loopback`.
+4. **Second review** — after every critiqued step, authoritatively synthesize the primary run and the critic's critique into `accept`, `accept_with_note`, `escalate`, or `loopback` — this is what lets a real critic false-positive get overturned instead of always forcing a loop-back.
 
 ---
 
@@ -156,14 +175,16 @@ server/                one Node daemon (we own main())
   src/db.ts            better-sqlite3 schema + CRUD (idempotent, WAL)
   src/providers.ts     pi provider registration + model discovery
   src/agent.ts         runRole(): one pi agent session per role (text mode, two-phase, think splitting)
-  src/roles.ts         role catalog (23 roles), flow templates, acceptance criteria, seed data
-  src/orchestrator.ts  ingest → plan → run → gate + scheduler + loop-back
+  src/roles.ts         role catalog (24 roles), flow templates, acceptance criteria, seed data
+  src/orchestrator.ts  ingest → plan → run → critique → gate + scheduler + loop-back
+  src/router.ts        strategic LLM routing advisors (question distillation, escalation, borderline gate, second review)
   src/git.ts           PLANNING scaffold + sandboxed artifact writes + commits
   src/bus.ts           in-process pub/sub for the SSE stream
   src/routes/          Fastify REST (api.ts) + SSE (sse.ts) + safety controls (safety.ts)
-  test/                Vitest test suite (agent, db, git, orchestrator, roles)
+  test/                Vitest test suite (agent, db, git, orchestrator, roles, router)
 client/                Vite + React SPA
-  src/routes/          Projects, ProjectBoard (kanban), TaskDetail, RolesEditor, Settings
+  src/routes/          Projects, ProjectBoard (kanban), TaskDetail, RolesEditor, Settings, Models, NetworkEditor
+  src/components/      ReviewCTA (review action items + open questions), QuestionDecompose (spin a question into a subtask), NetworkNodeCard
   src/api.ts           typed API client
 ```
 
@@ -182,7 +203,7 @@ client/                Vite + React SPA
 
 ## Roles
 
-23 roles are seeded as global defaults and are **customizable per project** (edit prompt, tools, model, enable/disable — a project override wins by key). Each flow template selects a subset and order per intake kind, with a counter-reviewer gating before the terminal role.
+24 roles are seeded as global defaults and are **customizable per project** (edit prompt, tools, model, enable/disable — a project override wins by key). Each flow template selects a subset and order per intake kind, with a counter-reviewer gating before the terminal role, and a cross-cutting `critic` role that can run after any non-terminal step depending on the flow's `reviewDepth`.
 
 ### Spec-track roles
 
@@ -224,6 +245,22 @@ client/                Vite + React SPA
 
 Counter-reviewers verify prior output against predefined acceptance criteria. If a "must" criterion is unmet, the orchestrator loops back to the responsible role (up to `maxLoopbacks` times). If still unmet after max attempts, the task escalates to **REVIEW** for a human.
 
+### Cross-cutting critique
+
+| Key | Title | Tools | Applies to |
+|---|---|---|---|
+| `critic` | Critic (Adversarial Domain Reviewer) | none (context-only) | all — runs per-step, scoped to that step's output only |
+
+Unlike the counter-reviewers above (which gate a whole flow against fixed criteria before the terminal role), `critic` runs immediately after an individual step and judges only that step's output, with a deliberately extreme bar: it stays silent unless the step commits a genuine, high-severity domain violation. How often it fires is set per flow by `reviewDepth`:
+
+| `reviewDepth` | Behavior | Used by |
+|---|---|---|
+| `every_step` | Runs after every non-terminal, non-reviewer step | `security`, `feature` |
+| `terminal_only` | Runs once, at the reviewer step | `error_file`, `bug`, `manual`, `chore`, `spike`, `research`, `ux`, `question` |
+| `none` | Never runs | — |
+
+`requirements_analyst` is exempt from critique (context-only, no findings to adversarially check). Custom networks expose the same behavior via a per-node `critics` field and network-level `reviewDepth` metadata.
+
 ---
 
 ## API
@@ -237,6 +274,13 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | GET | `/api/concerns` | The concern taxonomy (coverage map dimensions). |
 | GET | `/api/flows` | Flow templates per intake kind (steps, criteria, rigor). |
 | GET · PATCH | `/api/config` | Global connection profile (read/edit base URL, model, reasoning, thinking, text/two-phase mode). |
+| GET · POST | `/api/model-configs` | List / create named model configs. |
+| GET · PATCH · DELETE | `/api/model-configs/:id` | Get / update / delete a named model config. |
+| POST | `/api/model-configs/:id/duplicate` | Duplicate a model config. |
+| POST | `/api/model-configs/:id/set-default` | Set a model config as the global default. |
+| POST | `/api/model-configs/reorder` | Reorder model configs (drag-and-drop priority). |
+| POST | `/api/model-stats` | Radar/stats-table data per model config (params, quant score, cost, historical usage). |
+| GET | `/api/ping-network/stream` | SSE: live connectivity check against every configured model endpoint. |
 | GET | `/api/scheduler` · POST `/api/scheduler/{start,stop}` · POST `/api/tick` | Loop control / manual single step. |
 | GET · POST | `/api/projects` · GET · PATCH · DELETE `/api/projects/:id` | Projects. |
 | GET | `/api/projects/:id/roles` · PUT `/api/projects/:id/roles/:key` | Per-project role config (prompt, tools, model, enabled). |
@@ -256,7 +300,9 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | PATCH | `/api/tasks/:id` | Edit a task's name/content while in intake stage. |
 | POST | `/api/tasks/:id/reset` | Reset a task to intake state (clears history). |
 | POST | `/api/tasks/:id/subtasks` | Create a child task under a parent. |
-| POST | `/api/tasks/:id/interventions` | Steering: `pause`/`resume`/`rerun_role`/`deepen`/`inject_role`/`steer_note`/`pin_question`/`promote_role`/`run_now`. |
+| POST | `/api/tasks/:id/questions/decompose` | Spin an open review question off into its own child Question Flow subtask (idempotent per question). |
+| POST | `/api/tasks/:id/chat` | Send a follow-up chat message against a task (used by the inline decomposed-child preview). |
+| POST | `/api/tasks/:id/interventions` | Steering: `pause`/`resume`/`rerun_role`/`deepen`/`inject_role`/`steer_note`/`pin_question`/`promote_role`/`run_now`/`wont_do`. |
 | GET | `/api/tasks/:id/stream` | SSE: live role/tool/text events. |
 | GET · PATCH | `/api/safety` | Safety/pi dev controls (read agent boundaries, limits, gates, role summary; edit `role_tool_budget`). |
 
@@ -270,4 +316,4 @@ The single process is designed to run on a headless box under **systemd** (or pm
 
 ## Status
 
-The full pipeline — ingest, planning, role execution (including two-phase and text mode for unreliable tool-calling models), gating with counter-reviewers and loop-back, coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions), database, git operations, and roles.
+The full pipeline — ingest, planning, role execution (including two-phase and text mode for unreliable tool-calling models), per-step adversarial critique, gating with counter-reviewers and loop-back, optional LLM routing advisors, coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs with usage stats and network ping, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions, critique), router (advisory call points, fallback behavior), database, git operations, and roles.

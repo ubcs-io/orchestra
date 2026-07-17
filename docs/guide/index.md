@@ -33,6 +33,8 @@ The flow also defines **rigor** (low, standard, high), **acceptance criteria** (
 
 Each flow includes a **counter-reviewer** — a role whose job is to verify prior output against predefined criteria, not to author new content. If a "must" criterion is unmet, the orchestrator loops back to the responsible role. If still unmet after `maxLoopbacks` attempts, the task escalates to **REVIEW** for a human.
 
+Alongside the flow-level counter-reviewer, a cross-cutting **`critic`** role can run immediately after individual steps (per the flow's `reviewDepth`) to catch domain-ending violations early, scoped to just that step's output. Two optional, off-by-default LLM routing advisors — escalation assessment and borderline gate assessment — can further refine gate decisions; see [How It Works](/guide/how-it-works) and [Configuration](/reference/config#strategic-llm-routing-advisors).
+
 ### Exit Shapes
 
 - **spec** — ends with the `decomposition` role, producing an epic → story → task tree with acceptance criteria
@@ -49,5 +51,5 @@ One Node process is the whole app. The server boots the database, seeds the role
 
 - [Quick Start](/guide/quick-start) — get Orchestra running in 5 minutes
 - [How It Works](/guide/how-it-works) — deep dive into the refinement pipeline
-- [Roles Catalog](/reference/roles) — all 23 roles and their capabilities
+- [Roles Catalog](/reference/roles) — all 24 roles and their capabilities
 - [Agent Networks](/guide/networks) — build custom visual agent graphs

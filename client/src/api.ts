@@ -1,6 +1,8 @@
 /** Typed API client + shared types. All calls hit the Fastify `/api` surface. */
 
 export interface Project {
+  internal_calls?: number;
+  external_calls?: number;
   id: number;
   name: string;
   repo_path: string;

@@ -45,16 +45,24 @@ One role at a time runs as a pi agent session. Each role:
 
 Roles that struggle with native tool calling can run in **two-phase mode** (exploration → JSON formalization) or **text mode** (JSON output via markdown).
 
-## Stage 5: Gate
+## Stage 5: Critique
 
-After each role, the orchestrator evaluates the state:
+Depending on the flow's `reviewDepth` (`none` / `terminal_only` / `every_step`, see [Roles Catalog](/reference/roles#cross-cutting-critique)), a scoped adversarial **`critic`** role runs immediately after a step, checking *only that step's output* for a domain-ending violation (PII exposure, an authz bypass, an irreversible data-loss migration, a legal/compliance breach). Silence (`pass`) is the expected default — it only speaks up for genuine, high-severity issues. The critique is recorded as its own run (`run_kind: "critique"`, linked to the primary run) and its verdict is folded into the step's effective verdict without ever silently downgrading it. A `blocker` critique on a non-reviewer step can trigger one bounded loop-back independent of the flow's own reviewer.
+
+If the optional **second-review** [routing advisor](/reference/config#strategic-llm-routing-advisors) is enabled, it authoritatively synthesizes the primary run + critique afterward, and can let a critic false-positive proceed (`accept`/`accept_with_note`) instead of forcing a loop-back.
+
+## Stage 6: Gate
+
+After each role (and any critique), the orchestrator evaluates the state:
 
 - **Keep refining** — advance to the next role
-- **Loop back** — if the counter-reviewer finds an unmet "must" criterion, re-run the responsible role (up to `maxLoopbacks` times)
+- **Loop back** — if the counter-reviewer finds an unmet "must" criterion (or a critique blocker fires), re-run the responsible role (up to `maxLoopbacks` times)
 - **Escalate to REVIEW** — if loopback limit is exhausted, flag for human attention
 - **Exit to READY** — when the terminal role completes
 
-For **spec** tasks, the decomposition role spawns an epic → story → task child tree.
+Two optional LLM routing advisors can refine borderline gate calls: **escalation assessment** (is escalation truly needed, or should the task reroute/rerun/close instead?) and **borderline gate assessment** (for partial-criteria or near-loopback-exhaustion cases). Both are off by default and fall back to the heuristic decision above — see [Strategic LLM Routing Advisors](/reference/config#strategic-llm-routing-advisors).
+
+For **spec** tasks, the decomposition role spawns an epic → story → task child tree. Any open question a role raises along the way can also be spun off — via the Task Detail page's review call-to-action, or `POST /api/tasks/:id/questions/decompose` — into its own child **Question Flow** subtask, which gets a full task page of its own (and can recursively spin off its own open questions the same way).
 
 ## The PLANNING/ Tree
 

@@ -237,6 +237,37 @@ export function Projects() {
                     </Link>
                   </span>
                 </div>
+                {/* API calls bar */}
+                {(() => {
+                  const internal = p.internal_calls ?? 0;
+                  const external = p.external_calls ?? 0;
+                  const total = internal + external;
+                  if (total === 0) {
+                    return (
+                      <div className="api-calls-bar">
+                        <div className="api-calls-bar__empty" title="No API calls yet" />
+                      </div>
+                    );
+                  }
+                  const internalPct = Math.round((internal / total) * 100);
+                  const externalPct = 100 - internalPct;
+                  return (
+                    <div className="api-calls-bar" title={`${internal} internal / ${external} external API calls`}>
+                      {internalPct > 0 && (
+                        <div className="api-calls-bar__internal" style={{ width: `${internalPct}%` }} />
+                      )}
+                      {externalPct > 0 && (
+                        <div className="api-calls-bar__external" style={{ width: `${externalPct}%` }} />
+                      )}
+                    </div>
+                  );
+                })()}
+                <div className="api-calls-label">
+                  {((p.internal_calls ?? 0) + (p.external_calls ?? 0) === 0)
+                    ? "No calls"
+                    : `${p.internal_calls ?? 0} local / ${p.external_calls ?? 0} api`}
+                </div>
+
                 <div className="project-actions">
                   <Link to="/projects/$projectId/roles" params={{ projectId: String(p.id) }}>roles</Link>
                 </div>

@@ -1,8 +1,8 @@
 # Roles Catalog
 
-Orchestra ships with **23 roles** seeded as global defaults. Each role is customizable per project — you can edit its system prompt, assigned tools, model, or enable/disable it via the Roles Editor UI or `PUT /api/projects/:id/roles/:key`.
+Orchestra ships with **24 roles** seeded as global defaults. Each role is customizable per project — you can edit its system prompt, assigned tools, model, or enable/disable it via the Roles Editor UI or `PUT /api/projects/:id/roles/:key`.
 
-Roles are organized into three groups: spec-track, research/UX-track, and counter-reviewers.
+Roles are organized into four groups: spec-track, research/UX-track, counter-reviewers, and the cross-cutting `critic`.
 
 ## Spec-Track Roles
 
@@ -44,6 +44,28 @@ Counter-reviewers gate a flow by verifying prior output against predefined accep
 | `spec_review` | Spec Review (Verification Tech Lead) | read-only | feature, manual, chore, spike |
 | `brief_review` | Brief Review (Verification Lead) | none (context-only) | research, ux, question |
 
+## Cross-Cutting Critique
+
+| Key | Title | Tools | Applies to |
+|---|---|---|---|
+| `critic` | Critic (Adversarial Domain Reviewer) | none (context-only) | all — runs per-step |
+
+`critic` is not a flow-terminal gate like the counter-reviewers above — it runs immediately after an individual step and judges **only that step's output**, not the whole task. Its bar is deliberately extreme: it stays silent (`pass`) unless the step commits a genuine, high-severity domain violation (e.g. exposing PII, an authz bypass, an irreversible data-loss migration, a legal/compliance breach), in which case it sets `blocker` (or `needs_human` if ambiguous but serious). Its verdict folds into the step's effective verdict without ever silently downgrading it, and it's persisted as a separate `role_runs` row (`run_kind: "critique"`, linked to the primary run via `target_run_id`) — the primary role's output is never overwritten.
+
+How often `critic` fires is controlled per flow by a `reviewDepth` setting:
+
+| `reviewDepth` | Behavior | Flows |
+|---|---|---|
+| `every_step` | Runs after every non-terminal, non-reviewer step | `security`, `feature` |
+| `terminal_only` | Runs once, scoped to the reviewer step | `error_file`, `bug`, `manual`, `chore`, `spike`, `research`, `ux`, `question` |
+| `none` | Never runs | — |
+
+`requirements_analyst` is marked `critiqueExempt` (it's context-only with no tool-derived findings to adversarially check, so it's skipped even under `every_step`).
+
+If a critique on a non-reviewer step comes back `blocker`, the orchestrator can loop back to the responsible role once (bounded independently of the flow's own `maxLoopbacks`) before escalating — so a serious domain violation can be caught and re-run well before the flow's own counter-reviewer ever runs. When the optional [second-review router advisor](/reference/config#strategic-llm-routing-advisors) is enabled, its authoritative synthesis of the primary run + critique can also let a critic false-positive proceed instead of forcing a loop-back.
+
+Custom [agent networks](/guide/networks) expose the same mechanism via a per-node `critics: string[]` field (defaulting to `["critic"]` on non-terminal, non-reviewer nodes) and a network-level `reviewDepth` in its metadata.
+
 ## Role Tools
 
 Roles are assigned tool sets that define what they can do:
@@ -56,22 +78,22 @@ Roles are assigned tool sets that define what they can do:
 
 ## Flow Templates
 
-Each intake kind maps to a flow — a specific sequence of roles with a counter-reviewer:
+Each intake kind maps to a flow — a specific sequence of roles with a counter-reviewer, plus a `reviewDepth` that controls how often `critic` runs alongside it:
 
-| Intake Kind | Steps |
-|---|---|
-| `error_file` | intake_triage → explorer → bug_investigator → architecture_review → test_strategy → **bug_review** → decomposition |
-| `bug` | intake_triage → explorer → bug_investigator → architecture_review → test_strategy → **bug_review** → decomposition |
-| `security` | intake_triage → explorer → security_review → privacy_review → architecture_review → test_strategy → **security_review_adversary** → decomposition |
-| `feature` | intake_triage → requirements_analyst → explorer → architecture_review → api_design → data_schema_review → security_review → test_strategy → **spec_review** → decomposition |
-| `manual` | intake_triage → explorer → requirements_analyst → architecture_review → test_strategy → **spec_review** → decomposition |
-| `chore` | intake_triage → explorer → style_conventions → test_strategy → **spec_review** → decomposition |
-| `spike` | intake_triage → explorer → options_exploration → architecture_review → **spec_review** → decomposition |
-| `research` | intake_triage → user_research → options_exploration → edge_case_analysis → **brief_review** → research_synthesis |
-| `ux` | intake_triage → ux_review → user_research → options_exploration → edge_case_analysis → **brief_review** → research_synthesis |
-| `question` | intake_triage → explorer → options_exploration → **brief_review** → research_synthesis |
+| Intake Kind | Steps | `reviewDepth` |
+|---|---|---|
+| `error_file` | intake_triage → explorer → bug_investigator → architecture_review → test_strategy → **bug_review** → decomposition | `terminal_only` |
+| `bug` | intake_triage → explorer → bug_investigator → architecture_review → test_strategy → **bug_review** → decomposition | `terminal_only` |
+| `security` | intake_triage → explorer → security_review → privacy_review → architecture_review → test_strategy → **security_review_adversary** → decomposition | `every_step` |
+| `feature` | intake_triage → requirements_analyst → explorer → architecture_review → api_design → data_schema_review → security_review → test_strategy → **spec_review** → decomposition | `every_step` |
+| `manual` | intake_triage → explorer → requirements_analyst → architecture_review → test_strategy → **spec_review** → decomposition | `terminal_only` |
+| `chore` | intake_triage → explorer → style_conventions → test_strategy → **spec_review** → decomposition | `terminal_only` |
+| `spike` | intake_triage → explorer → options_exploration → architecture_review → **spec_review** → decomposition | `terminal_only` |
+| `research` | intake_triage → user_research → options_exploration → edge_case_analysis → **brief_review** → research_synthesis | `terminal_only` |
+| `ux` | intake_triage → ux_review → user_research → options_exploration → edge_case_analysis → **brief_review** → research_synthesis | `terminal_only` |
+| `question` | intake_triage → explorer → options_exploration → **brief_review** → research_synthesis | `terminal_only` |
 
-**Bold** roles are counter-reviewers.
+**Bold** roles are counter-reviewers. `security` and `feature` are the two highest-rigor flows, so `critic` checks every step rather than just the reviewer step.
 
 ## Per-Project Customization
 

@@ -4,7 +4,7 @@ Orchestra gives you full control over the refinement loop while it's running. Yo
 
 ## Live Visibility
 
-- **SSE Stream** — watch the active role's reasoning, every file it reads, and every tool call it makes, in real time
+- **SSE Stream** — watch the active role's reasoning, every file it reads, and every tool call it makes, in real time, rendered as structured role/tool/thinking/text/status events with inline markdown highlighting rather than a raw log
 - **Coverage Map** — see which concerns each role examined, skipped, or ignored, rolled up across the entire task. Omissions are highlighted so you can notice that, for example, privacy was never reviewed
 
 ## Interventions
@@ -22,11 +22,13 @@ All interventions are submitted via `POST /api/tasks/:id/interventions` with a J
 | `pin_question` | Pin a specific question for upcoming roles to address. |
 | `promote_role` | Promote an injected role into standing project policy — it will auto-run on future tasks of the same intake kind. |
 | `run_now` | Trigger the scheduler to process this specific task immediately, bypassing the idle poll interval. |
+| `wont_do` | Close the task as won't-do — sets it to `ready` with `exit_state: "wont_do"` and pauses it, without waiting for the flow to run to completion. |
 
 ## Task Lifecycle
 
 - **Reset** — reset a task back to intake state (clears all refinement history)
 - **Subtasks** — create child tasks under a parent (useful for decomposition of complex work)
+- **Question decomposition** — any open question a role raises (surfaced via the review call-to-action on Task Detail) can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), so a tangent gets its own focused refinement pass instead of derailing the parent. The child gets a full task page and can itself decompose its own open questions recursively; an inline chat box on the parent lets you ask it quick follow-ups without navigating away.
 - **Edit** — modify a task's name or content while it's still in the intake stage
 
 ## Common Steering Patterns

@@ -8,10 +8,11 @@ Networks replace a flow template's ordered list with a directed graph of **nodes
 
 Access the editor at `/networks` in the UI. It provides:
 
-- A **role palette** — drag any of the 23 roles onto the canvas
+- A **role palette** — drag any of the 24 roles onto the canvas
 - **React Flow canvas** with snap-to-grid positioning
 - **Edge connections** — click-drag from a node's output handle to another node's input handle
-- **Per-network metadata** — intake kind, rigor level, max loopbacks, reviewer role
+- **Per-network metadata** — intake kind, rigor level, max loopbacks, reviewer role, review depth
+- **In-place role editing** — click a node's person icon to open a role editor modal (enabled state, subtask creation, tools, model override, system prompt) without leaving the canvas
 
 ## System Templates
 
@@ -32,8 +33,13 @@ Create networks from scratch or duplicate a system template. Custom networks are
 - **Rewire edges** — change the flow of work through the graph
 - **Adjust rigor** — set `low`, `standard`, or `high` for the entire network
 - **Set as default** — mark a network as the default for its intake kind
+- **Project-scoped duplication** — duplicate a network directly into a specific project (or leave it global), assigned via a project-select modal shown when creating or duplicating
 
 When a network is set as default for an intake kind, the orchestrator uses it instead of the built-in flow template for all matching intakes.
+
+### Critique on network nodes
+
+Networks carry the same cross-cutting critique support as the built-in flows: each node has a `critics: string[]` field (defaulting to `["critic"]` on non-terminal, non-reviewer nodes), and the network's `metadata.reviewDepth` (`none` / `terminal_only` / `every_step`) controls how broadly it's applied. See [Roles Catalog — Cross-Cutting Critique](/reference/roles#cross-cutting-critique) for what the `critic` role actually checks.
 
 ## Import / Export
 

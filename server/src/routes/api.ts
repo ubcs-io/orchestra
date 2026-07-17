@@ -555,7 +555,24 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         const fallback = p.default_model ?? getGlobalConfig()?.default_model ?? null;
         if (fallback) models.push(fallback);
       }
-      return { ...p, repo_path: sanitizePath(p.repo_path), models };
+
+      // Compute per-project internal vs external API call stats
+      const configs = listModelConfigs();
+      const configByName = new Map(configs.map((c) => [c.name, c]));
+      let internal_calls = 0;
+      let external_calls = 0;
+      const projectTasks = listTasks({ projectId: p.id });
+      for (const task of projectTasks) {
+        const runs = listRoleRuns(task.task_id);
+        for (const run of runs) {
+          if (!run.model) continue;
+          const cfg = configByName.get(run.model);
+          const loc = locationLabel(cfg?.base_url ?? null);
+          if (loc === "local") internal_calls++;
+          else external_calls++;
+        }
+      }
+      return { ...p, repo_path: sanitizePath(p.repo_path), models, internal_calls, external_calls };
     });
     return { projects: enriched };
   });

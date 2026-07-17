@@ -381,6 +381,39 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 .project-card .project-actions { margin-top: 4px; }
 .project-card--register { grid-column: span 2; }
 
+/* ---- API calls progress bar on project cards ---- */
+.api-calls-bar {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--panel);
+  overflow: hidden;
+  display: flex;
+  margin-top: 4px;
+}
+.api-calls-bar__internal {
+  background: var(--ok);
+  height: 100%;
+  border-radius: 5px 0 0 5px;
+}
+.api-calls-bar__external {
+  background: var(--accent);
+  height: 100%;
+  border-radius: 0 5px 5px 0;
+}
+.api-calls-bar__empty {
+  height: 100%;
+  width: 100%;
+  background: var(--line);
+}
+.api-calls-bar:only-child .api-calls-bar__internal { border-radius: 5px; }
+.api-calls-bar:only-child .api-calls-bar__external { border-radius: 5px; }
+.api-calls-label {
+  font-size: 10px;
+  color: var(--ink-dim);
+  margin-top: 2px;
+}
+
+
 /* Settings */
 .settings { max-width: 912px; margin: 0 auto; }
 .safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
