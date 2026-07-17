@@ -17,6 +17,10 @@ Lowest → highest precedence:
 
 `baseUrl` and `apiKey` always prefer env vars over DB values (so credentials can stay out of the database).
 
+The Settings UI's **Pi Dev Controls** panel is a live view onto these boundaries and limits — what the agent harness can and cannot do, and the editable limits above are enforced by the orchestrator, not merely suggested:
+
+![Pi Dev Controls — agent tool boundaries, configurable limits, and gate/review settings](/screenshots/settings.png)
+
 ---
 
 ## Bootstrap Config (`config.json`)

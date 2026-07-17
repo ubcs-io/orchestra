@@ -45,6 +45,10 @@ One role at a time runs as a pi agent session. Each role:
 
 Roles that struggle with native tool calling can run in **two-phase mode** (exploration → JSON formalization) or **text mode** (JSON output via markdown).
 
+Each completed run is recorded with its verdict, disposition, token usage, and full reasoning trace:
+
+![Role run detail — verdict, tokens/sec, and reasoning trace for a completed step](/screenshots/role-history.png)
+
 ## Stage 5: Critique
 
 Depending on the flow's `reviewDepth` (`none` / `terminal_only` / `every_step`, see [Roles Catalog](/reference/roles#cross-cutting-critique)), a scoped adversarial **`critic`** role runs immediately after a step, checking *only that step's output* for a domain-ending violation (PII exposure, an authz bypass, an irreversible data-loss migration, a legal/compliance breach). Silence (`pass`) is the expected default — it only speaks up for genuine, high-severity issues. The critique is recorded as its own run (`run_kind: "critique"`, linked to the primary run) and its verdict is folded into the step's effective verdict without ever silently downgrading it. A `blocker` critique on a non-reviewer step can trigger one bounded loop-back independent of the flow's own reviewer.
@@ -76,6 +80,10 @@ All artifacts are written into your repository:
   REVIEW/     exit_state = needs_review (awaiting a human)
   epics/      epic/story/task decomposition output
 ```
+
+The Project Board mirrors these same four stages as kanban columns, so you can watch tasks move across the pipeline:
+
+![Project board — tasks grouped into Intake, Refining, Ready, and Review columns](/screenshots/manage-tasks.png)
 
 State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirrors it on disk so the refinement history is version-controlled and PR-able.
 

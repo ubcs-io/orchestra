@@ -50,7 +50,7 @@ const RADAR_AXES = [
   "Max Tokens",
   "Reasoning",
   "Quant Score",
-  "Effective\nParams",
+  "Active\nParams",
   "Params (log)",
 ] as const;
 
@@ -94,7 +94,7 @@ function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
   // Build radar data per stat
   const maxCtx = Math.max(1, ...stats.map((s) => s.context_window ?? 0));
   const maxMaxTok = Math.max(1, ...stats.map((s) => s.max_tokens ?? 0));
-  const maxEffective = Math.max(1, ...stats.map((s) => s.effective_params_b ?? s.parameter_count_b ?? 0));
+  const maxActive = Math.max(1, ...stats.map((s) => s.active_parameter_count_b ?? s.parameter_count_b ?? 0));
   const maxParams = Math.max(1, ...stats.map((s) => s.total_parameter_count_b ?? s.parameter_count_b ?? 0));
 
   const radar: RadarData[] = stats.map((s, i) => {
@@ -108,7 +108,7 @@ function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
         "Max Tokens": linScale(s.max_tokens, maxMaxTok),
         "Reasoning": thinkingLevelScore(s.reasoning ? s.thinking_level : null),
         "Quant Score": s.quantization_score ?? 0.6,
-        "Effective\nParams": linScale(s.effective_params_b ?? s.parameter_count_b, maxEffective),
+        "Active\nParams": linScale(s.active_parameter_count_b ?? s.parameter_count_b, maxActive),
         "Params (log)": logScale(s.total_parameter_count_b ?? s.parameter_count_b, maxParams),
       },
       raw: {
@@ -116,7 +116,7 @@ function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
         "Max Tokens": ctxLabel(s.max_tokens, 0),
         "Reasoning": s.reasoning ? (s.thinking_level ?? "medium") : "none",
         "Quant Score": `${s.quantization ?? "?"} (${(s.quantization_score * 100).toFixed(0)}%)`,
-        "Effective\nParams": s.effective_params_b != null ? `${s.effective_params_b}B` : s.parameter_count_b != null ? `${s.parameter_count_b}B` : "?",
+        "Active\nParams": s.active_parameter_count_b != null ? `${s.active_parameter_count_b}B` : s.parameter_count_b != null ? `${s.parameter_count_b}B` : "?",
         "Params (log)": s.total_parameter_count_b != null ? `${s.total_parameter_count_b}B` : s.parameter_count_b != null ? `${s.parameter_count_b}B` : "?",
       },
     };

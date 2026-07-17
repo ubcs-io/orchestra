@@ -226,8 +226,9 @@ export function Projects() {
         ) : (
           <div className="project-grid">
             {data?.projects && data.projects.length > 0 && data.projects.map((p) => (
-              <div className="project-card" key={p.id}>
-                <Link className="project-name" to="/projects/$projectId" params={{ projectId: String(p.id) }}>{p.name}</Link>
+              <Link className="project-card" to="/projects/$projectId" params={{ projectId: String(p.id) }} key={p.id}>
+                <Link className="project-roles-icon" to="/projects/$projectId/roles" params={{ projectId: String(p.id) }} title="Roles" onClick={(e) => e.stopPropagation()}>👤</Link>
+                <span className="project-name">{p.name}</span>
                 <div className="project-meta">
                   <span>Repo: {p.repo_path.split("/").pop()}</span>
                   <span>
@@ -268,10 +269,7 @@ export function Projects() {
                     : `${p.internal_calls ?? 0} local / ${p.external_calls ?? 0} api`}
                 </div>
 
-                <div className="project-actions">
-                  <Link to="/projects/$projectId/roles" params={{ projectId: String(p.id) }}>roles</Link>
-                </div>
-              </div>
+              </Link>
             ))}
             {/* ---- Register Repository (inline card) ---- */}
             <div className="project-card project-card--register">

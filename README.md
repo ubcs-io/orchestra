@@ -6,6 +6,8 @@ Connect any git repository, drop in work that ranges from a bare error log to an
 
 The point is **tighter control and visibility over long-running, nebulous work**. LLMs fail at big vague tasks; Orchestra breaks them into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably.
 
+![Orchestra dashboard — task board, network health, and registered projects](docs/public/screenshots/dashboard.png)
+
 ---
 
 ## How it works
@@ -55,6 +57,8 @@ Ten intake kinds are supported, each with a dedicated flow:
 - **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, create child **subtasks**, mark a task **won't do**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
 - **Review CTA & question decomposition** — the Task Detail page surfaces a review call-to-action distilled from the artifact's action items, coverage gaps, and open questions raised by roles; any open question can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), which itself gets a full task page (and can recursively decompose its own open questions) plus an inline chat box on the parent for quick follow-up without leaving the page.
 
+![Interactive live view — SSE role/tool stream, current state, steering, and coverage map](docs/public/screenshots/interactive-live-view.png)
+
 ### Agent Networks
 
 Beyond the built-in flow templates, you can author custom **agent networks** — visual graphs that define how the orchestrator routes work through role agents. Networks replace a flow template's ordered list with a directed graph of nodes (roles) and edges (transitions), giving you full control over branching, parallelism, and gating logic.
@@ -66,6 +70,8 @@ Beyond the built-in flow templates, you can author custom **agent networks** —
 
 Networks are stored in SQLite alongside projects and are resolved by intake kind: when a task enters the orchestrator, the default network for its intake kind is loaded. If no custom network is set, the built-in flow template is used as a fallback.
 
+![Agent network editor — drag-and-drop role graph with edge conditions and per-role tool boundaries](docs/public/screenshots/network-view.png)
+
 ### Model dashboard & network ping
 
 The **`/models`** page manages named model configs — reusable endpoint + model profiles (base URL, model ID, context/max-tokens, reasoning/thinking settings, text/two-phase mode, and "tier-1 compat" quirks like `supportsDeveloperRole`, `supportsReasoningEffort`, and stall-nudge thresholds) that a project or role can opt into by referencing the config's name, independent of the single global connection profile. From this page you can:
@@ -73,6 +79,8 @@ The **`/models`** page manages named model configs — reusable endpoint + model
 - **Compare models** — a radar chart and sortable stats table plot each config across context window, max tokens, reasoning, quantization score, effective parameter count, and (log) parameter count, alongside historical usage (runs, total tokens, avg tokens/run) pulled from actual role-run history.
 - **Reorder, duplicate, set default** — drag-and-drop cards to set model priority, duplicate a config as a starting point, or promote one to the global default.
 - **Ping Network** — from the Projects page, check live connectivity to every configured model endpoint over an SSE stream (`GET /api/ping-network/stream`): each node streams in as `checking → ok/down` with a running "N/M available" count, so you can see at a glance which of your local/tailnet/cloud endpoints are reachable.
+
+![Coverage radar and model comparison table across context window, params, quantization, and usage](docs/public/screenshots/model-radar.png)
 
 ### Strategic LLM routing advisors (experimental)
 
