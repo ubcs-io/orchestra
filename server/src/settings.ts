@@ -16,7 +16,7 @@
  */
 
 import { getConfig } from "./config.js";
-import { getGlobalConfig, getProjectConfig, upsertConfig, type ConfigRow } from "./db.js";
+import { getGlobalConfig, getProjectConfig, listModelConfigs, upsertConfig, type ConfigRow } from "./db.js";
 
 /** Per-thinking-level reasoning token budgets (mirrors pi's ThinkingBudgets). */
 export interface ThinkingBudgets {
@@ -93,6 +93,12 @@ export interface ModelCompat {
    *  Passed to pi's SettingsManager so providers that support token-based thinking
    *  caps can constrain reasoning tokens separately from the max_tokens budget. */
   thinkingBudgets?: ThinkingBudgets;
+  /** Overrides agent.ts's DEFAULT_PREEMPTIVE_NUDGE_CHARS — answer-text characters
+   *  without a tool call before the pre-emptive stall nudge aborts the turn. */
+  nudgeThresholdChars?: number;
+  /** Text-mode counterpart of nudgeThresholdChars (overrides
+   *  DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE). */
+  nudgeThresholdCharsTextMode?: number;
 }
 
 /** Fully resolved connection settings for a single model call. */
@@ -230,4 +236,71 @@ export function resolveConnection(projectId?: number | null): Connection {
       parseThinkingBudgets(global?.thinking_budgets),
     ),
   };
+}
+
+/**
+ * Build a Connection from a single named model-config row. Unlike
+ * resolveConnection(), this does NOT merge with the project/global 'default'
+ * row — a named config (created via the Models UI) is a complete, standalone
+ * profile with its own base_url/api_key/text_mode/two_phase/compat. Bootstrap
+ * config only fills in fields the row itself leaves unset.
+ */
+function connectionFromConfigRow(row: ConfigRow): Connection {
+  const cfg = getConfig();
+  const envBaseUrl = process.env.ORCHESTRA_BASE_URL;
+  const envApiKey = process.env.ORCHESTRA_API_KEY;
+  return {
+    baseUrl: pick(envBaseUrl, row.base_url, cfg.providerBaseUrl)!,
+    apiKey: pick(envApiKey, row.api_key, cfg.apiKey) ?? "",
+    api: row.api ?? "openai-completions",
+    defaultModelId: pick(row.default_model, cfg.defaultModelId)!,
+    contextWindow: pick(row.context_window, cfg.contextWindow)!,
+    maxTokens: pick(row.max_tokens, cfg.maxTokens)!,
+    requestTimeoutMs: pick(row.request_timeout_ms, cfg.requestTimeoutMs)!,
+    reasoning: pick(boolFromDb(row.reasoning), cfg.reasoning)!,
+    thinkingLevel: pick(row.thinking_level, cfg.thinkingLevel)! as Connection["thinkingLevel"],
+    thinkingFormat: pick(row.thinking_format, cfg.thinkingFormat)!,
+    textMode: boolFromDb(row.text_mode) ?? false,
+    twoPhase: boolFromDb(row.two_phase) ?? false,
+    compat: parseCompat(row.compat_json),
+    thinkingBudgets: parseThinkingBudgets(row.thinking_budgets),
+  };
+}
+
+export interface ResolvedModel {
+  connection: Connection;
+  modelId: string;
+}
+
+/**
+ * Resolve the connection AND the actual modelId for a role/task model
+ * reference (`role.model` / `task.model`).
+ *
+ * `modelRef` may be:
+ *  - empty/undefined: falls back entirely to the project/global default
+ *    connection (today's behavior when no override is set).
+ *  - the `name` of a named model config (what RolesEditor's ModelPicker
+ *    stores): resolves to THAT config's own base_url/api_key/text_mode/
+ *    two_phase/compat — not the currently-active default connection — and the
+ *    modelId sent to the API is that config's `default_model`, not the name.
+ *  - a raw model id string that matches no config name (e.g. typed directly
+ *    into a free-text field): falls back to the default connection, using
+ *    modelRef verbatim as the modelId (today's existing behavior).
+ *
+ * This is what lets textMode/twoPhase vary per model: two roles pointed at
+ * two different named configs each get that config's own tool-calling mode,
+ * instead of both being governed by whichever connection is flagged default.
+ */
+export function resolveConnectionForModel(
+  modelRef: string | null | undefined,
+  projectId?: number | null,
+): ResolvedModel {
+  if (modelRef) {
+    const match = listModelConfigs().find((c) => c.name === modelRef);
+    if (match) {
+      return { connection: connectionFromConfigRow(match), modelId: match.default_model || modelRef };
+    }
+  }
+  const connection = resolveConnection(projectId);
+  return { connection, modelId: modelRef || connection.defaultModelId };
 }

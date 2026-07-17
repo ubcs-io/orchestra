@@ -11,8 +11,9 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, verdictClass, type TaskDetail as TD, type RoleRun, type CoverageMap, type AgentNetworkGraph } from "../api";
+import { api, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
+import { ReviewCTA } from "../components/ReviewCTA";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -77,53 +78,6 @@ function parseQuestion(raw: string): ParsedQuestion {
   return { text: q || raw.trim(), defaultAnswer: dflt, options: opts };
 }
 
-/** Extract actionable next-step items from a task's recap and coverage data. */
-function extractActionItems(recap_md: string | null, coverage: CoverageMap | null, runs: RoleRun[]): string[] {
-  const items: string[] = [];
-
-  // 1. Parse recommendation bullets from the recap (## Recommendation or ## Next Steps).
-  if (recap_md) {
-    const headerRe = /^##\s+(?:Recommendation|Next\s+Steps?|Follow.?up)/im;
-    const headerMatch = recap_md.match(headerRe);
-    if (headerMatch) {
-      const afterHeader = recap_md.slice(headerMatch.index! + headerMatch[0].length);
-      const nextHeader = afterHeader.search(/^##\s+/m);
-      const section = nextHeader >= 0 ? afterHeader.slice(0, nextHeader) : afterHeader;
-      const bulletRe = /^[-*]\s+(.+)$/gm;
-      let bm;
-      while ((bm = bulletRe.exec(section)) !== null) {
-        const text = bm[1]!.trim();
-        if (text && !text.startsWith("---")) {
-          items.push(text.slice(0, 200));
-        }
-      }
-    }
-  }
-
-  // 2. Fallback: decomposition role output for [epic]/[story]/[task] bullets.
-  if (items.length === 0) {
-    const decomp = runs.find((r) => r.role_key === "decomposition");
-    if (decomp?.output_md) {
-      const labelRe = /\[(epic|story|task)\]\s*(.+)/gi;
-      let lm;
-      while ((lm = labelRe.exec(decomp.output_md)) !== null) {
-        items.push(lm[2]!.trim().slice(0, 200));
-      }
-    }
-  }
-
-  // 3. Fallback: coverage gaps.
-  if (items.length === 0 && coverage) {
-    for (const [concern, entry] of Object.entries(coverage)) {
-      if (entry.status === "never") {
-        items.push(`${concern} — not yet evaluated`);
-      }
-    }
-  }
-
-  return items.slice(0, 8);
-}
-
 /** Collect all open questions grouped by role, skipping runs with no questions. */
 function collectQuestions(runs: RoleRun[]): Array<{ runId: number; roleKey: string; questions: string[] }> {
   const groups: Array<{ runId: number; roleKey: string; questions: string[] }> = [];
@@ -157,8 +111,10 @@ export interface ActivityState {
   roleEndTime: number | null;
   /** Completed role stats — persist across role_start so the TPS / timing stay visible. */
   lastRole: { role: string; tokens: number; elapsedSec: number } | null;
-  /** TPS values from all completed runs so far, for min/max display. */
-  tpsHistory: number[];
+  /** TPS values per role from all completed runs, for per-role min/max display. */
+  tpsHistory: Record<string, number[]>;
+  /** Whether the final recap LLM call is still in progress. */
+  recapGenerating: boolean;
 }
 
 /** Structured line item for the live activity console — replaces raw strings. */
@@ -179,7 +135,7 @@ export interface LineItem {
   };
 }
 
-function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }) {
+function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }, resetKey: number) {
   const [lines, setLines] = useState<LineItem[]>([]);
   const [activity, setActivity] = useState<ActivityState>({
     currentRole: null,
@@ -187,7 +143,8 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     roleStartTime: null,
     roleEndTime: null,
     lastRole: null,
-    tpsHistory: [],
+    tpsHistory: {},
+    recapGenerating: false,
   });
   const bufRef = useRef("");
   const thinkRef = useRef("");
@@ -195,7 +152,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
   const repeatRef = useRef(0);
   useEffect(() => {
     setLines([]);
-    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: [] });
+    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: {}, recapGenerating: false });
     const role = nextRoleRef.current;
     if (role) {
       setActivity((a) => a.currentRole ? a : { ...a, currentRole: role, disposition: "reading", roleStartTime: Date.now() });
@@ -286,8 +243,11 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
           ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed }
           : a.lastRole;
         const tps = lastRole ? lastRole.tokens / lastRole.elapsedSec : null;
-        const tpsHistory = tps != null ? [...a.tpsHistory, tps] : a.tpsHistory;
+        const tpsHistory = tps != null
+          ? { ...a.tpsHistory, [d.role]: [...(a.tpsHistory[d.role] ?? []), tps] }
+          : a.tpsHistory;
         return {
+          ...a,
           currentRole: d.role,
           disposition: "done",
           roleStartTime: a.roleStartTime,
@@ -297,12 +257,18 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
         };
       });
     });
+    es.addEventListener("recap_start", () => {
+      setActivity((a) => ({ ...a, recapGenerating: true }));
+    });
+    es.addEventListener("recap_end", () => {
+      setActivity((a) => ({ ...a, recapGenerating: false }));
+    });
     es.addEventListener("task_update", () => onActivity());
     es.onerror = () => {}; // browser auto-reconnects
 
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
+  }, [taskId, resetKey]);
   return { lines, activity };
 }
 
@@ -743,7 +709,8 @@ export function TaskDetail() {
   const q = useQuery({ queryKey: ["task", taskId], queryFn: () => api.task(taskId), refetchInterval: 4000 });
   const refresh = () => qc.invalidateQueries({ queryKey: ["task", taskId] });
   const nextRoleRef = useRef<string | null>(null);
-  const { lines, activity } = useTaskStream(taskId, refresh, nextRoleRef);
+  const [resetKey, setResetKey] = useState(0);
+  const { lines, activity } = useTaskStream(taskId, refresh, nextRoleRef, resetKey);
   const liveRef = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
 
@@ -779,9 +746,6 @@ export function TaskDetail() {
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
-
-  // Subtask creation state
-  const [creatingSubtaskKey, setCreatingSubtaskKey] = useState<string | null>(null);
 
   // Scheduler state for banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -828,22 +792,11 @@ export function TaskDetail() {
   const doReset = async () => {
     try {
       await api.resetTask(taskId);
+      setResetKey((k) => k + 1);
       refresh();
       setResetModal(false);
     } catch (e: unknown) {
       // error will show via query refetch
-    }
-  };
-
-  const createSubtask = async (name: string) => {
-    setCreatingSubtaskKey(name);
-    try {
-      await api.createSubtask(taskId, { name });
-      refresh();
-    } catch (e: unknown) {
-      // error will show via query refetch
-    } finally {
-      setCreatingSubtaskKey(null);
     }
   };
 
@@ -865,9 +818,6 @@ export function TaskDetail() {
       return next;
     });
   };
-
-  const isFinished = t.stage === "ready" || t.stage === "review";
-  const actionItems = isFinished ? extractActionItems(d.recap_md, d.coverage, d.runs) : [];
 
   return (
     <div>
@@ -921,6 +871,7 @@ export function TaskDetail() {
         )}
         <h2 style={{ margin: 0, color: "var(--brass)" }}>{t.name ?? t.task_id.slice(0, 8)}</h2>
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
+        {t.exit_state === "wont_do" && <span className="pill dim">won't do</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
@@ -928,13 +879,6 @@ export function TaskDetail() {
           <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}
       </div>
-
-      {t.review_reason && (
-        <div className="panel" style={{ borderColor: "var(--human)" }}>
-          <h2>Needs review</h2>
-          <p>{t.review_reason}</p>
-        </div>
-      )}
 
       {t.network_id && t.stage !== "intake" && (
         <div className="panel task-network-panel">
@@ -957,32 +901,27 @@ export function TaskDetail() {
 
       <div className="detail-grid">
         <div>
+          {/* Show recap for review/ready, then the ReviewCTA actions */}
           {t.stage === "ready" || t.stage === "review" ? (
-            <div className="panel">
-              <h2>Final Status</h2>
-              {d.recap_md ? (
-                <div
-                  className="section-md rendered-md"
-                  style={{ marginBottom: 16 }}
-                  dangerouslySetInnerHTML={{ __html: marked.parse(d.recap_md) as string }}
-                />
-              ) : (
-                <p className="muted">Waiting for orchestrator recap…</p>
+            <>
+              {activity.recapGenerating && !d.recap_md && (
+                <div className="panel">
+                  <div className="recap-loading">
+                    <span className="in-progress-pulse" />
+                    <span>Generating final assessment…</span>
+                  </div>
+                </div>
               )}
-              <div className="row" style={{ marginTop: 8 }}>
-                {t.stage === "review" && (
-                  <>
-                    <span className="pill human">needs review</span>
-                    <span className="muted">{t.review_reason ?? "Task requires human judgement."}</span>
-                  </>
-                )}
-                {t.stage === "ready" && (
-                  <>
-                    <span className="pill ok">{t.exit_state ?? "complete"}</span>
-                    <span className="muted">Task is ready for implementation.</span>
-                  </>
-                )}
-              </div>
+              {d.recap_md && (
+                <div className="panel">
+                  <h2>Final Status</h2>
+                  <div
+                    className="section-md rendered-md"
+                    style={{ marginBottom: 16 }}
+                    dangerouslySetInnerHTML={{ __html: marked.parse(d.recap_md) as string }}
+                  />
+                </div>
+              )}
               {d.runs.some((r) => r.output_md) && (
                 <details style={{ marginTop: 16 }}>
                   <summary className="muted" style={{ cursor: "pointer" }}>Per-role findings</summary>
@@ -1000,7 +939,7 @@ export function TaskDetail() {
                   </div>
                 </details>
               )}
-            </div>
+            </>
           ) : (
             <div className="panel">
               <h2>Live activity</h2>
@@ -1163,9 +1102,15 @@ export function TaskDetail() {
                 <div className="in-progress-stat">
                   <span className="muted">tps</span>
                   <span className="pill dim">
-                    {activity.tpsHistory.length > 0
-                      ? `min ${Math.min(...activity.tpsHistory).toFixed(0)} / cur — / max ${Math.max(...activity.tpsHistory).toFixed(0)}`
-                      : "—"}
+                    {(() => {
+                      const roleHistory = activity.currentRole ? activity.tpsHistory[activity.currentRole] : undefined;
+                      if (roleHistory && roleHistory.length > 0) {
+                        const minTps = Math.min(...roleHistory).toFixed(0);
+                        const maxTps = Math.max(...roleHistory).toFixed(0);
+                        return minTps === maxTps ? `${minTps} tps` : `min ${minTps} / max ${maxTps} tps`;
+                      }
+                      return "—";
+                    })()}
                   </span>
                 </div>
               </div>
@@ -1301,28 +1246,18 @@ export function TaskDetail() {
         </div>
 
         <div>
-          {isFinished && (
-            <div className="panel">
-              <h2>Next Steps</h2>
-              {actionItems.length > 0 ? (
-                <div className="next-steps-list">
-                  {actionItems.map((item, i) => (
-                    <div key={i} className="next-step-item">
-                      <span className="next-step-text">{item}</span>
-                      <button
-                        className="small primary"
-                        disabled={creatingSubtaskKey === item}
-                        onClick={() => createSubtask(item)}
-                      >
-                        {creatingSubtaskKey === item ? "…" : "+ subtask"}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="muted">No follow-up steps identified.</p>
-              )}
-            </div>
+
+          {/* Immediate next steps — shown when task is in review or ready */}
+          {(t.stage === "ready" || t.stage === "review") && (
+            <ReviewCTA
+              taskId={taskId}
+              task={t}
+              recapMd={d.recap_md}
+              coverage={d.coverage}
+              runs={d.runs}
+              childTasks={d.children}
+              onMutate={refresh}
+            />
           )}
 
           {/* Current state panel — shown whenever there's meaningful state */}
@@ -1506,7 +1441,7 @@ export function TaskDetail() {
             )}
           </div>
 
-          {questionGroups.length > 0 && (
+          {questionGroups.length > 0 && t.stage !== "review" && t.stage !== "ready" && (
             <div className="panel">
               <h2>Questions</h2>
               <div className="questions-panel">

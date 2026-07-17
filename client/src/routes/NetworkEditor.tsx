@@ -16,8 +16,9 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type AgentNetworkGraph, type NetworkEdge } from "../api";
+import { api, type AgentNetworkGraph, type NetworkEdge, type ModelConfig } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
+import { ModelPicker } from "./RolesEditor";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -87,6 +88,8 @@ function ProjectSelectModal({
 function RoleEditModal({
   role,
   projectId,
+  modelConfigs,
+  defaultModelConfigName,
   onSave,
   onCancel,
   isSaving,
@@ -101,6 +104,8 @@ function RoleEditModal({
     can_create_subtasks: number;
   };
   projectId: number | null;
+  modelConfigs: ModelConfig[];
+  defaultModelConfigName: string;
   onSave: (body: {
     enabled: number;
     can_create_subtasks: number;
@@ -177,10 +182,11 @@ function RoleEditModal({
         <input value={tools} onChange={(e) => setTools(e.target.value)} />
 
         <label>Model override (optional)</label>
-        <input
+        <ModelPicker
           value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder={projectId != null ? "(project default)" : "(global default)"}
+          onChange={setModel}
+          configs={modelConfigs}
+          defaultConfigName={defaultModelConfigName}
         />
 
         <label>System prompt</label>
@@ -224,6 +230,10 @@ export function NetworkEditor() {
   });
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
   const projectsQ = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
+  const modelConfigsQ = useQuery({ queryKey: ["model-configs"], queryFn: api.modelConfigs });
+  const modelConfigs = modelConfigsQ.data?.configs ?? [];
+  const defaultModelConfigName =
+    modelConfigs.find((c) => c.project_id === null && c.key === "default")?.name ?? "(none)";
 
   // --- Parse current graph ---
   const currentNetwork = networkQ.data?.network ?? null;
@@ -1014,6 +1024,8 @@ export function NetworkEditor() {
           <RoleEditModal
             role={role}
             projectId={null}
+            modelConfigs={modelConfigs}
+            defaultModelConfigName={defaultModelConfigName}
             onSave={(body) => roleSaveMutation.mutate(body)}
             onCancel={() => setRoleModalKey(null)}
             isSaving={roleSaveMutation.isPending}

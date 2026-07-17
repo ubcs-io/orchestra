@@ -6,6 +6,7 @@
  * routing templates; users can override per task (§5.5 steering).
  */
 
+import { createHash } from "node:crypto";
 import { countGlobalRoles, createNetwork, getDb, getMeta, listNetworks, setMeta, upsertRole } from "./db.js";
 
 /** Read-only pi built-in tools given to code-inspecting roles. */
@@ -262,14 +263,19 @@ do NOT attempt to explore the repository or claim to read files. Work from what 
 Your output budget is limited: be decisive and finish promptly. Do NOT narrate a plan to explore.`.trim();
 
 /**
- * Shared output contract appended to every role's system prompt. Every role MUST
- * finish by calling `record_findings` exactly once — that structured call is how
- * the Orchestrator captures verdict + coverage without fragile text parsing.
+ * Shared output contract appended to every role's system prompt. Defines the
+ * findings schema (verdict, summary, coverage, section_md) every role must
+ * report — deliberately mechanism-agnostic (no mention of `record_findings` or
+ * any other submission mechanism), since whether that's a tool call or structured
+ * text depends on the connection's textMode/twoPhase settings, which aren't known
+ * at role-seed time. The mechanism-specific instruction is appended at runtime by
+ * agent.ts's TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION / TWO_PHASE_EXPLORE_CONTRACT.
  * (The tool-aware "How to work" preamble is prepended by `buildRoleSystemPrompt`.)
  */
 export const OUTPUT_CONTRACT = `
 ## How to finish (required)
-When done, call the \`record_findings\` tool EXACTLY ONCE with:
+When you are done, your findings must convey the following. (The exact submission
+mechanism — a tool call or structured text — is specified elsewhere in your instructions.)
 - verdict: one of "pass" (your concern is adequately addressed), "needs_more"
   (more refinement needed before this is actionable), "blocker" (a hard problem
   must be resolved first), or "needs_human" (ambiguity only a person can resolve).
@@ -563,34 +569,59 @@ export function buildRoleSystemPrompt(persona: string, tools: string[] = READ_ON
 }
 
 /**
- * Bump when the default personas / contract change so existing DBs re-seed the
- * global rows. Project-override rows (project_id set) are never touched.
+ * The exact seed payload for one role — used both to compute the content hash
+ * and to upsert the row, so the two can never drift out of sync with each other.
  */
-export const ROLES_SEED_VERSION = 3;
+function roleSeedPayload(r: RoleSeed) {
+  return {
+    key: r.key,
+    title: r.title,
+    ordering: r.ordering,
+    appliesTo: r.appliesTo,
+    tools: r.tools,
+    can_create_subtasks: r.can_create_subtasks,
+    system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
+  };
+}
 
 /**
- * Seed (or refresh) the global default role catalog. Idempotent within a version:
- * runs on first boot, and again when ROLES_SEED_VERSION increases so prompt fixes
- * propagate to existing databases. Only global (project_id NULL) rows are upserted.
+ * Hash of everything seedGlobalRoles() is about to persist. Comparing this
+ * against the last-seeded hash (instead of a hand-maintained version number)
+ * means any change to a persona, OUTPUT_CONTRACT, tool list, ordering, etc.
+ * automatically triggers a reseed on next boot — there is no version bump to
+ * remember (or forget mid-session, as happened here once already).
+ */
+function computeRolesSeedHash(): string {
+  const payload = DEFAULT_ROLES.map(roleSeedPayload);
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+/**
+ * Seed (or refresh) the global default role catalog. Idempotent: runs on first
+ * boot, and again whenever the seed content's hash changes, so prompt fixes
+ * automatically propagate to existing databases. Only global (project_id NULL)
+ * rows are upserted; project overrides are never touched.
  */
 export function seedGlobalRoles(): void {
-  const stored = Number(getMeta("roles_seed_version") ?? "0");
-  if (countGlobalRoles() > 0 && stored >= ROLES_SEED_VERSION) return;
+  const hash = computeRolesSeedHash();
+  const stored = getMeta("roles_seed_hash");
+  if (countGlobalRoles() > 0 && stored === hash) return;
   for (const r of DEFAULT_ROLES) {
+    const p = roleSeedPayload(r);
     upsertRole({
       project_id: null,
-      key: r.key,
-      title: r.title,
+      key: p.key,
+      title: p.title,
       enabled: true,
-      applies_to: JSON.stringify(r.appliesTo),
-      ordering: r.ordering,
-      system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
-      tools_json: JSON.stringify(r.tools),
-      can_create_subtasks: r.can_create_subtasks,
+      applies_to: JSON.stringify(p.appliesTo),
+      ordering: p.ordering,
+      system_prompt: p.system_prompt,
+      tools_json: JSON.stringify(p.tools),
+      can_create_subtasks: p.can_create_subtasks,
     });
   }
-  setMeta("roles_seed_version", String(ROLES_SEED_VERSION));
-  console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (v${ROLES_SEED_VERSION})`);
+  setMeta("roles_seed_hash", hash);
+  console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (hash ${hash.slice(0, 8)})`);
 }
 
 // ---------------------------------------------------------------------------

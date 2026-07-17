@@ -167,6 +167,14 @@ export function initDb(): void {
       created_at    TEXT,
       updated_at    TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS task_chat_messages (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id    TEXT NOT NULL,
+      role       TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      created_at TEXT
+    );
   `);
 
   // New tasks columns (existing DBs only have the original db.py set). Must run
@@ -229,6 +237,9 @@ export function initDb(): void {
 
   // Agent network linking: custom flow template per task.
   addColumnIfMissing(d, "tasks", "network_id", "network_id TEXT");
+  // Links a "decompose question" child task back to the question that spawned it.
+  addColumnIfMissing(d, "tasks", "origin_role_key", "origin_role_key TEXT");
+  addColumnIfMissing(d, "tasks", "origin_question", "origin_question TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -239,6 +250,7 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_configs_project ON configs(project_id);
     CREATE INDEX IF NOT EXISTS idx_agent_networks_project ON agent_networks(project_id);
     CREATE INDEX IF NOT EXISTS idx_agent_networks_intake ON agent_networks(intake_kind);
+    CREATE INDEX IF NOT EXISTS idx_task_chat_messages_task ON task_chat_messages(task_id);
   `);
 }
 
@@ -302,6 +314,8 @@ export interface TaskRow {
   recap_md: string | null;
   paused: number | null;
   network_id: string | null;
+  origin_role_key: string | null;
+  origin_question: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -366,6 +380,14 @@ export interface InterventionRow {
   payload_json: string | null;
   created_by: string | null;
   consumed_at: string | null;
+  created_at: string;
+}
+
+export interface TaskChatMessageRow {
+  id: number;
+  task_id: string;
+  role: string;
+  content: string;
   created_at: string;
 }
 
@@ -685,6 +707,9 @@ export function createTask(input: {
   step_number?: number | null;
   artifact_path?: string | null;
   refinement_plan_json?: string | null;
+  network_id?: string | null;
+  origin_role_key?: string | null;
+  origin_question?: string | null;
 }): TaskRow {
   const d = getDb();
   const ts = now();
@@ -692,9 +717,11 @@ export function createTask(input: {
   const info = d
     .prepare(
       `INSERT INTO tasks (task_id, name, status, model, content, project_id, stage, level, intake_kind,
-         exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json, created_at, updated_at)
+         exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json,
+         network_id, origin_role_key, origin_question, created_at, updated_at)
        VALUES (@task_id, @name, @status, @model, @content, @project_id, @stage, @level, @intake_kind,
-         @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json, @ts, @ts)`,
+         @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json,
+         @network_id, @origin_role_key, @origin_question, @ts, @ts)`,
     )
     .run({
       task_id: taskId,
@@ -712,6 +739,9 @@ export function createTask(input: {
       step_number: input.step_number ?? null,
       artifact_path: input.artifact_path ?? null,
       refinement_plan_json: input.refinement_plan_json ?? null,
+      network_id: input.network_id ?? null,
+      origin_role_key: input.origin_role_key ?? null,
+      origin_question: input.origin_question ?? null,
       ts,
     });
   return getTask(Number(info.lastInsertRowid))!;
@@ -987,6 +1017,34 @@ export function markInterventionConsumed(id: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Task chat messages (freeform chat against a decomposed question subtask)
+// ---------------------------------------------------------------------------
+
+export function createChatMessage(input: {
+  task_id: string;
+  role: "user" | "assistant";
+  content: string;
+}): TaskChatMessageRow {
+  const d = getDb();
+  const ts = now();
+  const info = d
+    .prepare(
+      `INSERT INTO task_chat_messages (task_id, role, content, created_at)
+       VALUES (@task_id, @role, @content, @ts)`,
+    )
+    .run({ task_id: input.task_id, role: input.role, content: input.content, ts });
+  return d
+    .prepare(`SELECT * FROM task_chat_messages WHERE id = ?`)
+    .get(Number(info.lastInsertRowid)) as TaskChatMessageRow;
+}
+
+export function listChatMessages(taskId: string): TaskChatMessageRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM task_chat_messages WHERE task_id = ? ORDER BY id ASC`)
+    .all(taskId) as TaskChatMessageRow[];
+}
+
+// ---------------------------------------------------------------------------
 // Agent Networks (visual flow templates)
 // ---------------------------------------------------------------------------
 
@@ -1120,7 +1178,7 @@ export function setDefaultNetwork(
   return getNetwork(network.id);
 }
 
-export function deleteNetwork(identifier: number | string): void {
+  export function deleteNetwork(identifier: number | string): void {
   const d = getDb();
   const network = getNetwork(identifier);
   if (!network || network.is_system) return; // cannot delete system networks
@@ -1129,6 +1187,66 @@ export function deleteNetwork(identifier: number | string): void {
   const keyCol = isNumeric ? "id" : "network_id";
   const keyVal = isNumeric ? Number(identifier) : String(identifier);
   d.prepare(`DELETE FROM agent_networks WHERE ${keyCol} = ?`).run(keyVal);
+}
+
+// ---------------------------------------------------------------------------
+// Model performance stats (historical TPS from role_runs)
+// ---------------------------------------------------------------------------
+
+export interface ModelPerformanceRow {
+  config_id: number;
+  config_name: string | null;
+  model_id: string | null;
+  total_runs: number;
+  total_tokens: number;
+  avg_tokens_per_run: number;
+}
+
+/** Aggregate token usage from role_runs, keyed by the model identifier string. */
+export function getModelPerformanceStats(): ModelPerformanceRow[] {
+  const d = getDb();
+  const raw = d.prepare(`
+    SELECT
+      r.model AS model_id,
+      COUNT(*) AS total_runs,
+      COALESCE(SUM(r.tokens), 0) AS total_tokens
+    FROM role_runs r
+    WHERE r.model IS NOT NULL AND r.tokens IS NOT NULL AND r.tokens > 0
+    GROUP BY r.model
+  `).all() as Array<{ model_id: string; total_runs: number; total_tokens: number }>;
+
+  // Match runs to configs by model name (the config's default_model field).
+  const configs = listModelConfigs();
+  const result: ModelPerformanceRow[] = [];
+
+  for (const row of raw) {
+    // Find configs where default_model matches this model_id
+    const matching = configs.filter((c) => c.default_model === row.model_id);
+    if (matching.length > 0) {
+      for (const cfg of matching) {
+        result.push({
+          config_id: cfg.id,
+          config_name: cfg.name,
+          model_id: row.model_id,
+          total_runs: row.total_runs,
+          total_tokens: row.total_tokens,
+          avg_tokens_per_run: row.total_runs > 0 ? Math.round(row.total_tokens / row.total_runs) : 0,
+        });
+      }
+    } else {
+      // Model name appears in runs but doesn't match any config's default_model
+      result.push({
+        config_id: -1,
+        config_name: null,
+        model_id: row.model_id,
+        total_runs: row.total_runs,
+        total_tokens: row.total_tokens,
+        avg_tokens_per_run: row.total_runs > 0 ? Math.round(row.total_tokens / row.total_runs) : 0,
+      });
+    }
+  }
+
+  return result;
 }
 
   // ---------------------------------------------------------------------------

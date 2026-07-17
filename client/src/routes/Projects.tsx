@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, displayModelName, verdictClass, type PingResult } from "../api";
@@ -14,6 +14,19 @@ export function Projects() {
   const [pinging, setPinging] = useState(false);
   const [pingResults, setPingResults] = useState<PingResult[] | null>(null);
   const [pingError, setPingError] = useState("");
+  const esRef = useRef<EventSource | null>(null);
+
+  const closeStream = useCallback(() => {
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => closeStream();
+  }, [closeStream]);
 
   const create = useMutation({
     mutationFn: () => api.createProject({ name, repo_path: repoPath }),
@@ -39,23 +52,64 @@ export function Projects() {
     }
   }
 
-  async function doPing() {
+  function doPing() {
+    // Clean up any existing stream
+    closeStream();
     setPinging(true);
     setPingError("");
     setPingResults(null);
-    try {
-      const res = await api.pingNetwork();
-      setPingResults(res.results);
-    } catch (e) {
-      setPingError((e as Error).message);
-    } finally {
+
+    const es = new EventSource(api.pingNetworkStreamUrl());
+    esRef.current = es;
+
+    es.addEventListener("init", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        configs: Array<{ config_id: number; name: string; base_url: string }>;
+      };
+      // Immediately show the full list with "checking" status
+      setPingResults(
+        data.configs.map((c) => ({
+          config_id: c.config_id,
+          name: c.name,
+          base_url: c.base_url,
+          available: false,
+          status: "checking" as const,
+        })),
+      );
+    });
+
+    es.addEventListener("result", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        config_id: number;
+        available: boolean;
+        error?: string;
+      };
+      setPingResults((prev) => {
+        if (!prev) return prev;
+        return prev.map((r) =>
+          r.config_id === data.config_id
+            ? { ...r, available: data.available, error: data.error, status: "done" as const }
+            : r,
+        );
+      });
+    });
+
+    es.addEventListener("done", () => {
       setPinging(false);
-    }
+      closeStream();
+    });
+
+    es.onerror = () => {
+      setPinging(false);
+      setPingError("Connection lost during ping");
+      closeStream();
+    };
   }
 
   const stats = summaryQ.data;
   const availableCount = pingResults?.filter((r) => r.available).length ?? 0;
   const totalNodes = pingResults?.length ?? 0;
+  const checkedCount = pingResults?.filter((r) => r.status === "done").length ?? 0;
 
   return (
     <div>
@@ -133,22 +187,27 @@ export function Projects() {
             disabled={pinging}
             onClick={doPing}
           >
-            {pinging ? "Pinging…" : "Ping Network"}
+            {pinging ? `Pinging… (${checkedCount}/${totalNodes})` : "Ping Network"}
           </button>
         </div>
         {pingError && <p className="pill bad" style={{ marginTop: 8 }}>{pingError}</p>}
         {pingResults && (
           <div>
             <p className="muted" style={{ marginTop: 4, marginBottom: 8 }}>
-              {availableCount}/{totalNodes} nodes available
+              {pinging ? `${checkedCount}/${totalNodes} checked so far` : `${availableCount}/${totalNodes} nodes available`}
             </p>
             <div className="ping-results">
               {pingResults.map((r) => (
-                <div key={r.config_id} className={`ping-node ${r.available ? "ping-ok" : "ping-down"}`}>
-                  <span className={`ping-dot ${r.available ? "ok" : "bad"}`} />
+                <div key={r.config_id} className={`ping-node ${r.status === "checking" ? "ping-checking" : r.available ? "ping-ok" : "ping-down"}`}>
+                  <span className={`ping-dot ${r.status === "checking" ? "ping-dot--checking" : r.available ? "ok" : "bad"}`} />
                   <span className="ping-name">{r.name}</span>
                   <span className="muted" style={{ fontSize: 11 }}>{r.base_url}</span>
-                  {r.error && <span className="pill bad" style={{ fontSize: 10 }}>{r.error}</span>}
+                  {r.status === "checking" && (
+                    <span className="pill dim" style={{ fontSize: 10 }}>checking…</span>
+                  )}
+                  {r.status === "done" && r.error && (
+                    <span className="pill bad" style={{ fontSize: 10 }}>{r.error}</span>
+                  )}
                 </div>
               ))}
             </div>
@@ -159,42 +218,14 @@ export function Projects() {
         )}
       </div>
 
-      {/* ---- Register Repository ---- */}
-      <div className="panel">
-        <h2>Register a repository</h2>
-        <div className="grid-2">
-          <div>
-            <label>Project name</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-service" />
-          </div>
-          <div>
-            <label>Absolute path to the repo root (a subdirectory or .git also works)</label>
-            <div className="repo-path-row">
-              <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="/Users/me/code/my-service" />
-              <button className="picker-btn" title="Browse for folder" disabled={picking} onClick={pickFolder}>
-                {picking ? "…" : "📁"}
-              </button>
-            </div>
-          </div>
-        </div>
-        {err && <p className="pill bad" style={{ marginTop: 8 }}>{err}</p>}
-        <div style={{ marginTop: 10 }}>
-          <button className="primary" disabled={!name || !repoPath || create.isPending} onClick={() => create.mutate()}>
-            {create.isPending ? "Registering…" : "Register project"}
-          </button>
-        </div>
-      </div>
-
       {/* ---- Project List ---- */}
       <div className="panel">
         <h2>Projects</h2>
         {isLoading ? (
           <p className="muted">Loading…</p>
-        ) : !data?.projects.length ? (
-          <p className="empty">No projects yet. Register a git repo above to begin.</p>
         ) : (
           <div className="project-grid">
-            {data.projects.map((p) => (
+            {data?.projects && data.projects.length > 0 && data.projects.map((p) => (
               <div className="project-card" key={p.id}>
                 <Link className="project-name" to="/projects/$projectId" params={{ projectId: String(p.id) }}>{p.name}</Link>
                 <div className="project-meta">
@@ -211,6 +242,31 @@ export function Projects() {
                 </div>
               </div>
             ))}
+            {/* ---- Register Repository (inline card) ---- */}
+            <div className="project-card project-card--register">
+              <div className="project-name">Register a repository</div>
+              <div className="grid-2" style={{ width: "100%" }}>
+                <div>
+                  <label>Project name</label>
+                  <input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-service" />
+                </div>
+                <div>
+                  <label>Absolute path to the repo root</label>
+                  <div className="repo-path-row">
+                    <input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="/Users/me/code/my-service" />
+                    <button className="picker-btn" title="Browse for folder" disabled={picking} onClick={pickFolder}>
+                      {picking ? "…" : "📁"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {err && <p className="pill bad" style={{ marginTop: 8 }}>{err}</p>}
+              <div className="project-actions" style={{ marginTop: 8 }}>
+                <button className="primary" disabled={!name || !repoPath || create.isPending} onClick={() => create.mutate()}>
+                  {create.isPending ? "Registering…" : "Register project"}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

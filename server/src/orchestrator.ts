@@ -38,6 +38,7 @@ import {
   planningRoot,
   refineCommitMessage,
   removeFile,
+  sanitizePath,
   scaffoldPlanning,
   scanIntake,
   writeArtifact,
@@ -60,7 +61,7 @@ import {
   type RunRoleParams,
 } from "./agent.js";
 import { getConfig } from "./config.js";
-import { resolveConnection } from "./settings.js";
+import { resolveConnectionForModel } from "./settings.js";
 import {
   resolveRouterConfig,
   distillQuestions,
@@ -479,7 +480,7 @@ export function inferIntakeKind(fileName: string, content: string): IntakeKind {
   return "manual";
 }
 
-function artifactName(task: TaskRow): string {
+export function artifactName(task: TaskRow): string {
   const shortId = task.task_id.slice(0, 8);
   const safe = (task.name ?? "task").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 40);
   const base = safe.replace(/\.md$/i, "");
@@ -567,6 +568,9 @@ function consumeInterventions(task: TaskRow, plan: RefinementPlan): { plan: Refi
       case "promote_role":
         if (p.role && task.project_id != null) promoteRole(task, p.role);
         break;
+      case "wont_do":
+        updateTask(task.task_id, { stage: "ready", exit_state: "wont_do", paused: 1 });
+        break;
       // steer_note / pin_question influence context (read in buildContext), no plan change
       default:
         break;
@@ -644,7 +648,7 @@ function getRouterCfg(project: ProjectRow): RouterConfig | null {
 // Context building
 // ---------------------------------------------------------------------------
 
-function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false): string {
+function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false, textMode = false): string {
   const parts: string[] = [];
   parts.push(`# Task: ${task.name ?? task.task_id}`);
   parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
@@ -696,11 +700,20 @@ function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false): str
         `tool — just write your summary as plain text. You will be asked to formalize it as structured ` +
         `JSON in the next step.`,
     );
+  } else if (textMode) {
+    parts.push(
+      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+        `output your findings as a single \`\`\`json code block at the end of your response. You do NOT ` +
+        `have a \`record_findings\` tool — do not try to call it. Instead, use this exact JSON format:\n` +
+        `\`\`\`\n{"verdict": "pass", "summary": "...", "open_questions": [], "coverage": [...], ` +
+        `"section_md": "## My Role\\n\\n..."}\n\`\`\`\n` +
+        `See the system prompt for the full schema. Output ONLY the JSON block — nothing after the closing \`\`\`.`,
+    );
   } else {
     parts.push(
       `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
-        `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in plain ` +
-        `text first — just make it.`,
+        `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in ` +
+        `plain text first — make the function call directly.`,
     );
   }
   return parts.join("\n");
@@ -745,8 +758,10 @@ function maybeDistillQuestions(
     }
   }
 
-  const conn = resolveConnection(project.id);
-  const modelId = task.model || project.default_model || conn.defaultModelId;
+  const { modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
 
   // Fire-and-forget — do not await
   distillQuestions(
@@ -800,7 +815,6 @@ function isJsonParseError(message: string): boolean {
 // ---------------------------------------------------------------------------
 
 async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, plan: RefinementPlan): Promise<void> {
-  const conn = resolveConnection(project.id);
   const planningDir = project.planning_dir || "PLANNING";
   const role = getRole(project.id, step.role) ?? getRole(null, step.role);
   if (!role || !role.system_prompt) {
@@ -811,9 +825,30 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   }
 
   const tools: string[] = role.tools_json ? (JSON.parse(role.tools_json) as string[]) : [];
-  const modelId = role.model || task.model || project.default_model || conn.defaultModelId;
+  // Resolve the connection FROM the chosen model reference (a named model-config's
+  // `name`, or a raw modelId) rather than always the project/global default — this
+  // is what lets textMode/twoPhase/base_url vary per role when a model override
+  // points at a config with its own settings. Falls back to the default connection
+  // (and its defaultModelId) when no override is set, matching prior behavior.
+  const modelRef = role.model || task.model || project.default_model || null;
+  const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const absArtifact = path.join(project.repo_path, relArtifact);
+
+  // Deep-sanitize home-directory paths from streaming event data (tool args,
+  // text deltas, thinking deltas) before they hit the live activity pane.
+  const sanitizeEventData = (data: unknown): unknown => {
+    if (typeof data === "string") return sanitizePath(data);
+    if (data && typeof data === "object") {
+      if (Array.isArray(data)) return data.map(sanitizeEventData);
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+        out[k] = sanitizeEventData(v);
+      }
+      return out;
+    }
+    return data;
+  };
 
   publish(task.task_id, "role_start", { role: step.role, depth: step.depth });
 
@@ -828,11 +863,13 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       modelId,
       systemPrompt: role.system_prompt,
       tools,
-      context: buildRoleContext(task, step.role, conn.twoPhase),
-      thinkingLevel: conn.reasoning ? conn.thinkingLevel : undefined,
-      textMode: conn.textMode,
-      twoPhase: conn.twoPhase,
-      onEvent: (ev) => publish(task.task_id, ev.type as never, ev),
+      context: buildRoleContext(task, step.role, connection.twoPhase, connection.textMode),
+      thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
+      textMode: connection.textMode,
+      twoPhase: connection.twoPhase,
+      thinkingBudgets: connection.thinkingBudgets,
+      connection,
+      onEvent: (ev) => publish(task.task_id, ev.type as never, sanitizeEventData(ev)),
       signal: ac.signal,
     });
   } catch (err) {
@@ -1034,8 +1071,10 @@ async function generateRecap(
   coverage: CoverageMap,
   criteriaResults: CriteriaResult[],
 ): Promise<string | null> {
-  const conn = resolveConnection(project.id);
-  const modelId = task.model || project.default_model || conn.defaultModelId;
+  const { connection, modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
   const planningDir = project.planning_dir || "PLANNING";
   const context = buildRecapContext(task, project, runs, coverage, criteriaResults);
 
@@ -1053,6 +1092,8 @@ async function generateRecap(
         "Do not describe what you are doing; just produce the recap.",
       tools: [],
       context,
+      thinkingBudgets: connection.thinkingBudgets,
+      connection,
       signal: new AbortController().signal,
     });
     return result.findings.section_md || result.findings.summary || null;
@@ -1109,8 +1150,10 @@ async function maybeAssessEscalation(
     ]),
   ];
 
-  const conn = resolveConnection(project.id);
-  const modelId = task.model || project.default_model || conn.defaultModelId;
+  const { modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
 
   try {
     const assessment = await assessEscalation(
@@ -1249,8 +1292,10 @@ async function maybeAssessBorderline(
     unmetMust.some((c) => c.ownerRole === r.role_key),
   );
 
-  const conn = resolveConnection(project.id);
-  const modelId = task.model || project.default_model || conn.defaultModelId;
+  const { modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
 
   try {
     const assessment = await assessBorderline(
@@ -1375,9 +1420,17 @@ async function applyGate(
 
   /** Fire-and-forget: generate a recap for a task that just reached terminal state. */
   const triggerRecap = (finalCoverage: CoverageMap, finalCriteria: CriteriaResult[]) => {
+    publish(task.task_id, "recap_start", {});
     generateRecap(task, project, listRoleRuns(task.task_id), finalCoverage, finalCriteria).then(
       (recapMd) => {
         if (recapMd) updateTask(task.task_id, { recap_md: recapMd });
+        publish(task.task_id, "recap_end", { success: true });
+        publish(task.task_id, "task_update", { stage: task.stage });
+      },
+      (err) => {
+        console.error(`[orchestrator] recap failed: ${(err as Error).message}`);
+        publish(task.task_id, "recap_end", { success: false });
+        publish(task.task_id, "task_update", { stage: task.stage });
       },
     );
   };
@@ -1483,7 +1536,7 @@ async function applyGate(
             // Skip remaining loop-backs, escalate immediately
             const reason =
               `[router] Acceptance review incomplete — router advised early escalation after ${attempts} attempt(s).` +
-              (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => c.id).join(", ")}.` : "") +
+              (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => `${c.text} (${c.id})`).join("; ")}.` : "") +
               (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
             escalate(reason);
             triggerRecap(coverage, criteriaResults);
@@ -1535,7 +1588,7 @@ async function applyGate(
       // Loop-backs exhausted → human review.
       const reason =
         `Acceptance review incomplete after ${flow.maxLoopbacks} loop-back(s).` +
-        (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => c.id).join(", ")}.` : "") +
+        (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => `${c.text} (${c.id})`).join("; ")}.` : "") +
         (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
       escalate(reason);
       triggerRecap(coverage, criteriaResults);

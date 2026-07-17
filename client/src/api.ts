@@ -25,6 +25,8 @@ export interface Task {
   refinement_plan_json: string | null;
   content: string | null;
   network_id: string | null;
+  origin_role_key: string | null;
+  origin_question: string | null;
 }
 
 export interface RoleRun {
@@ -64,6 +66,14 @@ export interface Intervention {
   kind: string;
   payload_json: string | null;
   consumed_at: string | null;
+  created_at: string;
+}
+
+export interface ChatMessage {
+  id: number;
+  task_id: string;
+  role: string;
+  content: string;
   created_at: string;
 }
 
@@ -170,6 +180,7 @@ export interface TaskDetail {
   runs: RoleRun[];
   interventions: Intervention[];
   children: Task[];
+  chat_messages: ChatMessage[];
   taxonomy: string[];
 }
 
@@ -327,6 +338,15 @@ export interface PingResult {
   base_url: string;
   available: boolean;
   error?: string;
+  status: "checking" | "done";
+}
+
+export interface PingResultInit {
+  configs: Array<{
+    config_id: number;
+    name: string;
+    base_url: string;
+  }>;
 }
 
 export const api = {
@@ -383,6 +403,18 @@ export const api = {
 
   createSubtask: (taskId: string, body: { name: string; content?: string }) =>
     req<{ task: Task }>(`/api/tasks/${taskId}/subtasks`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  decomposeQuestion: (taskId: string, body: { role_key: string; question: string }) =>
+    req<{ task: Task; created: boolean }>(`/api/tasks/${taskId}/questions/decompose`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  sendChatMessage: (taskId: string, body: { message: string }) =>
+    req<{ user_message: ChatMessage; assistant_message: ChatMessage }>(`/api/tasks/${taskId}/chat`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
@@ -487,8 +519,44 @@ export const api = {
 
   // Summary dashboard
   summary: () => req<SummaryStats>("/api/summary"),
-  pingNetwork: () => req<{ results: PingResult[] }>("/api/ping-network", { method: "POST" }),
+  /** URL for the SSE ping-network stream (GET). */
+  pingNetworkStreamUrl: () => "/api/ping-network/stream",
+
+  // ---- Model stats (radar chart + performance comparison) ----
+  modelStats: (configIds?: number[]) =>
+    req<{ stats: ModelStat[] }>("/api/model-stats", {
+      method: "POST",
+      body: JSON.stringify({ config_ids: configIds }),
+    }),
 };
+
+export interface ModelStat {
+  config_id: number;
+  name: string;
+  model_id: string | null;
+  context_window: number | null;
+  max_tokens: number | null;
+  reasoning: boolean;
+  thinking_level: string | null;
+  thinking_format: string | null;
+  text_mode: boolean;
+  has_api_key: boolean;
+  has_env_token: boolean;
+  location: string | null;
+  parameter_count_b: number | null;
+  parameter_count_estimated: number | null;
+  total_parameter_count_b: number | null;
+  active_parameter_count_b: number | null;
+  effective_params_b: number | null;
+  quantization: string | null;
+  quantization_estimated: string | null;
+  quantization_score: number;
+  cost_per_1m_input: number | null;
+  cost_per_1m_output: number | null;
+  historical_runs: number;
+  historical_total_tokens: number;
+  historical_avg_tokens_per_run: number;
+}
 
 /** Strip GGUF shard suffixes like "-00001-of-00003.gguf" for display purposes. */
 export function displayModelName(name: string): string {

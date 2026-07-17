@@ -21,7 +21,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
 import { appendArtifactSection, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
-import { resolveConnection } from "./settings.js";
+import { resolveConnection, type Connection, type ThinkingBudgets } from "./settings.js";
 import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.js";
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
@@ -111,6 +111,16 @@ export interface RunRoleParams {
    *  Supersedes textMode for models whose built-in tool usage works but whose
    *  custom tool calling (record_findings) is unreliable. */
   twoPhase?: boolean;
+  /** Per-thinking-level reasoning token budgets passed to pi's SettingsManager.
+   *  Caps reasoning spend so the model's output has guaranteed headroom.
+   *  Falls back to the global connection's thinkingBudgets when omitted. */
+  thinkingBudgets?: ThinkingBudgets;
+  /** Pre-resolved connection (base URL/auth/textMode/twoPhase/compat/thinkingBudgets)
+   *  for `modelId` — pass the result of settings.ts's `resolveConnectionForModel()`
+   *  so a role/task running against a named model-config override uses THAT
+   *  config's own settings instead of the project/global default connection.
+   *  Falls back to `resolveConnection()` (today's behavior) when omitted. */
+  connection?: Connection;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -208,13 +218,21 @@ const THINK_CLOSE = "</think>";
 // a known failure mode on self-hosted endpoints whose chat template doesn't reliably
 // surface tool calls as structured deltas: the model just talks about calling the
 // tool (e.g. "Let me call record_findings now") forever, burning the token budget.
-const STALL_REPEAT_THRESHOLD = 3;
+// Kept fairly high because both this and the narration check below abort the stream
+// mid-chunk the instant they fire — false positives on legitimate verbose analysis
+// truncate output mid-word (see PREEMPTIVE_NUDGE_CHARS below).
+const STALL_REPEAT_THRESHOLD = 5;
 const STALL_MIN_SENTENCE_LEN = 20;
 
-const TOOL_CALL_DISCIPLINE =
+export const TOOL_CALL_DISCIPLINE =
   "\n\nWhen you are ready to use a tool, invoke it directly as a function call — never describe or " +
   'narrate the call in plain text (e.g. do not write "Let me call record_findings now" or similar). ' +
-  "Plain text should contain your analysis, not announcements of tool use.";
+  "Plain text should contain your analysis, not announcements of tool use.\n\n" +
+  "When you are done, call the `record_findings` tool EXACTLY ONCE with the fields described in " +
+  '"How to finish" above. record_findings is a platform custom tool and IS available to you. Even ' +
+  'if it does not appear in a separate "built-in" tool list, it is registered and ready — just ' +
+  'call it. You will not get a "tool not found" error for it. Do not question whether it exists — ' +
+  "invoke it when you are done.";
 
 const STALL_NUDGE =
   "You just described calling a tool in plain text, repeatedly, without actually invoking it. Stop " +
@@ -250,7 +268,7 @@ function hasNarrationPattern(text: string): boolean {
  * Instruction appended to the system prompt when textMode is on. The model is told
  * to output its findings as a JSON code block instead of using record_findings.
  */
-const TEXT_MODE_INSTRUCTION = `
+export const TEXT_MODE_INSTRUCTION = `
 ## How to finish (text mode)
 
 You do NOT have a record_findings tool. Instead, when you are done with your analysis,
@@ -520,15 +538,20 @@ function tryParseFindings(json: string): RoleFindings | null {
 // ---- Main role runner ----
 
 /**
- * Number of answer-text characters without a tool call before we pre-emptively
- * inject the stall nudge (token-budget guard). This fires before the model runs
- * out of tokens, giving the retry room to work.
+ * Default number of answer-text characters without a tool call before we
+ * pre-emptively inject the stall nudge (token-budget guard). This fires before the
+ * model runs out of tokens, giving the retry room to work.
  *
  * In text_mode, reasoning models spend most of their output on <think> analysis
  * before producing the JSON block — a higher threshold gives them room to think.
+ *
+ * These fire an immediate session.abort() mid-stream (see the message_update
+ * handler below), which can cut generation off mid-word — so they're intentionally
+ * generous defaults, not a tight budget. Overridable per connection profile via
+ * ModelCompat.nudgeThresholdChars / nudgeThresholdCharsTextMode (settings.ts).
  */
-const PREEMPTIVE_NUDGE_CHARS = 2000;
-const PREEMPTIVE_NUDGE_CHARS_TEXT_MODE = 6000;
+const DEFAULT_PREEMPTIVE_NUDGE_CHARS = 8000;
+const DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE = 20000;
 
 export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const textMode = params.textMode === true;
@@ -626,10 +649,15 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       ? TEXT_MODE_INSTRUCTION
       : TOOL_CALL_DISCIPLINE;
 
-  const conn = resolveConnection();
+  const connection = params.connection ?? resolveConnection();
+  const thinkingBudgets = params.thinkingBudgets ?? connection.thinkingBudgets;
   const settingsManager = SettingsManager.inMemory(
-    conn.thinkingBudgets ? { thinkingBudgets: conn.thinkingBudgets } : undefined,
+    thinkingBudgets ? { thinkingBudgets } : undefined,
   );
+  const nudgeThresholdChars =
+    connection.compat.nudgeThresholdChars ?? DEFAULT_PREEMPTIVE_NUDGE_CHARS;
+  const nudgeThresholdCharsTextMode =
+    connection.compat.nudgeThresholdCharsTextMode ?? DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE;
   const loader = new DefaultResourceLoader({
     cwd: params.repoPath,
     agentDir: getAgentDir(),
@@ -643,7 +671,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   });
   await loader.reload();
 
-  const model = ensureModel(params.modelId);
+  const model = ensureModel(params.modelId, connection);
 
   // `git_history` is a custom tool, not a pi builtin — pull it out of the builtin
   // allowlist and register it as a custom tool only for roles that opt in.
@@ -701,8 +729,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           if (text.length > 0) {
             answerTextLenSinceLastTool += text.length;
             const nudgeThreshold = textMode
-              ? PREEMPTIVE_NUDGE_CHARS_TEXT_MODE
-              : PREEMPTIVE_NUDGE_CHARS;
+              ? nudgeThresholdCharsTextMode
+              : nudgeThresholdChars;
             if (
               !preemptiveNudged &&
               !captured &&

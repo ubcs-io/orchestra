@@ -143,6 +143,37 @@ describe("twoPhase contract (pure)", () => {
   });
 });
 
+describe("record_findings availability claim (persisted vs runtime)", () => {
+  // Regression coverage for the "record_findings IS available... Tool record_findings
+  // not found" contradiction: OUTPUT_CONTRACT is baked into every role's system_prompt
+  // and persisted in the DB, so it must never assert tool availability — only the
+  // runtime-computed discipline suffixes (TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION)
+  // may do that, since only they know whether the tool is actually registered.
+  const AVAILABILITY_CLAIM = /is available to you|will (never|not) (get|receive) a ["']?tool not found/i;
+
+  it("OUTPUT_CONTRACT (persisted) never asserts record_findings tool availability", async () => {
+    const { OUTPUT_CONTRACT } = await import("../src/roles.js");
+    expect(OUTPUT_CONTRACT).not.toMatch(AVAILABILITY_CLAIM);
+  });
+
+  it("buildRoleSystemPrompt (persisted) + TEXT_MODE_INSTRUCTION never asserts availability", async () => {
+    const { buildRoleSystemPrompt } = await import("../src/roles.js");
+    const { TEXT_MODE_INSTRUCTION } = await import("../src/agent.js");
+    const prompt = buildRoleSystemPrompt("You are a test role.") + TEXT_MODE_INSTRUCTION;
+    expect(prompt).not.toMatch(AVAILABILITY_CLAIM);
+    // The negative claim ("you do NOT have a record_findings tool") must still be present.
+    expect(prompt).toMatch(/do NOT have a `?record_findings`? tool/);
+  });
+
+  it("buildRoleSystemPrompt (persisted) + TOOL_CALL_DISCIPLINE instructs calling record_findings", async () => {
+    const { buildRoleSystemPrompt } = await import("../src/roles.js");
+    const { TOOL_CALL_DISCIPLINE } = await import("../src/agent.js");
+    const prompt = buildRoleSystemPrompt("You are a test role.") + TOOL_CALL_DISCIPLINE;
+    expect(prompt).toMatch(/call the `record_findings` tool/);
+    expect(prompt).toMatch(AVAILABILITY_CLAIM);
+  });
+});
+
 describe("extractFindingsFromText (salvage path)", () => {
   it("parses a well-formed closed fence", () => {
     const text =

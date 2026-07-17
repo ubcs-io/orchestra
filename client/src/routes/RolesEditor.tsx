@@ -143,8 +143,16 @@ function TagInput({
   );
 }
 
-/** Bubble-picker dropdown for model overrides — mimics the "Get models" flow in Models. */
-function ModelPicker({
+/**
+ * Bubble-picker dropdown for model overrides — mimics the "Get models" flow in Models.
+ *
+ * Stores the selected config's `name` (not its `default_model`) as the role's model
+ * override — the server resolves that name back to the config's own connection
+ * (base URL/auth/text_mode/two_phase/etc.) and real `default_model` at run time
+ * via `resolveConnectionForModel()`. Shared between RolesEditor and NetworkEditor
+ * so both surfaces store/display role.model consistently.
+ */
+export function ModelPicker({
   value,
   onChange,
   configs,
@@ -242,7 +250,12 @@ function ModelPicker({
                 onChange(value === cfg.name ? "" : (cfg.name ?? ""));
                 setShowDropdown(false);
               }}
-              title={cfg.default_model ? `${cfg.name ?? cfg.key} → ${cfg.default_model}` : (cfg.name ?? cfg.key)}
+              title={
+                cfg.default_model
+                  ? `Runs on ${cfg.name ?? cfg.key}'s own connection (${cfg.default_model}, ` +
+                    `${cfg.text_mode ? "text mode" : cfg.two_phase ? "two-phase mode" : "native tool-calling"})`
+                  : (cfg.name ?? cfg.key)
+              }
             >
               {cfg.name ?? cfg.key}
             </button>
@@ -319,15 +332,15 @@ function RoleCard({
               configs={modelConfigs}
               defaultConfigName={defaultModelConfigName}
             />
-          </div>
-          <div>
-            <label>System prompt</label>
-            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
             <div style={{ marginTop: 8 }}>
               <button className="primary" disabled={save.isPending} onClick={() => save.mutate()}>
                 {save.isPending ? "Saving…" : "Save project override"}
               </button>
             </div>
+          </div>
+          <div>
+            <label>System prompt</label>
+            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
           </div>
         </div>
       )}
