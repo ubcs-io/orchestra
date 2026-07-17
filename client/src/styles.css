@@ -373,12 +373,33 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 
 /* Project cards */
 .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-.project-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+.project-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: flex; flex-direction: column; gap: 6px; position: relative; color: inherit; text-decoration: none; }
 .project-card:hover { border-color: var(--brass); }
 .project-card .project-name { font-size: 15px; font-weight: 600; color: var(--accent); }
 .project-card .project-name:hover { color: var(--brass); }
 .project-card .project-meta { font-size: 12px; color: var(--ink-dim); display: flex; flex-direction: column; gap: 2px; }
 .project-card .project-actions { margin-top: 4px; }
+.project-card .project-roles-icon {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  font-size: 18px;
+  color: var(--accent);
+  text-decoration: none;
+  line-height: 1;
+  z-index: 2;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 7px;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.project-card .project-roles-icon:hover {
+  color: var(--brass);
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.12);
+  text-decoration: none;
+}
 .project-card--register { grid-column: span 2; }
 
 /* ---- API calls progress bar on project cards ---- */
@@ -536,9 +557,9 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 
 /* ---- Ping results ---- */
 .ping-results {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
 }
 .ping-node {
   display: flex;

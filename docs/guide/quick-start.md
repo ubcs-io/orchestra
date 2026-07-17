@@ -62,6 +62,8 @@ Open `http://localhost:5173` in your browser.
 2. **Drop an intake** — write a brief description of what you want (e.g., "Investigate the timeout error in auth.ts" or "Research whether we should migrate to Postgres")
 3. **Press Start loop** — the orchestrator picks it up, infers the intake kind, and begins running role agents
 
+![New intake form — name, kind, and free-text content dropped straight into the queue](/screenshots/new-intake.png)
+
 You'll see the live SSE stream on the Task Detail page as roles inspect your codebase and record their findings.
 
 ## Production Build

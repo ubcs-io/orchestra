@@ -67,8 +67,8 @@ function SafetyDashboard() {
         <ToolBoundaries data={data} />
         <LimitsCard data={data} />
         <GatesCard data={data} />
-        <RolesSummary data={data} />
-        <div className="full-width">
+        <div>
+          <RolesSummary data={data} />
           <SecurityPosture data={data} />
         </div>
       </div>

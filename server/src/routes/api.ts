@@ -559,9 +559,12 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         if (fallback) models.push(fallback);
       }
 
-      // Compute per-project internal vs external API call stats
+      // Compute per-project internal vs external API call stats.
+      // run.model stores the resolved model ID (e.g. "qwen2.5-coder:7b"), not the
+      // config name. Resolve by checking each config's default_model, then fall
+      // back to the global default connection.
       const configs = listModelConfigs();
-      const configByName = new Map(configs.map((c) => [c.name, c]));
+      const globalConfig = getGlobalConfig();
       let internal_calls = 0;
       let external_calls = 0;
       const projectTasks = listTasks({ projectId: p.id });
@@ -569,8 +572,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         const runs = listRoleRuns(task.task_id);
         for (const run of runs) {
           if (!run.model) continue;
-          const cfg = configByName.get(run.model);
-          const loc = locationLabel(cfg?.base_url ?? null);
+          // 1. Match by config name (role model override picked from UI).
+          // 2. Match by config.default_model (the model ID sent to the API).
+          // 3. Fall back to the global default connection.
+          let baseUrl = configs.find(
+            (c) => c.name === run.model || c.default_model === run.model,
+          )?.base_url ?? null;
+          if (!baseUrl) {
+            baseUrl = globalConfig?.base_url ?? null;
+          }
+          const loc = locationLabel(baseUrl);
           if (loc === "local") internal_calls++;
           else external_calls++;
         }
@@ -1326,7 +1337,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "qwen3.5-122b", total_b: 122, active_b: 10 },
     { pattern: "qwen3.5-35b", total_b: 35, active_b: 3 },
     { pattern: "qwen3.5-27b", total_b: 27 },
-    { pattern: "qwen3.5", total_b: 397, active_b: 17, num_experts: 128, active_per_token: 8 },
+    // No bare "qwen3.5" fallback — unlisted point sizes (e.g. a future 3.6/3.7
+    // release) should fall through to the regex-based extractor below instead
+    // of silently inheriting the 397B flagship figure.
     // ── Qwen 3 ──
     { pattern: "qwen3-235b", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
     { pattern: "qwen3-30b-a3b", total_b: 30, active_b: 3, num_experts: 128, active_per_token: 8 },
@@ -1336,7 +1349,8 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "qwen3-4b", total_b: 4 },
     { pattern: "qwen3-1.7b", total_b: 1.7 },
     { pattern: "qwen3-0.6b", total_b: 0.6 },
-    { pattern: "qwen3", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
+    // No bare "qwen3" fallback — same reasoning (was misclassifying e.g. a
+    // dense Qwen3.6-27B as the 235B/22B-active MoE flagship).
     // ── Qwen 2.5 ──
     { pattern: "qwen2.5-max", total_b: 72 },
     { pattern: "qwen2.5-72b", total_b: 72 },
@@ -1360,7 +1374,8 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "gemma-4-31b", total_b: 31 },
     { pattern: "gemma-4-e4b", total_b: 4.5 },
     { pattern: "gemma-4-e2b", total_b: 2.3 },
-    { pattern: "gemma-4", total_b: 31 },
+    // No bare "gemma-4" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 31B dense-flagship figure.
     { pattern: "gemma-3-27b", total_b: 27 },
     { pattern: "gemma-3-12b", total_b: 12 },
     { pattern: "gemma-3-4b", total_b: 4 },
@@ -1438,7 +1453,8 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "ornith-1.0-35b", total_b: 35, active_b: 3 },
     { pattern: "ornith-1.0-31b", total_b: 31 },
     { pattern: "ornith-1.0-9b", total_b: 9 },
-    { pattern: "ornith", total_b: 35, active_b: 3 },
+    // No bare "ornith" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 35B/3B-active MoE figure.
 
     // ── xAI Grok ── Grok-1 is the only vendor-confirmed figure; 2/3/4 are
     // rough community estimates (undisclosed).
@@ -1458,6 +1474,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
 
     // ── Small / local-friendly models ──
     { pattern: "solar-10.7b", total_b: 10.7 },
+    { pattern: "stablelm-2-12b", total_b: 12 },
     { pattern: "stablelm-2", total_b: 1.6 },
     { pattern: "smollm2-1.7b", total_b: 1.7 },
     { pattern: "smollm2-360m", total_b: 0.36 },
@@ -1471,11 +1488,14 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     { pattern: "exaone-3.5-32b", total_b: 32 },
     { pattern: "exaone-3.5-7.8b", total_b: 7.8 },
     { pattern: "exaone-3.5-2.4b", total_b: 2.4 },
-    { pattern: "exaone", total_b: 7.8 },
+    // No bare "exaone" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 7.8B figure.
 
     // ── NVIDIA Nemotron ──
     { pattern: "nemotron-4-340b", total_b: 340 },
-    { pattern: "nemotron", total_b: 70 },
+    // No bare "nemotron" fallback — the family spans 12B-340B and each
+    // release encodes its real size in the id, so an unlisted variant should
+    // fall through to the regex extractor rather than guessing 70B.
 
     // ── Fine-tune families that reuse a Mixtral base (MoE) ──
     { pattern: "wizardlm-2-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
@@ -1609,19 +1629,6 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       const costInput = typeof extras.cost_per_1m_input === "number" ? extras.cost_per_1m_input : null;
       const costOutput = typeof extras.cost_per_1m_output === "number" ? extras.cost_per_1m_output : null;
 
-      // Epoch.ai effective-params formula: for MoE models, the dense
-      // equivalent is (num_experts^0.44 / active_per_token^0.63) × total_b.
-      // For dense models, effective_params = total_b.
-      const knownMoE = lookupKnownModelSize(cfg.default_model ?? "");
-      let effectiveParamsB: number | null = null;
-      if (knownMoE && knownMoE.num_experts && knownMoE.active_per_token) {
-        const factor = Math.pow(knownMoE.num_experts, 0.44) / Math.pow(knownMoE.active_per_token, 0.63);
-        effectiveParamsB = Math.round(factor * knownMoE.total_b * 10) / 10;
-      } else if (estimatedTotalParams) {
-        // Dense model (or MoE without expert info) — effective = total
-        effectiveParamsB = Math.round(estimatedTotalParams * 10) / 10;
-      }
-
       const perf = perfByConfig.get(cfg.id);
 
       return {
@@ -1644,7 +1651,6 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         quantization: userQuant ?? estimatedQuant,
         quantization_estimated: estimatedQuant,
         quantization_score: quantizationScore(userQuant ?? estimatedQuant),
-        effective_params_b: effectiveParamsB,
         cost_per_1m_input: costInput,
         cost_per_1m_output: costOutput,
         historical_runs: perf?.total_runs ?? 0,

@@ -560,7 +560,6 @@ export interface ModelStat {
   parameter_count_estimated: number | null;
   total_parameter_count_b: number | null;
   active_parameter_count_b: number | null;
-  effective_params_b: number | null;
   quantization: string | null;
   quantization_estimated: string | null;
   quantization_score: number;
