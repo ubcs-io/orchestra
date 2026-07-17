@@ -19,6 +19,7 @@ import {
   restoreCheckpoint,
   setRoleRunner,
   tick,
+  tickOnce,
 } from "../src/orchestrator";
 import type { RoleRunner } from "../src/orchestrator";
 import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn } from "../src/router";
@@ -254,17 +255,17 @@ describe("orchestrator loop (integration)", () => {
     expect(t.artifact_path).toContain("READY");
     expect(t.git_branch).toBeTruthy();
     expect(t.git_base_branch).toBeTruthy();
-    // Reaching "ready" checks the repo back out to the base branch it started
-    // from, leaving the task branch untouched for reference — so the artifact
-    // isn't on disk on whatever branch is now checked out...
+    expect(t.git_worktree_path).toBeTruthy();
+    // Reconciliation merges the task's branch back into base on completion...
+    expect(t.reconcile_status).toBe("merged");
     const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
       .toString()
       .trim();
     expect(currentBranch).toBe(t.git_base_branch);
-    expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(false);
-    // ...but is present and committed on the task's own branch.
-    execFileSync("git", ["checkout", t.git_branch!], { cwd: repo });
+    // ...so the artifact is present in the shared checkout too, not just the
+    // task's own worktree, once reconciliation has run.
     expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
+    expect(fs.existsSync(path.join(t.git_worktree_path!, t.artifact_path!))).toBe(true);
     // Decomposition produced child tasks.
     expect(listTasks({ parentTaskId: t.task_id }).length).toBeGreaterThan(0);
     // INTAKE original was consumed (moved out).
@@ -290,11 +291,57 @@ describe("orchestrator loop (integration)", () => {
     writeArtifact(path.join(repo, "PLANNING", "INTAKE", "one.log"), "boom");
     setRoleRunner(fakeRunner("pass"));
 
-    // Fire two ticks at once; the mutex must prevent double-ingest.
+    // Fire two ticks at once; per-task tracking must prevent double-ingest
+    // and double-dispatch even though different tasks CAN now run concurrently.
     await Promise.all([tick(), tick()]);
 
     const roots = listTasks({ projectId }).filter((t) => t.parent_task_id == null);
     expect(roots.length).toBe(1);
+  });
+
+  it("dispatches multiple tasks' role-steps concurrently, each in its own worktree", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "a.log"), "boom a");
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "b.log"), "boom b");
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    setRoleRunner(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight--;
+      return {
+        findings: {
+          verdict: "pass" as Verdict,
+          summary: "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\nok\n",
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+      };
+    });
+
+    // One round with two free slots: ingest creates both tasks, then both
+    // get dispatched together — this is the actual point of worktrees, so
+    // it must be a genuine wall-clock overlap, not just two disjoint steps.
+    await tickOnce(2);
+
+    expect(maxInFlight).toBe(2);
+    const roots = listTasks({ projectId }).filter((t) => t.parent_task_id == null);
+    expect(roots.length).toBe(2);
+    // Each task got its own worktree directory.
+    const worktrees = new Set(roots.map((t) => t.git_worktree_path));
+    expect(worktrees.size).toBe(2);
+    for (const t of roots) expect(fs.existsSync(t.git_worktree_path!)).toBe(true);
   });
 
   it("loops back to the owner role when the counter-reviewer fails, then reaches READY", async () => {
@@ -541,7 +588,8 @@ describe("checkpoint restore", () => {
     const t = rootTask(projectId)!;
     expect(t.git_branch).toMatch(/^orchestra\//);
     expect(t.git_base_branch).toBeTruthy();
-    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
+    expect(t.git_worktree_path).toBeTruthy();
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: t.git_worktree_path! })
       .toString()
       .trim();
     expect(currentBranch).toBe(t.git_branch);
@@ -549,7 +597,7 @@ describe("checkpoint restore", () => {
     const runs = listRoleRuns(t.task_id);
     expect(runs.length).toBe(1);
     expect(runs[0]!.git_commit_sha).toBeTruthy();
-    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: t.git_worktree_path! }).toString().trim();
     expect(runs[0]!.git_commit_sha).toBe(headSha);
   });
 
@@ -588,9 +636,11 @@ describe("checkpoint restore", () => {
     expect(plan.steps.slice(1).every((s) => s.status === "pending")).toBe(true);
 
     // The branch's HEAD is back at the checkpoint commit.
-    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: after.git_worktree_path! }).toString().trim();
     expect(headSha).toBe(checkpoint.git_commit_sha);
-    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: after.git_worktree_path!,
+    })
       .toString()
       .trim();
     expect(currentBranch).toBe(after.git_branch);

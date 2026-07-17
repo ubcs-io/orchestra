@@ -264,21 +264,6 @@ export function checkoutBranch(repoPath: string, branch: string): void {
 }
 
 /**
- * Checkout `baseBranch`, then switch to `branch` — creating it off `baseBranch`
- * if it doesn't exist yet, or just checking it out if it does (idempotent, so
- * it's safe to call on every task-start even for a task that already has a
- * branch). Same non-forcing failure semantics as `checkoutBranch`.
- */
-export function ensureBranch(repoPath: string, branch: string, baseBranch: string): void {
-  checkoutBranch(repoPath, baseBranch);
-  if (branchExists(repoPath, branch)) {
-    checkoutBranch(repoPath, branch);
-  } else {
-    git(repoPath, ["checkout", "-b", branch]);
-  }
-}
-
-/**
  * Whether `repoPath` has uncommitted changes to *tracked* files (staged or
  * unstaged). Untracked files (`??` in porcelain output — build artifacts,
  * Orchestra's own not-yet-added `.gitkeep` scaffolding, etc.) are deliberately
@@ -318,13 +303,20 @@ export function worktreePath(repoPath: string, taskId: string): string {
   return path.join(repoPath, WORKTREES_DIR, taskId);
 }
 
-function worktreeRegistered(repoPath: string, worktreeDir: string): boolean {
+/**
+ * Whether `worktreeDir` is already a live worktree. Checked by asking git
+ * from *inside* that directory rather than string-matching it against
+ * `git worktree list`'s output against `repoPath` — the latter compares
+ * canonicalized paths (git resolves symlinks) against `worktreeDir` as
+ * constructed, which spuriously mismatches wherever the two differ (e.g.
+ * macOS's `/var` → `/private/var`), causing a duplicate `worktree add` that
+ * git then rejects because the directory already exists.
+ */
+function worktreeRegistered(worktreeDir: string): boolean {
+  if (!fs.existsSync(path.join(worktreeDir, ".git"))) return false;
   try {
-    const list = git(repoPath, ["worktree", "list", "--porcelain"]);
-    const target = path.resolve(worktreeDir);
-    return list
-      .split("\n")
-      .some((line) => line.startsWith("worktree ") && path.resolve(line.slice("worktree ".length)) === target);
+    git(worktreeDir, ["rev-parse", "--is-inside-work-tree"]);
+    return true;
   } catch {
     return false;
   }
@@ -341,7 +333,7 @@ function worktreeRegistered(repoPath: string, worktreeDir: string): boolean {
  * the exact cross-task races worktrees exist to remove.
  */
 export function ensureWorktree(repoPath: string, worktreeDir: string, branch: string, baseBranch: string): void {
-  if (worktreeRegistered(repoPath, worktreeDir)) return;
+  if (worktreeRegistered(worktreeDir)) return;
   fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
   if (branchExists(repoPath, branch)) {
     git(repoPath, ["worktree", "add", worktreeDir, branch]);

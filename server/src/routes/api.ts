@@ -53,6 +53,7 @@ import {
   commitArtifacts,
   isGitRepo,
   removeFile,
+  removeWorktree,
   sanitizePath,
   scaffoldPlanning,
   writeArtifact,
@@ -68,12 +69,14 @@ import {
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   artifactName,
+  ensureTaskWorkspace,
   isSchedulerRunning,
   isSchedulerStopping,
   reincorporateAnswer,
   restoreCheckpoint,
   startScheduler,
   stopScheduler,
+  taskRepoPath,
   tick,
 } from "../orchestrator.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
@@ -691,19 +694,22 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const taskId = (req.params as { id: string }).id;
     const q = req.query as { removePlan?: string };
 
-    // Resolve artifact path before deletion so we know what to delete on disk.
+    // Resolve artifact/worktree paths before deletion so we know what to
+    // clean up on disk.
     const task = getTask(taskId);
     const artifactRel = task?.artifact_path ?? null;
+    const project = task?.project_id != null ? getProject(task.project_id) : undefined;
 
     deleteTask(taskId);
 
     // Optionally remove the .md plan/output file from disk.
-    if (q.removePlan === "true" && artifactRel && task?.project_id) {
-      const project = getProject(task.project_id);
-      if (project) {
-        const absPath = path.join(project.repo_path, artifactRel);
-        removeFile(absPath);
-      }
+    if (q.removePlan === "true" && artifactRel && project) {
+      removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
+    }
+    // The worktree itself is a disk-consuming resource, unlike the cheap
+    // branch ref it sits on — clean it up whenever the task is deleted.
+    if (task?.git_worktree_path && project) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
     return { ok: true };
@@ -735,13 +741,17 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const taskId = (req.params as { id: string }).id;
     const task = getTask(taskId);
     if (!task) return bad(reply, 404, "task not found");
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
 
     // Remove the output .md file from disk if one exists.
-    if (task.artifact_path && task.project_id) {
-      const project = getProject(task.project_id);
-      if (project) {
-        removeFile(path.join(project.repo_path, task.artifact_path));
-      }
+    if (task.artifact_path && project) {
+      removeFile(path.join(task.git_worktree_path ?? project.repo_path, task.artifact_path));
+    }
+    // Same disk-cost reasoning as delete: drop the worktree now, but leave
+    // the branch ref alone — ensureTaskWorkspace recreates the worktree onto
+    // it next time this task does any work.
+    if (task.git_worktree_path && project) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
     const updated = resetTask(taskId);
@@ -901,7 +911,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       const shortTitle = words.slice(0, 6).join(" ");
       const name = `Q: ${shortTitle}${words.length > 6 ? "…" : ""}`;
 
-      const child = createTask({
+      let child = createTask({
         name,
         content: digest,
         project_id: project.id,
@@ -915,17 +925,21 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         origin_role_key: body.role_key,
         origin_question: question,
       });
+      // Give this child its own worktree before writing anything, so the
+      // intake commit lands in isolated history from the start (mirrors
+      // ingestProject/createDecompositionChildren, not the shared checkout).
+      child = ensureTaskWorkspace(child, project);
+      const childRepo = taskRepoPath(child, project);
 
       const planningDir = project.planning_dir || "PLANNING";
       const relArtifact = path.join(planningDir, "REFINING", artifactName(child));
-      const absArtifact = path.join(project.repo_path, relArtifact);
       writeArtifact(
-        absArtifact,
+        path.join(childRepo, relArtifact),
         `# ${name}\n\n> Follow-up question from **${parent.name ?? parent.task_id.slice(0, 8)}** ` +
           `(role: \`${body.role_key}\`)\n\n${digest}\n`,
       );
       updateTask(child.task_id, { artifact_path: relArtifact });
-      commitArtifacts(project.repo_path, [relArtifact], `intake(question): ${name}`);
+      commitArtifacts(childRepo, [relArtifact], `intake(question): ${name}`);
       publish(child.task_id, "task_update", { stage: "intake" });
 
       return reply.code(201).send({ task: getTask(child.task_id), created: true });
@@ -973,10 +987,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const modelRef = task.model || project.default_model || null;
     const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
 
+    const chatRepoPath = taskRepoPath(task, project);
     const result = await runRole({
-      repoPath: project.repo_path,
+      repoPath: chatRepoPath,
       planningDir: project.planning_dir || "PLANNING",
-      artifactAbsPath: path.join(project.repo_path, task.artifact_path ?? ""),
+      artifactAbsPath: path.join(chatRepoPath, task.artifact_path ?? ""),
       modelId,
       systemPrompt: CHAT_SYSTEM_PROMPT,
       tools: [],

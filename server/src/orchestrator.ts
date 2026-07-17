@@ -534,7 +534,7 @@ function taskBranchName(task: TaskRow): string {
  * to a shared checkout, which would reintroduce the cross-task races
  * per-task worktrees exist to remove.
  */
-function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow {
+export function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow {
   let baseBranch = task.git_base_branch ?? project.main_branch;
   if (!baseBranch) {
     baseBranch = currentBranch(project.repo_path);
@@ -554,7 +554,7 @@ function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow {
 /** Where this task's own git/filesystem operations should run: its dedicated
  *  worktree once `ensureTaskWorkspace` has created one, else the project's
  *  shared checkout (covers tasks that predate this feature). */
-function taskRepoPath(task: TaskRow, project: ProjectRow): string {
+export function taskRepoPath(task: TaskRow, project: ProjectRow): string {
   return task.git_worktree_path ?? project.repo_path;
 }
 
@@ -575,24 +575,25 @@ function ingestProject(project: ProjectRow): number {
       intake_kind: kind,
       exit_kind: EXIT_KIND_BY_INTAKE[kind],
     });
-    // Give the task its own checkpoint branch before writing anything, so the
-    // intake commit below lands in the right isolated history from the start.
-    task = ensureTaskBranch(task, project);
-    // Seed the REFINING artifact and remove the INTAKE original (dedupe = move).
+    // Consume the INTAKE original on the shared checkout first — before this
+    // task's own worktree branches off it — so the file can never be
+    // re-scanned into a duplicate task, and no task branch needs to carry a
+    // copy of the removal itself.
+    removeFile(f.absPath);
+    commitArtifacts(project.repo_path, [path.join(planningDir, "INTAKE")], `intake(${kind}): consumed ${f.fileName}`);
+
+    // Give the task its own worktree (off the now-updated base), then seed
+    // the REFINING artifact there.
+    task = ensureTaskWorkspace(task, project);
     const artName = artifactName(task);
     const relArtifact = path.join(planningDir, "REFINING", artName);
-    const absArtifact = path.join(project.repo_path, relArtifact);
+    const taskRepo = taskRepoPath(task, project);
     writeArtifact(
-      absArtifact,
+      path.join(taskRepo, relArtifact),
       `# ${f.fileName}\n\n> Intake kind: **${kind}** · task \`${task.task_id.slice(0, 8)}\`\n\n## Original intake\n\n\`\`\`\n${f.content.trim()}\n\`\`\`\n`,
     );
-    removeFile(f.absPath);
     updateTask(task.task_id, { artifact_path: relArtifact });
-    commitArtifacts(
-      project.repo_path,
-      [relArtifact, path.join(planningDir, "INTAKE")],
-      `intake(${kind}): ${f.fileName}`,
-    );
+    commitArtifacts(taskRepo, [relArtifact], `intake(${kind}): ${f.fileName}`);
     created++;
     publish(task.task_id, "task_update", { stage: "intake" });
   }
@@ -858,7 +859,7 @@ function maybeDistillQuestions(
       priorQuestions: allPrior.slice(0, 50), // cap at 50 prior questions
     },
     roleRunner,
-    project.repo_path,
+    taskRepoPath(task, project),
     project.planning_dir || "PLANNING",
     modelId,
   )
@@ -900,10 +901,10 @@ function isJsonParseError(message: string): boolean {
 // ---------------------------------------------------------------------------
 
 async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, plan: RefinementPlan): Promise<void> {
-  // Re-assert this task's branch before touching the repo — the scheduler
-  // round-robins role-steps across tasks sharing this repo, so another task's
-  // step may have switched branches since this one last ran.
-  task = ensureTaskBranch(task, project);
+  // Ensure this task's dedicated worktree exists before touching the repo —
+  // idempotent, so this is cheap on every step after the first.
+  task = ensureTaskWorkspace(task, project);
+  const repoPath = taskRepoPath(task, project);
   const planningDir = project.planning_dir || "PLANNING";
   const role = getRole(project.id, step.role) ?? getRole(null, step.role);
   if (!role || !role.system_prompt) {
@@ -922,7 +923,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   const modelRef = role.model || task.model || project.default_model || null;
   const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
-  const absArtifact = path.join(project.repo_path, relArtifact);
+  const absArtifact = path.join(repoPath, relArtifact);
 
   // Deep-sanitize home-directory paths from streaming event data (tool args,
   // text deltas, thinking deltas) before they hit the live activity pane.
@@ -943,10 +944,10 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   let result;
   const ac = new AbortController();
-  activeAbort = ac;
+  activeAborts.set(task.task_id, ac);
   try {
     result = await roleRunner({
-      repoPath: project.repo_path,
+      repoPath,
       planningDir,
       artifactAbsPath: absArtifact,
       modelId,
@@ -1030,7 +1031,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     publish(task.task_id, "task_update", { stage: "review" });
     return;
   } finally {
-    activeAbort = null;
+    activeAborts.delete(task.task_id);
   }
 
   const { findings } = result;
@@ -1074,13 +1075,13 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // commit is this run's checkpoint — restore resets task.git_branch to it.
   appendArtifactSection(absArtifact, findings.section_md);
   const committed = commitArtifacts(
-    project.repo_path,
+    repoPath,
     [relArtifact],
     refineCommitMessage(step.role, task.name ?? task.task_id, findings.summary),
   );
   if (committed) {
     try {
-      setRoleRunCommitSha(run.id, headSha(project.repo_path));
+      setRoleRunCommitSha(run.id, headSha(repoPath));
     } catch (err) {
       console.warn(`[git] could not read checkpoint SHA for run ${run.id}: ${(err as Error).message}`);
     }
@@ -1228,7 +1229,7 @@ async function runCritiquePass(
 
   try {
     const result = await roleRunner({
-      repoPath: project.repo_path,
+      repoPath: taskRepoPath(task, project),
       planningDir: project.planning_dir || "PLANNING",
       artifactAbsPath: "",
       modelId,
@@ -1343,12 +1344,13 @@ async function generateRecap(
   );
   const planningDir = project.planning_dir || "PLANNING";
   const context = buildRecapContext(task, project, runs, coverage, criteriaResults);
+  const repoPath = taskRepoPath(task, project);
 
   try {
     const result = await roleRunner({
-      repoPath: project.repo_path,
+      repoPath,
       planningDir,
-      artifactAbsPath: path.join(project.repo_path, planningDir, "REFINING", `${task.task_id.slice(0, 8)}.md`),
+      artifactAbsPath: path.join(repoPath, planningDir, "REFINING", `${task.task_id.slice(0, 8)}.md`),
       modelId,
       systemPrompt:
         "You are the orchestration layer performing a final recap of a multi-role refinement pipeline. " +
@@ -1438,7 +1440,7 @@ async function maybeAssessEscalation(
         planSteps: plan.steps,
       },
       roleRunner,
-      project.repo_path,
+      taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
     );
@@ -1595,7 +1597,7 @@ async function maybeAssessBorderline(
         coverageMap: coverage,
       },
       roleRunner,
-      project.repo_path,
+      taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
     );
@@ -1692,7 +1694,7 @@ async function maybeSecondReview(
         coverageMap: coverage,
       },
       roleRunner,
-      project.repo_path,
+      taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
     );
@@ -1731,10 +1733,11 @@ async function applyGate(
   const planningDir = project.planning_dir || "PLANNING";
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const coverageJson = JSON.stringify(coverage);
+  const repoPath = taskRepoPath(task, project);
 
   const escalate = (reason: string) => {
     const dest = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}REVIEW${path.sep}`);
-    moveArtifact(path.join(project.repo_path, relArtifact), path.join(project.repo_path, dest));
+    moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, dest));
     updateTask(task.task_id, {
       refinement_plan_json: JSON.stringify(plan),
       coverage_json: coverageJson,
@@ -1744,7 +1747,7 @@ async function applyGate(
       artifact_path: dest,
       status: "complete",
     });
-    commitArtifacts(project.repo_path, [relArtifact, dest], `review: ${task.name ?? task.task_id}`);
+    commitArtifacts(repoPath, [relArtifact, dest], `review: ${task.name ?? task.task_id}`);
     publish(task.task_id, "task_update", { stage: "review" });
   };
 
@@ -1959,7 +1962,7 @@ async function applyGate(
   // Terminal role finished cleanly → ready.
   if (isTerminalRole(task, step.role) || !nextPending(plan)) {
     const dest = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}READY${path.sep}`);
-    moveArtifact(path.join(project.repo_path, relArtifact), path.join(project.repo_path, dest));
+    moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, dest));
     updateTask(task.task_id, {
       refinement_plan_json: JSON.stringify(plan),
       coverage_json: coverageJson,
@@ -1968,7 +1971,7 @@ async function applyGate(
       artifact_path: dest,
       status: "complete",
     });
-    commitArtifacts(project.repo_path, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
+    commitArtifacts(repoPath, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
     triggerRecap(coverage, criteriaResults);
     if (isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec") {
       // Only [epic] and [story] nodes decompose further; [task] is the atomic leaf.
@@ -1993,8 +1996,25 @@ async function applyGate(
         createDecompositionChildren(task, project);
       }
     }
-    // Accepted — return the repo to the branch the task started from. The task
-    // branch is left in place, untouched, for reference; nothing is merged.
+    // Accepted — reconcile the task's branch back into base before returning
+    // the shared checkout there. Best-effort: a conflict/error is recorded as
+    // a flag on the task (not a blocking state) and never prevents "ready" —
+    // the task's own artifact is unaffected by a merge conflict, only its git
+    // history is. The branch itself is left in place afterward either way,
+    // for reference / possible manual resolution.
+    if (task.git_branch && task.git_base_branch) {
+      const reconciled = reconcileBranch(repoPath, task.git_branch, task.git_base_branch);
+      updateTask(task.task_id, {
+        reconcile_status: reconciled.status,
+        reconcile_detail: reconciled.detail ?? null,
+      });
+      if (reconciled.status === "conflict" || reconciled.status === "error") {
+        console.warn(
+          `[git] reconciliation ${reconciled.status} for task ${task.task_id.slice(0, 8)}: ${reconciled.detail}`,
+        );
+      }
+      publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: reconciled.status });
+    }
     if (task.git_base_branch) {
       try {
         checkoutBranch(project.repo_path, task.git_base_branch);
@@ -2054,20 +2074,20 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
       step_number: step++,
       status: "active",
     });
-    // Same isolated-branch treatment as top-level intake — a decomposition
+    // Same isolated-worktree treatment as top-level intake — a decomposition
     // child is its own checkpointable task, not a continuation of the parent's.
-    child = ensureTaskBranch(child, project);
+    child = ensureTaskWorkspace(child, project);
+    const childRepo = taskRepoPath(child, project);
 
     // Write a minimal intake artifact so the child follows the normal pipeline.
     const artName = artifactName(child);
     const relArtifact = path.join(planningDir, "REFINING", artName);
-    const absArtifact = path.join(project.repo_path, relArtifact);
     writeArtifact(
-      absArtifact,
+      path.join(childRepo, relArtifact),
       `# ${node.name}\n\n> Child of: **${parentName}** · level: \`${node.level}\`\n\n## Problem\n\n${node.name}\n`,
     );
     updateTask(child.task_id, { artifact_path: relArtifact });
-    commitArtifacts(project.repo_path, [relArtifact], `intake(child): ${node.name}`);
+    commitArtifacts(childRepo, [relArtifact], `intake(child): ${node.name}`);
     publish(child.task_id, "task_update", { stage: "intake" });
   }
 }
@@ -2076,36 +2096,134 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
 // Tick + scheduler
 // ---------------------------------------------------------------------------
 
-/** Pick the least-recently-updated active task that has work to do. */
-function pickNextTask(): { task: TaskRow; project: ProjectRow } | undefined {
-  for (const project of listProjects()) {
-    const candidates = listTasks({ projectId: project.id })
-      .filter((t) => (t.stage === "intake" || t.stage === "refining") && (t.paused ?? 0) === 0)
-      .sort((a, b) => a.updated_at.localeCompare(b.updated_at));
-    if (candidates.length) return { task: candidates[0]!, project };
-  }
-  return undefined;
-}
-
 /**
- * Serialize every tick — the scheduler loop, manual /api/tick calls, and
- * checkpoint restores all funnel through one chain so no two role steps (or a
- * step and a restore) ever run concurrently (single-worker sequential
- * semantics, regardless of caller).
+ * Task ids with a role-step (or restore/reincorporate) currently in flight,
+ * mapped to the promise doing that work. Two roles:
+ *  - `pickNextTasks` consults it so concurrent rounds (or a manual API call
+ *    racing the scheduler loop) never pick the same task twice.
+ *  - `serializeTask` chains onto it so a restore/reincorporate can never race
+ *    a step already running for that same task — each task still gets
+ *    single-worker sequential semantics against *itself*, even though
+ *    different tasks now run concurrently (one worktree each).
  */
-let tickChain: Promise<void> = Promise.resolve();
+const inFlightTasks = new Map<string, Promise<void>>();
+const taskChains = new Map<string, Promise<void>>();
+/** Abort controllers for in-progress role runs, keyed by task id — stopScheduler()
+ *  aborts every in-flight task, not just one, now that several can run at once. */
+const activeAborts = new Map<string, AbortController>();
 
-function serialize<T>(fn: () => Promise<T>): Promise<T> {
+function serializeTask<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+  const prior = taskChains.get(taskId) ?? Promise.resolve();
   let result: T;
-  const run = tickChain.then(async () => {
+  const run = prior.then(async () => {
     result = await fn();
   });
-  tickChain = run.catch(() => {});
+  taskChains.set(taskId, run.catch(() => {}));
   return run.then(() => result!);
 }
 
+/** Pick up to `limit` least-recently-updated active tasks with work to do,
+ *  excluding any already in flight. Same per-project-first ordering as the
+ *  original single-task picker (drains one project's candidates before
+ *  moving to the next), just returning a batch instead of one. */
+function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRow }> {
+  const picked: Array<{ task: TaskRow; project: ProjectRow }> = [];
+  for (const project of listProjects()) {
+    const candidates = listTasks({ projectId: project.id })
+      .filter(
+        (t) =>
+          (t.stage === "intake" || t.stage === "refining") &&
+          (t.paused ?? 0) === 0 &&
+          !inFlightTasks.has(t.task_id),
+      )
+      .sort((a, b) => a.updated_at.localeCompare(b.updated_at));
+    for (const task of candidates) {
+      picked.push({ task, project });
+      if (picked.length >= limit) return picked;
+    }
+  }
+  return picked;
+}
+
+/** Run one role-step's worth of work for `taskId` — the per-task body a round
+ *  dispatches once it's picked a task. Registers/deregisters the task in
+ *  `inFlightTasks` for the duration and funnels through `serializeTask` so it
+ *  can never overlap a restore or answer-reincorporation for the same task. */
+function dispatchTask(taskId: string): Promise<void> {
+  const running = serializeTask(taskId, () => runTaskStepOnce(taskId));
+  inFlightTasks.set(taskId, running);
+  return running.finally(() => {
+    if (inFlightTasks.get(taskId) === running) inFlightTasks.delete(taskId);
+  });
+}
+
+/** Do one unit of work for a single already-picked task: ensure a plan,
+ *  consume interventions, then advance (or finalize) the next step. Extracted
+ *  from the old single-task `tickOnce` body so it can be dispatched for
+ *  several tasks concurrently. */
+async function runTaskStepOnce(taskId: string): Promise<void> {
+  let task = getTask(taskId);
+  if (!task) return;
+  const project = task.project_id != null ? getProject(task.project_id) : undefined;
+  if (!project) return;
+
+  // Ensure a plan; intake → refining on first plan.
+  let plan = readPlan(task);
+  if (!plan) {
+    plan = planFromTemplate((task.intake_kind as IntakeKind) || "manual", task.network_id);
+    // Fold any promoted project roles for this kind into the plan.
+    plan = withPromotedRoles(project, task, plan);
+    updateTask(task.task_id, { refinement_plan_json: JSON.stringify(plan), stage: "refining" });
+    task = getTask(task.task_id)!;
+    publish(task.task_id, "task_update", { stage: "refining" });
+  }
+
+  // Consume interventions (may pause / mutate plan).
+  const consumed = consumeInterventions(task, plan);
+  plan = consumed.plan;
+  if (consumed.paused) return;
+  task = getTask(task.task_id)!;
+
+  // Determine the next step. If the plan has edge routing data and at least one
+  // role has already run, use edge conditions to bias routing. Otherwise fall
+  // back to linear order (first step, or tasks with no network graph).
+  const runs = listRoleRuns(task.task_id);
+  const lastRun = runs[runs.length - 1];
+  const context = lastRun ? buildEdgeContext(lastRun, task.task_id) : undefined;
+
+  const step = lastRun ? nextStep(plan, lastRun.role_key, context) : nextPending(plan);
+
+  if (!step) {
+    // No pending steps but not terminal — finalize as ready to avoid wedging.
+    const routerCfg = getRouterCfg(project);
+    await applyGate(task, project, plan, { role: "", status: "done", depth: 1 }, "pass", rollupCoverage(task.task_id), [], routerCfg);
+    return;
+  }
+
+  await runOneStep(task, project, step, plan);
+}
+
+/** Ingest new intakes across every project, then dispatch up to `limit` free
+ *  task slots. Returns true if any work (ingest or a dispatched step) happened.
+ *  `tick()` (manual /api/tick, tests) calls this with limit 1, preserving its
+ *  old one-task-per-call contract; the scheduler loop calls it with the
+ *  configured concurrency cap. */
+export async function tickOnce(limit: number): Promise<boolean> {
+  let ingested = 0;
+  for (const project of listProjects()) ingested += ingestProject(project);
+
+  const freeSlots = limit - inFlightTasks.size;
+  if (freeSlots <= 0) return ingested > 0;
+
+  const picked = pickNextTasks(freeSlots);
+  if (!picked.length) return ingested > 0;
+
+  await Promise.all(picked.map((p) => dispatchTask(p.task.task_id)));
+  return true;
+}
+
 export function tick(): Promise<boolean> {
-  return serialize(() => tickOnce());
+  return tickOnce(1);
 }
 
 /**
@@ -2115,11 +2233,11 @@ export function tick(): Promise<boolean> {
  * step statuses from what survives — so the task resumes right after the
  * restored-to role, as if everything after it never happened.
  *
- * Serialized through `tickChain` so a restore can never race a concurrent
- * scheduler tick mutating the same task's plan/branch.
+ * Serialized through `serializeTask` so a restore can never race a step
+ * already running for the same task.
  */
 export function restoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
-  return serialize(() => doRestoreCheckpoint(taskId, roleRunId));
+  return serializeTask(taskId, () => doRestoreCheckpoint(taskId, roleRunId));
 }
 
 async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
@@ -2128,14 +2246,19 @@ async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<v
   if (run.run_kind !== "primary") throw new Error("can only restore to a primary role run");
   if (!run.git_commit_sha) throw new Error("this run has no checkpoint commit to restore to");
 
-  const task = getTask(taskId);
+  let task = getTask(taskId);
   if (!task) throw new Error("task not found");
   if (!task.git_branch) throw new Error("task has no checkpoint branch to restore");
+  const branch = task.git_branch;
   const project = task.project_id != null ? getProject(task.project_id) : undefined;
   if (!project) throw new Error("project not found for task");
 
-  checkoutBranch(project.repo_path, task.git_branch);
-  resetHardTo(project.repo_path, run.git_commit_sha);
+  // Recreate the worktree if it was removed (e.g. by a prior reset) — the
+  // branch itself always survives, so this just re-attaches to it.
+  task = ensureTaskWorkspace(task, project);
+  const repoPath = taskRepoPath(task, project);
+  checkoutBranch(repoPath, branch);
+  resetHardTo(repoPath, run.git_commit_sha);
 
   deleteRoleRunsAfter(taskId, run.id);
   deleteUnconsumedInterventionsAfter(taskId, run.created_at);
@@ -2194,11 +2317,11 @@ async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<v
  * decomposition children spawned off this task are left untouched, just
  * flagged (`markChildrenStale`) for a human to triage.
  *
- * Serialized through `tickChain` so this can never race a scheduler tick or a
- * manual restore mutating the same task.
+ * Serialized through `serializeTask` so this can never race a scheduler step
+ * or a manual restore mutating the same task.
  */
 export function reincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
-  return serialize(() => doReincorporateAnswer(taskId, question, answer));
+  return serializeTask(taskId, () => doReincorporateAnswer(taskId, question, answer));
 }
 
 async function doReincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
@@ -2231,7 +2354,7 @@ async function doReincorporateAnswer(taskId: string, question: string, answer: s
       const assessment = await assessAnswerMatch(
         { question: guess.question, assumedAnswer: guess.assumed_answer, confidence: guess.confidence, humanAnswer: answer },
         roleRunner,
-        project.repo_path,
+        taskRepoPath(task, project),
         project.planning_dir || "PLANNING",
         modelId,
       );
@@ -2287,61 +2410,6 @@ function markChildrenStale(task: TaskRow, raisingRole: string): void {
   }
 }
 
-/** Do one unit of work. Returns true if work was performed (caller loops fast). */
-async function tickOnce(): Promise<boolean> {
-  // 1. Ingest new intake files.
-  let ingested = 0;
-  for (const project of listProjects()) ingested += ingestProject(project);
-
-  // 2. Advance one role step on the next active task.
-  const next = pickNextTask();
-  if (!next) return ingested > 0;
-
-  let { task } = next;
-  const { project } = next;
-
-  // Ensure a plan; intake → refining on first plan.
-  let plan = readPlan(task);
-  if (!plan) {
-    plan = planFromTemplate(
-      (task.intake_kind as IntakeKind) || "manual",
-      task.network_id,
-    );
-    // Fold any promoted project roles for this kind into the plan.
-    plan = withPromotedRoles(project, task, plan);
-    updateTask(task.task_id, { refinement_plan_json: JSON.stringify(plan), stage: "refining" });
-    task = getTask(task.task_id)!;
-    publish(task.task_id, "task_update", { stage: "refining" });
-  }
-
-  // Consume interventions (may pause / mutate plan).
-  const consumed = consumeInterventions(task, plan);
-  plan = consumed.plan;
-  if (consumed.paused) return true;
-  task = getTask(task.task_id)!;
-
-  // Determine the next step. If the plan has edge routing data and at least one
-  // role has already run, use edge conditions to bias routing. Otherwise fall
-  // back to linear order (first step, or tasks with no network graph).
-  const runs = listRoleRuns(task.task_id);
-  const lastRun = runs[runs.length - 1];
-  const context = lastRun ? buildEdgeContext(lastRun, task.task_id) : undefined;
-
-  const step = lastRun
-    ? nextStep(plan, lastRun.role_key, context)
-    : nextPending(plan);
-
-  if (!step) {
-    // No pending steps but not terminal — finalize as ready to avoid wedging.
-    const routerCfg = getRouterCfg(project);
-    await applyGate(task, project, plan, { role: "", status: "done", depth: 1 }, "pass", rollupCoverage(task.task_id), [], routerCfg);
-    return true;
-  }
-
-  await runOneStep(task, project, step, plan);
-  return true;
-}
-
 /** Fold promoted project roles into a fresh plan (before the terminal role). */
 function withPromotedRoles(project: ProjectRow, task: TaskRow, plan: RefinementPlan): RefinementPlan {
   if (!project.config_json) return plan;
@@ -2366,24 +2434,23 @@ function withPromotedRoles(project: ProjectRow, task: TaskRow, plan: RefinementP
 let stopped = true;
 let stopping = false;
 let loopHandle: Promise<void> | undefined;
-/** Abort controller for the in-progress tick — set by stopScheduler() to hard-cut a stuck agent. */
-let activeAbort: AbortController | null = null;
 
-/** Start the daemon heartbeat. Idempotent. tick() is self-serializing. */
+/** Start the daemon heartbeat. Idempotent. Each round dispatches up to
+ *  `maxConcurrentTasks` tasks concurrently (each in its own worktree) via
+ *  `tickOnce`, and waits for the whole round before starting the next. */
 export function startScheduler(): void {
   if (!stopped) return;
   stopped = false;
   stopping = false;
-  const cfg = getConfig();
   loopHandle = (async () => {
     while (!stopped) {
       let didWork = false;
       try {
-        didWork = await tick();
+        didWork = await tickOnce(getConfig().maxConcurrentTasks);
       } catch (err) {
         console.error(`[orchestrator] tick error: ${(err as Error).message}`);
       }
-      await sleep(didWork ? 50 : cfg.schedulerIdleMs);
+      await sleep(didWork ? 50 : getConfig().schedulerIdleMs);
     }
     stopping = false;
     console.log("[orchestrator] scheduler stopped");
@@ -2391,15 +2458,16 @@ export function startScheduler(): void {
   console.log("[orchestrator] scheduler started");
 }
 
-/** Signal the loop to stop and abort the in-progress tick. Non-blocking:
- *  sets the stop flags immediately and fires the abort controller. The
- *  current tick unwinds naturally (agent session is cancelled), then the
- *  loop exits on the next `while (!stopped)` check. */
+/** Signal the loop to stop and abort every in-progress task. Non-blocking:
+ *  sets the stop flags immediately and fires every active abort controller —
+ *  now that several tasks can run at once, all of them, not just one. The
+ *  current round unwinds naturally (each agent session is cancelled), then
+ *  the loop exits on the next `while (!stopped)` check. */
 export function stopScheduler(): void {
   if (stopped) return;
   stopped = true;
   stopping = true;
-  activeAbort?.abort();
+  for (const ac of activeAborts.values()) ac.abort();
 }
 
 export function isSchedulerRunning(): boolean {
