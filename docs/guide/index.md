@@ -11,6 +11,8 @@ LLMs fail at big, vague tasks. They lose context, skip concerns, and produce sha
 - **Steer mid-run** — pause, inject roles, deepen analysis, add notes
 - **Version control** — every refinement step commits to your repo as markdown
 
+![Orchestra dashboard — task board, network health, and registered projects](/screenshots/dashboard.png)
+
 ## Key Concepts
 
 ### Intake

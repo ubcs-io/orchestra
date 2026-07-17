@@ -79,6 +79,8 @@ Each config additionally stores:
 
 `POST /api/model-stats` returns comparison data across all configs (or a subset) — context window, max tokens, reasoning, quantization score, dense/MoE-aware parameter counts, estimated cost per 1M input/output tokens, and historical usage (run count, total tokens, avg tokens/run) pulled from actual role-run history — rendered in the `/models` page as a radar chart plus a sortable stats table. The same page's **Ping Network** action (surfaced on the Projects page) hits every config's `/models` endpoint over `GET /api/ping-network/stream` and streams back live availability.
 
+![Coverage radar and model comparison table across context window, params, quantization, and usage](/screenshots/model-radar.png)
+
 ---
 
 ## Strategic LLM Routing Advisors

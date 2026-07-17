@@ -14,6 +14,8 @@ Access the editor at `/networks` in the UI. It provides:
 - **Per-network metadata** — intake kind, rigor level, max loopbacks, reviewer role, review depth
 - **In-place role editing** — click a node's person icon to open a role editor modal (enabled state, subtask creation, tools, model override, system prompt) without leaving the canvas
 
+![Agent network editor — drag-and-drop role graph with edge conditions and per-role tool boundaries](/screenshots/network-view.png)
+
 ## System Templates
 
 Orchestra ships with pre-configured networks for common intake kinds:

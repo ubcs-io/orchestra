@@ -7,6 +7,8 @@ Orchestra gives you full control over the refinement loop while it's running. Yo
 - **SSE Stream** — watch the active role's reasoning, every file it reads, and every tool call it makes, in real time, rendered as structured role/tool/thinking/text/status events with inline markdown highlighting rather than a raw log
 - **Coverage Map** — see which concerns each role examined, skipped, or ignored, rolled up across the entire task. Omissions are highlighted so you can notice that, for example, privacy was never reviewed
 
+![Interactive live view — SSE role/tool stream, current state, steering, and coverage map](/screenshots/interactive-live-view.png)
+
 ![Live activity feed — a role's findings streaming in with inline markdown highlighting](/screenshots/live-activity.png)
 
 ![Coverage map — concerns rolled up as considered, skipped, out of scope, or never looked at](/screenshots/coverage-map.png)
