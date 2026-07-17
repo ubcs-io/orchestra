@@ -52,6 +52,16 @@ export interface Config {
 
   /** Directory of the built React client to serve (server/public). */
   clientDir: string;
+
+  /**
+   * Per-model API key map loaded from ORCHESTRA_TOKENS env var.
+   * Keys are model config names, values are the API key strings.
+   * When a model config's name matches a key here, the env token overrides
+   * the DB-stored api_key for that model config.
+   *
+   * Example env: ORCHESTRA_TOKENS='{"qwen-7b":"sk-abc","deepseek-r1":"sk-xyz"}'
+   */
+  tokenMap: Record<string, string>;
 }
 
 const SERVER_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -64,7 +74,7 @@ const DEFAULTS: Config = {
   apiKey: "",
   defaultModelId: "deepseek-r1:latest",
   contextWindow: 128_000,
-  maxTokens: 16_384,
+  maxTokens: 32_768,
   requestTimeoutMs: 300_000,
   reasoning: true,
   thinkingLevel: "medium",
@@ -73,6 +83,7 @@ const DEFAULTS: Config = {
   schedulerIdleMs: 3_000,
   roleToolBudget: 40,
   clientDir: path.join(SERVER_DIR, "public"),
+  tokenMap: {},
 };
 
 function readConfigFile(): Partial<Config> {
@@ -101,6 +112,18 @@ function readEnv(): Partial<Config> {
   if (e.ORCHESTRA_REASONING) out.reasoning = e.ORCHESTRA_REASONING !== "0" && e.ORCHESTRA_REASONING !== "false";
   if (e.ORCHESTRA_THINKING_LEVEL) out.thinkingLevel = e.ORCHESTRA_THINKING_LEVEL as Config["thinkingLevel"];
   if (e.ORCHESTRA_THINKING_FORMAT) out.thinkingFormat = e.ORCHESTRA_THINKING_FORMAT;
+  if (e.ORCHESTRA_TOKENS) {
+    try {
+      const parsed = JSON.parse(e.ORCHESTRA_TOKENS);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        out.tokenMap = parsed as Record<string, string>;
+      } else {
+        console.warn("[config] ORCHESTRA_TOKENS is not a valid JSON object — ignoring");
+      }
+    } catch {
+      console.warn("[config] ORCHESTRA_TOKENS is not valid JSON — ignoring");
+    }
+  }
   return out;
 }
 

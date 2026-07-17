@@ -14,6 +14,8 @@
  * Call Point 1 — Question Distillation (after a role produces open_questions)
  * Call Point 2 — Escalation Assessment (before escalating to human REVIEW)
  * Call Point 3 — Borderline Gate Assessment (partial criteria, near-exhaustion)
+ * Call Point 4 — Second Review (authoritative synthesis of a step's primary run
+ *                 + its adversarial critique, run after every critiqued step)
  */
 
 import type { RoleRunner, PlanStep, CoverageMap as OrchestratorCoverageMap } from "./orchestrator.js";
@@ -35,6 +37,8 @@ export interface RouterConfig {
   escalationAssessment: boolean;
   /** Call Point 3: assess borderline gate decisions (partial criteria, last loop-back). */
   borderlineGateAssessment: boolean;
+  /** Call Point 4: authoritative second review synthesizing a step's primary run + critique. */
+  secondReview: boolean;
   /** Override model for router calls (falls back to project connection default). */
   model?: string;
   /** Token budget per router call. Default 1024. */
@@ -48,6 +52,7 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   questionDistillation: false,
   escalationAssessment: false,
   borderlineGateAssessment: false,
+  secondReview: false,
 };
 
 /** Resolve router config from a project's config_json or return defaults. */
@@ -65,11 +70,32 @@ export function resolveRouterConfig(projectConfigJson: string | null): RouterCon
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/** Extract JSON from an LLM text response (handles markdown code blocks). */
+/** Extract JSON from an LLM text response (handles markdown code blocks).
+ *  Tolerates trailing text / commentary after a valid JSON root object. */
 function extractJson<T>(text: string): T {
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const raw = (jsonMatch?.[1] ?? text).trim();
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch (firstErr) {
+    // Handle trailing non-whitespace after a valid root object.
+    // Models sometimes append commentary after the JSON block.
+    if (
+      firstErr instanceof SyntaxError &&
+      firstErr.message.includes("after JSON")
+    ) {
+      // Walk backwards from the end, truncating one character at a time,
+      // until a valid parse is found. Prefer closing brace/brace-style roots.
+      for (let i = raw.length - 1; i > 0; i--) {
+        try {
+          return JSON.parse(raw.slice(0, i)) as T;
+        } catch {
+          continue;
+        }
+      }
+    }
+    throw firstErr;
+  }
 }
 
 /** Run a router LLM call through the roleRunner seam and parse the result. */
@@ -486,6 +512,120 @@ async function defaultAssessBorderline(
 }
 
 // ---------------------------------------------------------------------------
+// Call Point 4: Second Review (authoritative synthesis of primary + critique)
+// ---------------------------------------------------------------------------
+
+export interface SecondReviewInput {
+  taskName: string;
+  intakeKind: string;
+  roleKey: string;
+  primaryVerdict: string;
+  primarySummary: string;
+  critiqueVerdict?: string;
+  critiqueSummary?: string;
+  coverageMap: Record<string, { status: string; note?: string }>;
+}
+
+export type SecondReviewDecision = "accept" | "accept_with_note" | "escalate" | "loopback";
+
+export interface SecondReviewResult {
+  decision: SecondReviewDecision;
+  reasoning: string;
+  steer_note?: string;
+}
+
+const SECOND_REVIEW_SYSTEM_PROMPT = `You are the orchestrator's own second reviewer for an automated code refinement pipeline.
+A role just produced a finding, and — if enabled — an adversarial critic judged whether that
+finding is SO egregious it would violate their domain (e.g. exposing PII, an authz bypass, an
+irreversible data-loss migration). Your job is to synthesize both into one authoritative decision.
+
+Available decisions:
+- "accept": Nothing serious here. Proceed normally.
+- "accept_with_note": Minor concern worth flagging for the record, but not worth blocking on. Proceed, but attach a steer_note.
+- "loopback": The critique's concern is real and the responsible role should redo this step with the concern in mind.
+- "escalate": The concern is serious enough (or ambiguous enough) that only a human should decide.
+
+Guidelines:
+- If the critic passed (no objection) and the primary verdict is fine, "accept".
+- If the critic raised a "blocker", take it seriously — do NOT rubber-stamp it, but do independently
+  judge whether it's a genuine, concrete, high-severity domain violation or a false positive/nitpick.
+  A genuine violation (PII exposure, authz bypass, irreversible data loss, legal/compliance breach)
+  should "escalate" (or "loopback" if a straightforward redo would resolve it). A false positive or a
+  stylistic nitpick should be downgraded to "accept_with_note" so the pipeline isn't blocked on noise.
+- You may also independently escalate even if the critic passed, if the primary finding itself looks
+  like a serious domain violation the critic missed.
+- Never downgrade a genuine security, privacy, or safety violation to "accept" or "accept_with_note".
+
+Respond ONLY with valid JSON matching this schema — no markdown, no explanation outside the JSON:
+{
+  "decision": "accept" | "accept_with_note" | "escalate" | "loopback",
+  "reasoning": "brief explanation of the decision",
+  "steer_note": "guidance for the re-run role or a note to carry forward (omit for \\"accept\\")"
+}`;
+
+function buildSecondReviewPrompt(input: SecondReviewInput): string {
+  const coverage = Object.entries(input.coverageMap)
+    .map(([k, v]) => `- ${k}: ${v.status}${v.note ? ` (${v.note})` : ""}`)
+    .join("\n");
+
+  return `Task: ${input.taskName} (${input.intakeKind})
+Role: ${input.roleKey}
+
+## Primary run
+- Verdict: ${input.primaryVerdict}
+- Summary: ${input.primarySummary}
+
+## Adversarial critique
+${
+  input.critiqueVerdict
+    ? `- Verdict: ${input.critiqueVerdict}\n- Summary: ${input.critiqueSummary ?? "(no summary)"}`
+    : "(no critique ran for this step)"
+}
+
+## Coverage map
+${coverage}
+
+Synthesize a single authoritative decision for this step.`;
+}
+
+async function defaultAssessSecondReview(
+  input: SecondReviewInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+): Promise<SecondReviewResult> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const json = await routerCall<SecondReviewResult>(
+      roleRunner,
+      repoPath,
+      planningDir,
+      modelId,
+      SECOND_REVIEW_SYSTEM_PROMPT,
+      buildSecondReviewPrompt(input),
+      controller.signal,
+    );
+
+    clearTimeout(timeout);
+
+    const valid = ["accept", "accept_with_note", "escalate", "loopback"];
+    if (!valid.includes(json.decision)) {
+      throw new Error(`invalid decision: ${json.decision}`);
+    }
+    return json;
+  } catch (err) {
+    console.warn(`[router] second review failed: ${(err as Error).message}`);
+    return {
+      decision: "accept",
+      reasoning: "Router second review failed — falling back to accepting the primary verdict as-is.",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Injector seam (same pattern as orchestrator's setRoleRunner)
 // ---------------------------------------------------------------------------
 
@@ -513,25 +653,38 @@ type BorderlineParams = [
   modelId: string,
 ];
 
+type SecondReviewParams = [
+  input: SecondReviewInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+];
+
 export type DistillFn = (...args: DistillParams) => Promise<DistillationResult>;
 export type EscalationFn = (...args: EscalationParams) => Promise<EscalationAssessmentResult>;
 export type BorderlineFn = (...args: BorderlineParams) => Promise<BorderlineAssessmentResult>;
+export type SecondReviewFn = (...args: SecondReviewParams) => Promise<SecondReviewResult>;
 
 let _distill: DistillFn = defaultDistill;
 let _assessEscalation: EscalationFn = defaultAssessEscalation;
 let _assessBorderline: BorderlineFn = defaultAssessBorderline;
+let _assessSecondReview: SecondReviewFn = defaultAssessSecondReview;
 
 export function setDistillFn(fn: DistillFn): void { _distill = fn; }
 export function setEscalationFn(fn: EscalationFn): void { _assessEscalation = fn; }
 export function setBorderlineFn(fn: BorderlineFn): void { _assessBorderline = fn; }
+export function setSecondReviewFn(fn: SecondReviewFn): void { _assessSecondReview = fn; }
 
 export function resetRouterFns(): void {
   _distill = defaultDistill;
   _assessEscalation = defaultAssessEscalation;
   _assessBorderline = defaultAssessBorderline;
+  _assessSecondReview = defaultAssessSecondReview;
 }
 
 /** Public entry points that tests can override via the seam. */
 export const distillQuestions: DistillFn = (...args) => _distill(...args);
 export const assessEscalation: EscalationFn = (...args) => _assessEscalation(...args);
 export const assessBorderline: BorderlineFn = (...args) => _assessBorderline(...args);
+export const assessSecondReview: SecondReviewFn = (...args) => _assessSecondReview(...args);

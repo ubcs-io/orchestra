@@ -7,40 +7,67 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
+  createChatMessage,
   createIntervention,
+  createModelConfig,
   createNetwork,
   createProject,
   createTask,
+  deleteModelConfig,
   deleteNetwork,
   deleteProject,
   deleteTask,
+  duplicateModelConfig,
   duplicateNetwork,
+  getConfigById,
+  getDb,
   getGlobalConfig,
+  getModelPerformanceStats,
   getNetwork,
   getNetworkByIntakeKind,
   getProject,
   getTask,
+  listChatMessages,
   listInterventions,
+  listModelConfigs,
   listNetworks,
   listProjects,
   listRoles,
   listRoleRuns,
   listTasks,
+  reorderModelConfigs,
   resetTask,
+  setDefaultModelConfig,
   setDefaultNetwork,
+  updateModelConfig,
   updateNetwork,
   updateProject,
   updateTask,
   upsertConfig,
   upsertRole,
 } from "../db.js";
-import { isGitRepo, removeFile, scaffoldPlanning, writeArtifact } from "../git.js";
+import {
+  commitArtifacts,
+  isGitRepo,
+  removeFile,
+  sanitizePath,
+  scaffoldPlanning,
+  writeArtifact,
+} from "../git.js";
 import { discoverModels } from "../providers.js";
-import { resolveConnection, THINKING_FORMATS } from "../settings.js";
+import {
+  envTokenForModel,
+  locationLabel,
+  resolveConnection,
+  resolveConnectionForModel,
+  THINKING_FORMATS,
+} from "../settings.js";
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
+  artifactName,
   isSchedulerRunning,
   isSchedulerStopping,
   startScheduler,
@@ -48,6 +75,8 @@ import {
   tick,
 } from "../orchestrator.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
+import { runRole } from "../agent.js";
+import { publish } from "../bus.js";
 
 function bad(reply: FastifyReply, code: number, message: string) {
   return reply.code(code).send({ error: message });
@@ -80,6 +109,7 @@ function taskDetail(taskId: string) {
     runs,
     interventions,
     children,
+    chat_messages: listChatMessages(task.task_id),
     taxonomy: CONCERN_TAXONOMY,
     flow: {
       key: flow.key,
@@ -125,14 +155,87 @@ export function normalizeRepoPath(input: string): string {
   return path.isAbsolute(raw) ? path.resolve(raw) : raw;
 }
 
+/**
+ * Discover models from an arbitrary OpenAI-compatible endpoint.
+ * Best-effort: returns [] if the endpoint is unreachable or shaped differently.
+ */
+async function discoverModelsFrom(baseUrl: string, apiKey?: string): Promise<string[]> {
+  const url = baseUrl.replace(/\/+$/, "") + "/models";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { data?: Array<{ id?: string }> } | Array<{ id?: string }>;
+    const list = Array.isArray(data) ? data : (data.data ?? []);
+    return list
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === "string")
+      .map((id) => id.replace(/^.*[/\\]/, ""));
+  } catch {
+    return [];
+  }
+}
+
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/health", async () => ({ ok: true }));
 
   app.get("/api/models", async () => ({ models: await discoverModels() }));
 
+  // Discover models from a caller-supplied base URL (for model-config setup flow).
+  app.post("/api/models/discover", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as { base_url?: string; api_key?: string };
+    if (!body.base_url) return bad(reply, 400, "base_url is required");
+    const models = await discoverModelsFrom(body.base_url.trim(), body.api_key?.trim() || undefined);
+    return { models };
+  });
+
   app.get("/api/concerns", async () => ({ concerns: CONCERN_TAXONOMY }));
 
   app.get("/api/flows", async () => ({ flows: FLOW_TEMPLATES }));
+
+  // ---- Folder picker dialog (native OS dialog) ----
+  app.post("/api/dialogs/folder", async (_req: FastifyRequest, reply: FastifyReply) => {
+    try {
+      let script: string;
+      let args: string[];
+      if (process.platform === "darwin") {
+        script = "osascript";
+        args = ["-e", 'POSIX path of (choose folder with prompt "Select repository folder")'];
+      } else if (process.platform === "win32") {
+        script = "powershell";
+        args = [
+          "-NoProfile",
+          "-Command",
+          `Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.FolderBrowserDialog
+$f.Description = "Select repository folder"
+if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
+        ];
+      } else {
+        // Linux — try zenity, fall back to kdialog
+        script = "zenity";
+        args = ["--file-selection", "--directory", "--title=Select repository folder"];
+      }
+      const path = await new Promise<string>((resolve) => {
+        execFile(script, args, { timeout: 120_000 }, (err, stdout) => {
+          if (err) {
+            // Non-zero exit (e.g. user cancelled) — return null, not an error.
+            resolve("");
+            return;
+          }
+          resolve(stdout.trim());
+        });
+      });
+      return { path: path || null };
+    } catch (err) {
+      console.error(`[api] folder picker failed: ${(err as Error).message}`);
+      return { path: null };
+    }
+  });
 
   // ---- Connection config (global 'default' profile) ----
   // The API key is never sent back to the client — only whether one is set, and
@@ -157,6 +260,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         thinkingLevel: resolved.thinkingLevel,
         thinkingFormat: resolved.thinkingFormat,
         textMode: resolved.textMode,
+        compat: resolved.compat,
         has_api_key: !!resolved.apiKey,
       },
       env_overrides: {
@@ -179,6 +283,8 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       thinking_level?: string;
       thinking_format?: string;
       text_mode?: boolean;
+      compat?: Record<string, unknown> | null;
+      thinking_budgets?: string;
     };
     if (
       body.thinking_format !== undefined &&
@@ -190,6 +296,13 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     // omitting the field leaves the existing token untouched.
     const api_key =
       body.api_key === undefined ? undefined : body.api_key.trim() === "" ? null : body.api_key.trim();
+    // compat_json: null clears it, undefined keeps prior, an object serialises.
+    const compat_json =
+      body.compat === undefined
+        ? undefined
+        : body.compat === null
+          ? null
+          : JSON.stringify(body.compat);
     upsertConfig({
       project_id: null,
       key: "default",
@@ -204,11 +317,217 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       thinking_level: body.thinking_level,
       thinking_format: body.thinking_format,
       text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
+      compat_json,
+      thinking_budgets: body.thinking_budgets,
     });
     // Return the same redacted shape as GET.
     const row = getGlobalConfig();
     const { api_key: _k, ...safe } = row ?? {};
     return { config: { ...safe, has_api_key: !!(_k && _k.length) } };
+  });
+
+  // ---- Model Configs (named connection profiles) ----
+
+  // List all model configs.
+  app.get("/api/model-configs", async () => {
+    const configs = listModelConfigs();
+    const hasTokensEnv = !!process.env.ORCHESTRA_TOKENS;
+    const enriched = configs.map((cfg) => {
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        ...safe,
+        has_api_key: !!(api_key && api_key.length),
+        has_env_token: !!envKey,
+        location: locationLabel(cfg.base_url),
+      };
+    });
+    return { configs: enriched, has_tokens_env: hasTokensEnv };
+  });
+
+  // Create a new model config.
+  app.post("/api/model-configs", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      base_url?: string;
+      api_key?: string;
+      default_model?: string;
+      context_window?: number;
+      max_tokens?: number;
+      request_timeout_ms?: number;
+      reasoning?: boolean;
+      thinking_level?: string;
+      thinking_format?: string;
+      text_mode?: boolean;
+      thinking_budgets?: string;
+    };
+    if (!body.name || !body.name.trim()) return bad(reply, 400, "name is required");
+    if (
+      body.thinking_format !== undefined &&
+      !(THINKING_FORMATS as readonly string[]).includes(body.thinking_format)
+    ) {
+      return bad(reply, 400, `unknown thinking_format '${body.thinking_format}'`);
+    }
+    try {
+      const cfg = createModelConfig({
+        name: body.name.trim(),
+        base_url: body.base_url?.trim(),
+        api_key: body.api_key?.trim() || null,
+        default_model: body.default_model?.trim(),
+        context_window: body.context_window,
+        max_tokens: body.max_tokens,
+        request_timeout_ms: body.request_timeout_ms,
+        reasoning: body.reasoning,
+        thinking_level: body.thinking_level,
+        thinking_format: body.thinking_format,
+        text_mode: body.text_mode,
+        thinking_budgets: body.thinking_budgets,
+      });
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Get a single model config.
+  app.get("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const cfg = getConfigById(id);
+    if (!cfg) return bad(reply, 404, "model config not found");
+    const { api_key, ...safe } = cfg;
+    const envKey = envTokenForModel(cfg.name);
+    return {
+      config: {
+        ...safe,
+        has_api_key: !!(api_key && api_key.length),
+        has_env_token: !!envKey,
+        location: locationLabel(cfg.base_url),
+      },
+    };
+  });
+
+  // Update a model config.
+  app.patch("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body ?? {}) as {
+      name?: string;
+      base_url?: string;
+      api_key?: string;
+      default_model?: string;
+      context_window?: number;
+      max_tokens?: number;
+      request_timeout_ms?: number;
+      reasoning?: boolean;
+      thinking_level?: string;
+      thinking_format?: string;
+      text_mode?: boolean;
+      thinking_budgets?: string;
+    };
+    if (
+      body.thinking_format !== undefined &&
+      !(THINKING_FORMATS as readonly string[]).includes(body.thinking_format)
+    ) {
+      return bad(reply, 400, `unknown thinking_format '${body.thinking_format}'`);
+    }
+    try {
+      const cfg = updateModelConfig(id, {
+        name: body.name?.trim(),
+        base_url: body.base_url?.trim(),
+        api_key: body.api_key !== undefined ? (body.api_key.trim() === "" ? null : body.api_key.trim()) : undefined,
+        default_model: body.default_model?.trim(),
+        context_window: body.context_window,
+        max_tokens: body.max_tokens,
+        request_timeout_ms: body.request_timeout_ms,
+        reasoning: body.reasoning === undefined ? undefined : body.reasoning ? 1 : 0,
+        thinking_level: body.thinking_level,
+        thinking_format: body.thinking_format,
+        text_mode: body.text_mode === undefined ? undefined : body.text_mode ? 1 : 0,
+        thinking_budgets: body.thinking_budgets,
+      });
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Delete a model config.
+  app.delete("/api/model-configs/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    try {
+      deleteModelConfig(id);
+      return { ok: true };
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
+  });
+
+  // Duplicate a model config.
+  app.post("/api/model-configs/:id/duplicate", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body ?? {}) as { name?: string };
+    try {
+      const cfg = duplicateModelConfig(id, body.name);
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 409, (err as Error).message);
+    }
+  });
+
+  // Reorder model configs by ID array.
+  app.post("/api/model-configs/reorder", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as { ids?: number[] };
+    if (!body.ids || !Array.isArray(body.ids) || body.ids.length === 0) {
+      return bad(reply, 400, "ids must be a non-empty array of config IDs");
+    }
+    reorderModelConfigs(body.ids);
+    return { ok: true };
+  });
+
+  // Set a model config as the global default.
+  app.post("/api/model-configs/:id/set-default", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    try {
+      const cfg = setDefaultModelConfig(id);
+      const { api_key, ...safe } = cfg;
+      const envKey = envTokenForModel(cfg.name);
+      return {
+        config: {
+          ...safe,
+          has_api_key: !!(api_key && api_key.length),
+          has_env_token: !!envKey,
+          location: locationLabel(cfg.base_url),
+        },
+      };
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
   });
 
   // ---- Scheduler ----
@@ -224,7 +543,53 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/tick", async () => ({ worked: await tick() }));
 
   // ---- Projects ----
-  app.get("/api/projects", async () => ({ projects: listProjects() }));
+  app.get("/api/projects", async () => {
+    const projects = listProjects();
+    const enriched = projects.map((p) => {
+      const roles = listRoles(p.id);
+      const models = [...new Set(
+        roles
+          .filter((r) => r.enabled && r.model)
+          .map((r) => r.model!)
+      )];
+      // If no per-role model is set, fall back to the project default_model or
+      // the global default model config so the homepage card never shows "—".
+      if (models.length === 0) {
+        const fallback = p.default_model ?? getGlobalConfig()?.default_model ?? null;
+        if (fallback) models.push(fallback);
+      }
+
+      // Compute per-project internal vs external API call stats.
+      // run.model stores the resolved model ID (e.g. "qwen2.5-coder:7b"), not the
+      // config name. Resolve by checking each config's default_model, then fall
+      // back to the global default connection.
+      const configs = listModelConfigs();
+      const globalConfig = getGlobalConfig();
+      let internal_calls = 0;
+      let external_calls = 0;
+      const projectTasks = listTasks({ projectId: p.id });
+      for (const task of projectTasks) {
+        const runs = listRoleRuns(task.task_id);
+        for (const run of runs) {
+          if (!run.model) continue;
+          // 1. Match by config name (role model override picked from UI).
+          // 2. Match by config.default_model (the model ID sent to the API).
+          // 3. Fall back to the global default connection.
+          let baseUrl = configs.find(
+            (c) => c.name === run.model || c.default_model === run.model,
+          )?.base_url ?? null;
+          if (!baseUrl) {
+            baseUrl = globalConfig?.base_url ?? null;
+          }
+          const loc = locationLabel(baseUrl);
+          if (loc === "local") internal_calls++;
+          else external_calls++;
+        }
+      }
+      return { ...p, repo_path: sanitizePath(p.repo_path), models, internal_calls, external_calls };
+    });
+    return { projects: enriched };
+  });
 
   app.post("/api/projects", async (req: FastifyRequest, reply: FastifyReply) => {
     const body = (req.body ?? {}) as {
@@ -256,20 +621,21 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       default_model: body.default_model ?? null,
     });
     scaffoldPlanning(project.repo_path, project.planning_dir);
-    return { project };
+    return { project: { ...project, repo_path: sanitizePath(project.repo_path) } };
   });
 
   app.get("/api/projects/:id", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     const project = getProject(id);
     if (!project) return bad(reply, 404, "project not found");
-    return { project, roles: listRoles(id) };
+    return { project: { ...project, repo_path: sanitizePath(project.repo_path) }, roles: listRoles(id) };
   });
 
   app.patch("/api/projects/:id", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     if (!getProject(id)) return bad(reply, 404, "project not found");
-    return { project: updateProject(id, (req.body ?? {}) as Record<string, unknown>) };
+    const updated = updateProject(id, (req.body ?? {}) as Record<string, unknown>);
+    return { project: updated ? { ...updated, repo_path: sanitizePath(updated.repo_path) } : updated };
   });
 
   app.delete("/api/projects/:id", async (req: FastifyRequest) => {
@@ -435,6 +801,177 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       task_type: "child",
     });
     return { task: child };
+  });
+
+  // ---- Question decomposition (spin a review question off into its own
+  // Question Flow subtask, with a compacted digest of the parent's context) ----
+
+  function buildQuestionDigest(
+    parent: import("../db.js").TaskRow,
+    roleKey: string,
+    question: string,
+  ): string {
+    const parentName = parent.name ?? parent.task_id.slice(0, 8);
+    const excerpt = parent.content?.trim() ?? "";
+    const truncatedExcerpt =
+      excerpt.length > 600 ? `${excerpt.slice(0, 600)}…` : excerpt || "(no original intake text)";
+
+    const runs = listRoleRuns(parent.task_id).slice(-6);
+    const findingsLines = runs.length
+      ? runs
+          .map((r) => {
+            const summary = (r.summary ?? "").trim();
+            const truncated = summary.length > 200 ? `${summary.slice(0, 200)}…` : summary;
+            return `- **${r.role_key}** (${r.verdict ?? "unknown"}): ${truncated || "(no summary)"}`;
+          })
+          .join("\n")
+      : "(no prior findings yet)";
+
+    return [
+      `## The question to resolve`,
+      question,
+      ``,
+      `(Raised by the \`${roleKey}\` role while refining "${parentName}".)`,
+      ``,
+      `## Original problem (excerpt)`,
+      truncatedExcerpt,
+      ``,
+      `## Findings so far (condensed)`,
+      findingsLines,
+      ``,
+      `## Where to find more`,
+      `The above is a condensed summary. The full upstream context — the original intake, every prior ` +
+        `role's complete write-up, and any human answers — lives in \`${parent.artifact_path ?? "(no artifact yet)"}\` ` +
+        `at the root of this repository. Read that file with your \`read\` tool if the condensed summary above ` +
+        `isn't enough to answer the question confidently. Don't ask the user something you could answer yourself ` +
+        `by reading that file.`,
+      ``,
+      `## Output format requested`,
+      `When the research_synthesis step produces the final brief, structure it as an explicit options table: ` +
+        `one row per option with columns "Option", "What it means for this question", "Trade-offs", "When to ` +
+        `pick it" — followed by a clear "Recommendation" section. Use a real markdown table, not just prose.`,
+    ].join("\n");
+  }
+
+  app.post(
+    "/api/tasks/:id/questions/decompose",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const taskId = (req.params as { id: string }).id;
+      const parent = getTask(taskId);
+      if (!parent) return bad(reply, 404, "task not found");
+      const body = (req.body ?? {}) as { role_key?: string; question?: string };
+      if (!body.role_key || !body.question) {
+        return bad(reply, 400, "role_key and question are required");
+      }
+
+      // Idempotency: re-clicking "decompose" on the same question returns the
+      // existing subtask instead of spawning a duplicate.
+      const existing = listTasks({ parentTaskId: parent.task_id }).find(
+        (c) => c.origin_role_key === body.role_key && c.origin_question === body.question,
+      );
+      if (existing) return reply.code(200).send({ task: existing, created: false });
+
+      const project = parent.project_id != null ? getProject(parent.project_id) : undefined;
+      if (!project) return bad(reply, 400, "parent task has no project");
+
+      const network = getNetworkByIntakeKind(project.id, "question");
+      const digest = buildQuestionDigest(parent, body.role_key, body.question);
+      const question = body.question;
+      const words = question.split(/\s+/);
+      const shortTitle = words.slice(0, 6).join(" ");
+      const name = `Q: ${shortTitle}${words.length > 6 ? "…" : ""}`;
+
+      const child = createTask({
+        name,
+        content: digest,
+        project_id: project.id,
+        stage: "intake",
+        level: "task",
+        intake_kind: "question",
+        exit_kind: "research_brief",
+        parent_task_id: parent.task_id,
+        task_type: "child",
+        network_id: network?.network_id ?? null,
+        origin_role_key: body.role_key,
+        origin_question: question,
+      });
+
+      const planningDir = project.planning_dir || "PLANNING";
+      const relArtifact = path.join(planningDir, "REFINING", artifactName(child));
+      const absArtifact = path.join(project.repo_path, relArtifact);
+      writeArtifact(
+        absArtifact,
+        `# ${name}\n\n> Follow-up question from **${parent.name ?? parent.task_id.slice(0, 8)}** ` +
+          `(role: \`${body.role_key}\`)\n\n${digest}\n`,
+      );
+      updateTask(child.task_id, { artifact_path: relArtifact });
+      commitArtifacts(project.repo_path, [relArtifact], `intake(question): ${name}`);
+      publish(child.task_id, "task_update", { stage: "intake" });
+
+      return reply.code(201).send({ task: getTask(child.task_id), created: true });
+    },
+  );
+
+  const CHAT_SYSTEM_PROMPT =
+    `You are answering a follow-up question from a human about a research brief that was already ` +
+    `produced for them. Read the brief and prior conversation turns supplied in the context, then ` +
+    `respond directly and conversationally to the user's latest message — no meta-commentary about ` +
+    `being an AI, no repeating the whole brief back. When you finish, call record_findings: set verdict ` +
+    `to "pass", leave open_questions and coverage empty, put a one-line gist in summary, and put your ` +
+    `full reply (this is what the user will see) in section_md. If you don't have enough grounding to ` +
+    `answer confidently, say so plainly instead of guessing.`;
+
+  app.post("/api/tasks/:id/chat", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "task not found");
+    const body = (req.body ?? {}) as { message?: string };
+    const message = body.message?.trim();
+    if (!message) return bad(reply, 400, "message is required");
+    if (!task.recap_md) {
+      return bad(reply, 400, "this subtask has not produced a brief yet — wait for it to reach ready/review");
+    }
+
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+    if (!project) return bad(reply, 400, "task has no project");
+
+    const history = listChatMessages(task.task_id);
+    const userMsg = createChatMessage({ task_id: task.task_id, role: "user", content: message });
+
+    const transcript = history
+      .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+      .join("\n\n");
+    const context = [
+      `## Research brief`,
+      task.recap_md,
+      ...(transcript ? [``, `## Conversation so far`, transcript] : []),
+      ``,
+      `## Latest message`,
+      `User: ${message}`,
+    ].join("\n");
+
+    const modelRef = task.model || project.default_model || null;
+    const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
+
+    const result = await runRole({
+      repoPath: project.repo_path,
+      planningDir: project.planning_dir || "PLANNING",
+      artifactAbsPath: path.join(project.repo_path, task.artifact_path ?? ""),
+      modelId,
+      systemPrompt: CHAT_SYSTEM_PROMPT,
+      tools: [],
+      context,
+      thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
+      textMode: connection.textMode,
+      twoPhase: connection.twoPhase,
+      thinkingBudgets: connection.thinkingBudgets,
+      connection,
+    });
+
+    const replyText = result.findings.section_md?.trim() || result.findings.summary?.trim() || "(no response)";
+    const assistantMsg = createChatMessage({ task_id: task.task_id, role: "assistant", content: replyText });
+
+    return { user_message: userMsg, assistant_message: assistantMsg };
   });
 
   // ---- Interventions (steering) ----
@@ -624,5 +1161,572 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const q = req.query as { project_id?: string };
     const projectId = q.project_id ? Number(q.project_id) : null;
     return { roles: listRoles(projectId) };
+  });
+
+  // ---- Summary stats (homepage dashboard) ----
+  app.get("/api/summary", async () => {
+    const d = getDb();
+    const projects = listProjects();
+    const allTasks = listTasks();
+    const byStage: Record<string, number> = { intake: 0, refining: 0, ready: 0, review: 0 };
+    let inFlight = 0;
+    let actionItems = 0;
+    let blockers = 0;
+    let paused = 0;
+    const blockersList: Array<{
+      task_id: string;
+      name: string | null;
+      exit_state: string | null;
+      stage: string | null;
+      project_id: number | null;
+      review_reason: string | null;
+    }> = [];
+
+    for (const t of allTasks) {
+      const stage = t.stage ?? "intake";
+      if (byStage[stage] !== undefined) byStage[stage]++;
+      if (stage === "refining" || stage === "ready") inFlight++;
+      if (t.exit_state && ["blocker", "needs_human", "needs_more"].includes(t.exit_state)) {
+        actionItems++;
+        if (t.exit_state === "blocker") blockers++;
+        blockersList.push({
+          task_id: t.task_id,
+          name: t.name,
+          exit_state: t.exit_state,
+          stage: t.stage,
+          project_id: t.project_id,
+          review_reason: t.review_reason,
+        });
+      }
+      if (t.paused === 1) paused++;
+    }
+
+    // Enrich action items with project name
+    const enrichedBlockers = blockersList.map((b) => {
+      const proj = projects.find((p) => p.id === b.project_id);
+      return { ...b, project_name: proj?.name ?? null };
+    });
+
+    return {
+      total: allTasks.length,
+      by_stage: byStage,
+      in_flight: inFlight,
+      action_items: actionItems,
+      blockers,
+      paused,
+      projects_count: projects.length,
+      blockers_list: enrichedBlockers,
+    };
+  });
+
+  // ---- Model stats (radar chart + performance comparison) ----
+
+  /** Known API/model-size pairs. First match wins (case-insensitive substring).
+   *  MoE entries also carry expert counts for the Epoch.ai effective-params
+   *  formula:  Dense ≈ (num_experts^0.44 / active_per_token^0.63) × total_b  */
+  const KNOWN_MODEL_SIZES: Array<{
+    pattern: string;
+    total_b: number;
+    active_b?: number;
+    num_experts?: number;
+    active_per_token?: number;
+  }> = [
+    // ── OpenAI ── GPT-4 figures are the SemiAnalysis/leaked-architecture consensus
+    // (1.8T total, 16 experts x ~111B, 2 routed + ~55B shared attention ≈ 280B active).
+    // Everything past GPT-4 is undisclosed; reusing the GPT-4 estimate is a placeholder,
+    // not a verified figure.
+    { pattern: "gpt-5.1-nano", total_b: 8 },
+    { pattern: "gpt-5-nano", total_b: 8 },
+    { pattern: "gpt-5.1-mini", total_b: 80 },
+    { pattern: "gpt-5-mini", total_b: 80 },
+    { pattern: "gpt-5.1", total_b: 1800, active_b: 460 },
+    { pattern: "gpt-5", total_b: 1800, active_b: 460 },
+    { pattern: "gpt-4.1-nano", total_b: 8 },
+    { pattern: "gpt-4.1-mini", total_b: 70 },
+    { pattern: "gpt-4.1", total_b: 1760, active_b: 280 },
+    { pattern: "gpt-4o-mini", total_b: 8 },
+    { pattern: "gpt-4o", total_b: 1760, active_b: 280 },
+    { pattern: "gpt-4-turbo", total_b: 1760, active_b: 280 },
+    { pattern: "gpt-4", total_b: 1760, active_b: 280, num_experts: 16, active_per_token: 2 },
+    { pattern: "gpt-3.5-turbo", total_b: 20 },
+    { pattern: "o1-mini", total_b: 20 },
+    { pattern: "o3-mini", total_b: 20 },
+    { pattern: "o4-mini", total_b: 20 },
+    { pattern: "o1", total_b: 1760, active_b: 280 },
+    { pattern: "o3", total_b: 1760, active_b: 280 },
+    { pattern: "o4", total_b: 1760, active_b: 280 },
+
+    // ── Anthropic ── Undisclosed; order-of-magnitude placeholders only (public
+    // estimates for these range from ~20B to several trillion depending on source).
+    { pattern: "claude-opus-4", total_b: 2000 },
+    { pattern: "claude-sonnet-4.5", total_b: 1000 },
+    { pattern: "claude-sonnet-4", total_b: 1000 },
+    { pattern: "claude-haiku-4", total_b: 200 },
+    { pattern: "claude-3.5-sonnet", total_b: 1000 },
+    { pattern: "claude-3.5-haiku", total_b: 200 },
+    { pattern: "claude-3-opus", total_b: 2000 },
+    { pattern: "claude-3-sonnet", total_b: 1000 },
+    { pattern: "claude-3-haiku", total_b: 200 },
+
+    // ── Google Gemini ── Undisclosed; placeholders.
+    { pattern: "gemini-3-pro", total_b: 2000 },
+    { pattern: "gemini-3-flash", total_b: 300 },
+    { pattern: "gemini-2.5-pro", total_b: 2000 },
+    { pattern: "gemini-2.5-flash", total_b: 200 },
+    { pattern: "gemini-2.0-flash", total_b: 100 },
+    { pattern: "gemini-1.5-pro", total_b: 1000 },
+    { pattern: "gemini-1.5-flash", total_b: 100 },
+
+    // ── DeepSeek (MoE) ──
+    { pattern: "deepseek-v4-pro", total_b: 1600, active_b: 49 },
+    { pattern: "deepseek-v4-flash", total_b: 284, active_b: 13 },
+    { pattern: "deepseek-v4", total_b: 1600, active_b: 49 },
+    { pattern: "deepseek-r1", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
+    { pattern: "deepseek-v3", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
+    { pattern: "deepseek-v2-lite", total_b: 16, active_b: 2.4, num_experts: 64, active_per_token: 6 },
+    { pattern: "deepseek-v2", total_b: 236, active_b: 21, num_experts: 160, active_per_token: 6 },
+    { pattern: "deepseek-coder-v2-lite", total_b: 16, active_b: 2.4, num_experts: 64, active_per_token: 6 },
+    { pattern: "deepseek-coder-v2", total_b: 236, active_b: 21, num_experts: 160, active_per_token: 6 },
+    { pattern: "deepseek-chat", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
+    { pattern: "deepseek-reasoner", total_b: 671, active_b: 37, num_experts: 256, active_per_token: 8 },
+
+    // ── Meta — Llama 4 (MoE) ──
+    { pattern: "llama-4-behemoth", total_b: 2000, active_b: 288, num_experts: 16, active_per_token: 1 },
+    { pattern: "llama-4-maverick", total_b: 400, active_b: 17, num_experts: 128, active_per_token: 1 },
+    { pattern: "llama-4-scout", total_b: 109, active_b: 17, num_experts: 16, active_per_token: 1 },
+    // ── Meta — Llama 3 (dense) ──
+    { pattern: "llama-3.3-70b", total_b: 70 },
+    { pattern: "llama-3.1-405b", total_b: 405 },
+    { pattern: "llama-3.1-70b", total_b: 70 },
+    { pattern: "llama-3.1-8b", total_b: 8 },
+    { pattern: "llama-3.2-90b", total_b: 90 },
+    { pattern: "llama-3.2-11b", total_b: 11 },
+    { pattern: "llama-3.2-3b", total_b: 3 },
+    { pattern: "llama-3.2-1b", total_b: 1 },
+    { pattern: "llama-3-70b", total_b: 70 },
+    { pattern: "llama-3-8b", total_b: 8 },
+    { pattern: "llama-2-70b", total_b: 70 },
+    { pattern: "llama-2-13b", total_b: 13 },
+    { pattern: "llama-2-7b", total_b: 7 },
+    { pattern: "codellama-70b", total_b: 70 },
+    { pattern: "codellama-34b", total_b: 34 },
+    { pattern: "codellama-13b", total_b: 13 },
+    { pattern: "codellama-7b", total_b: 7 },
+
+    // ── Mistral — Large 3 / Mixtral (MoE) ──
+    { pattern: "mistral-large-3", total_b: 675, active_b: 41 },
+    { pattern: "mixtral-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
+    { pattern: "mixtral-8x7b", total_b: 46.7, active_b: 12.9, num_experts: 8, active_per_token: 2 },
+    // ── Mistral (dense) ──
+    { pattern: "mistral-large-2", total_b: 123 },
+    { pattern: "mistral-large", total_b: 675, active_b: 41 },
+    { pattern: "mistral-medium", total_b: 70 },
+    { pattern: "ministral-14b", total_b: 14 },
+    { pattern: "ministral-8b", total_b: 8 },
+    { pattern: "ministral-3b", total_b: 3 },
+    { pattern: "mistral-small-3", total_b: 24 },
+    { pattern: "mistral-small", total_b: 24 },
+    { pattern: "mistral-nemo", total_b: 12 },
+    { pattern: "pixtral-large", total_b: 123 },
+    { pattern: "pixtral", total_b: 12 },
+    { pattern: "codestral", total_b: 22 },
+    { pattern: "mistral-7b", total_b: 7 },
+
+    // ── Qwen 3.5 (MoE, 2026) ──
+    { pattern: "qwen3.5-397b", total_b: 397, active_b: 17, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3.5-122b", total_b: 122, active_b: 10 },
+    { pattern: "qwen3.5-35b", total_b: 35, active_b: 3 },
+    { pattern: "qwen3.5-27b", total_b: 27 },
+    // No bare "qwen3.5" fallback — unlisted point sizes (e.g. a future 3.6/3.7
+    // release) should fall through to the regex-based extractor below instead
+    // of silently inheriting the 397B flagship figure.
+    // ── Qwen 3 ──
+    { pattern: "qwen3-235b", total_b: 235, active_b: 22, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3-30b-a3b", total_b: 30, active_b: 3, num_experts: 128, active_per_token: 8 },
+    { pattern: "qwen3-32b", total_b: 32 },
+    { pattern: "qwen3-14b", total_b: 14 },
+    { pattern: "qwen3-8b", total_b: 8 },
+    { pattern: "qwen3-4b", total_b: 4 },
+    { pattern: "qwen3-1.7b", total_b: 1.7 },
+    { pattern: "qwen3-0.6b", total_b: 0.6 },
+    // No bare "qwen3" fallback — same reasoning (was misclassifying e.g. a
+    // dense Qwen3.6-27B as the 235B/22B-active MoE flagship).
+    // ── Qwen 2.5 ──
+    { pattern: "qwen2.5-max", total_b: 72 },
+    { pattern: "qwen2.5-72b", total_b: 72 },
+    { pattern: "qwen2.5-32b", total_b: 32 },
+    { pattern: "qwen2.5-14b", total_b: 14 },
+    { pattern: "qwen2.5-7b", total_b: 7 },
+    { pattern: "qwen2.5-3b", total_b: 3 },
+    { pattern: "qwen2.5-1.5b", total_b: 1.5 },
+    { pattern: "qwen2.5-0.5b", total_b: 0.5 },
+    // ── Qwen 2 (dense + MoE) ──
+    { pattern: "qwen2-57b-a14b", total_b: 57, active_b: 14, num_experts: 16, active_per_token: 4 },
+    { pattern: "qwen2-72b", total_b: 72 },
+    { pattern: "qwen2-7b", total_b: 7 },
+    { pattern: "qwen2-1.5b", total_b: 1.5 },
+    { pattern: "qwen2-0.5b", total_b: 0.5 },
+    // ── Qwen QwQ (reasoning, dense) ──
+    { pattern: "qwq-32b", total_b: 32 },
+
+    // ── Google Gemma ──
+    { pattern: "gemma-4-26b", total_b: 26, active_b: 4, num_experts: 8, active_per_token: 1 },
+    { pattern: "gemma-4-31b", total_b: 31 },
+    { pattern: "gemma-4-e4b", total_b: 4.5 },
+    { pattern: "gemma-4-e2b", total_b: 2.3 },
+    // No bare "gemma-4" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 31B dense-flagship figure.
+    { pattern: "gemma-3-27b", total_b: 27 },
+    { pattern: "gemma-3-12b", total_b: 12 },
+    { pattern: "gemma-3-4b", total_b: 4 },
+    { pattern: "gemma-3-1b", total_b: 1 },
+    { pattern: "gemma-2-27b", total_b: 27 },
+    { pattern: "gemma-2-9b", total_b: 9 },
+    { pattern: "gemma-2-2b", total_b: 2 },
+    { pattern: "gemma-7b", total_b: 7 },
+    { pattern: "gemma-2b", total_b: 2 },
+    { pattern: "codegemma", total_b: 7 },
+
+    // ── Microsoft Phi ──
+    { pattern: "phi-3.5-moe", total_b: 42, active_b: 6.6, num_experts: 16, active_per_token: 2 },
+    { pattern: "phi-3.5-mini", total_b: 3.8 },
+    { pattern: "phi-3.5-vision", total_b: 4.2 },
+    { pattern: "phi-3-medium", total_b: 14 },
+    { pattern: "phi-3-small", total_b: 7 },
+    { pattern: "phi-3-mini", total_b: 3.8 },
+    { pattern: "phi-4-mini", total_b: 3.8 },
+    { pattern: "phi-4", total_b: 14 },
+    { pattern: "phi-2", total_b: 2.7 },
+    { pattern: "phi-1", total_b: 1.3 },
+
+    // ── GLM (Zhipu AI / Z.ai) ──
+    { pattern: "glm-5.2", total_b: 744, active_b: 40 },
+    { pattern: "glm-5", total_b: 744, active_b: 40 },
+    { pattern: "glm-4.6", total_b: 355, active_b: 32, num_experts: 160, active_per_token: 8 },
+    { pattern: "glm-4.5-air", total_b: 106, active_b: 12 },
+    { pattern: "glm-4.5", total_b: 355, active_b: 32, num_experts: 160, active_per_token: 8 },
+    { pattern: "glm-4", total_b: 130 },
+
+    // ── Yi (01.AI) ──
+    { pattern: "yi-1.5-34b", total_b: 34 },
+    { pattern: "yi-1.5-9b", total_b: 9 },
+    { pattern: "yi-1.5-6b", total_b: 6 },
+    { pattern: "yi-34b", total_b: 34 },
+    { pattern: "yi-9b", total_b: 9 },
+    { pattern: "yi-6b", total_b: 6 },
+
+    // ── InternLM (Shanghai AI Lab) ──
+    { pattern: "internlm2-20b", total_b: 20 },
+    { pattern: "internlm2-7b", total_b: 7 },
+
+    // ── DBRX (Databricks, MoE) ──
+    { pattern: "dbrx", total_b: 132, active_b: 36, num_experts: 16, active_per_token: 4 },
+    // ── Snowflake Arctic (MoE) ──
+    { pattern: "arctic", total_b: 480, active_b: 17, num_experts: 128, active_per_token: 2 },
+    // ── AI21 Jamba (MoE) ──
+    { pattern: "jamba-1.5-large", total_b: 398, active_b: 94, num_experts: 8, active_per_token: 2 },
+    { pattern: "jamba-1.5-mini", total_b: 52, active_b: 12, num_experts: 8, active_per_token: 2 },
+
+    // ── Allen AI OLMo ──
+    { pattern: "olmo-2-32b", total_b: 32 },
+    { pattern: "olmo-2-13b", total_b: 13 },
+    { pattern: "olmo-2-7b", total_b: 7 },
+    { pattern: "olmoe", total_b: 7, active_b: 1, num_experts: 64, active_per_token: 8 },
+
+    // ── IBM Granite ──
+    { pattern: "granite-3-8b", total_b: 8 },
+    { pattern: "granite-3-2b", total_b: 2 },
+
+    // ── BigCode StarCoder2 ──
+    { pattern: "starcoder2-15b", total_b: 15 },
+    { pattern: "starcoder2-7b", total_b: 7 },
+    { pattern: "starcoder2-3b", total_b: 3 },
+    { pattern: "starcoder", total_b: 15.5 },
+
+    // ── TII Falcon (dense) ──
+    { pattern: "falcon-180b", total_b: 180 },
+    { pattern: "falcon-40b", total_b: 40 },
+    { pattern: "falcon-7b", total_b: 7 },
+
+    // ── DeepReinforce Ornith 1.0 ──
+    { pattern: "ornith-1.0-397b", total_b: 397, active_b: 34 },
+    { pattern: "ornith-1.0-35b", total_b: 35, active_b: 3 },
+    { pattern: "ornith-1.0-31b", total_b: 31 },
+    { pattern: "ornith-1.0-9b", total_b: 9 },
+    // No bare "ornith" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 35B/3B-active MoE figure.
+
+    // ── xAI Grok ── Grok-1 is the only vendor-confirmed figure; 2/3/4 are
+    // rough community estimates (undisclosed).
+    { pattern: "grok-1", total_b: 314, active_b: 86, num_experts: 8, active_per_token: 2 },
+    { pattern: "grok-4", total_b: 3000, active_b: 400 },
+    { pattern: "grok-3", total_b: 2800, active_b: 400 },
+    { pattern: "grok-2", total_b: 300 },
+
+    // ── Cohere ──
+    { pattern: "command-a", total_b: 111 },
+    { pattern: "command-r-plus", total_b: 104 },
+    { pattern: "command-r", total_b: 35 },
+    { pattern: "aya-expanse-32b", total_b: 32 },
+    { pattern: "aya-expanse-8b", total_b: 8 },
+    { pattern: "aya-23-35b", total_b: 35 },
+    { pattern: "aya-23-8b", total_b: 8 },
+
+    // ── Small / local-friendly models ──
+    { pattern: "solar-10.7b", total_b: 10.7 },
+    { pattern: "stablelm-2-12b", total_b: 12 },
+    { pattern: "stablelm-2", total_b: 1.6 },
+    { pattern: "smollm2-1.7b", total_b: 1.7 },
+    { pattern: "smollm2-360m", total_b: 0.36 },
+    { pattern: "smollm2-135m", total_b: 0.135 },
+    { pattern: "tinyllama", total_b: 1.1 },
+    { pattern: "minicpm3-4b", total_b: 4 },
+    { pattern: "minicpm", total_b: 2.4 },
+    { pattern: "baichuan2-13b", total_b: 13 },
+    { pattern: "baichuan2-7b", total_b: 7 },
+    { pattern: "chatglm3-6b", total_b: 6 },
+    { pattern: "exaone-3.5-32b", total_b: 32 },
+    { pattern: "exaone-3.5-7.8b", total_b: 7.8 },
+    { pattern: "exaone-3.5-2.4b", total_b: 2.4 },
+    // No bare "exaone" fallback — unlisted sizes fall through to the regex
+    // extractor rather than inheriting the 7.8B figure.
+
+    // ── NVIDIA Nemotron ──
+    { pattern: "nemotron-4-340b", total_b: 340 },
+    // No bare "nemotron" fallback — the family spans 12B-340B and each
+    // release encodes its real size in the id, so an unlisted variant should
+    // fall through to the regex extractor rather than guessing 70B.
+
+    // ── Fine-tune families that reuse a Mixtral base (MoE) ──
+    { pattern: "wizardlm-2-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
+    { pattern: "wizardlm-2-70b", total_b: 70 },
+    { pattern: "wizardlm-2", total_b: 7 },
+    { pattern: "dolphin-mixtral-8x22b", total_b: 141, active_b: 39, num_experts: 8, active_per_token: 2 },
+    { pattern: "dolphin-mixtral", total_b: 46.7, active_b: 12.9, num_experts: 8, active_per_token: 2 },
+  ];
+
+  /** Look up a model in the known-sizes table. */
+  function lookupKnownModelSize(modelName: string): (typeof KNOWN_MODEL_SIZES)[number] | null {
+    const s = modelName.toLowerCase();
+    for (const entry of KNOWN_MODEL_SIZES) {
+      if (s.includes(entry.pattern)) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Estimate active parameter count in billions.
+   * Priority: user override → known table (active_b or total_b) → regex fallback.
+   * Regex now catches "122B A10B" (active hint) and "A10B" alone.
+   */
+  function estimateParameterCount(modelName: string | null | undefined): number | null {
+    if (!modelName) return null;
+    const known = lookupKnownModelSize(modelName);
+    if (known) return known.active_b ?? known.total_b;
+
+    // Regex fallback
+    const s = modelName.toLowerCase();
+
+    // "A10B" — explicit active parameter annotation (common in MoE naming)
+    const activeHintMatch = s.match(/\bA(\d+\.?\d*)\s*B\b/i);
+    if (activeHintMatch) return Math.round(Number(activeHintMatch[1]) * 10) / 10;
+
+    // "8x22B" MoE pattern
+    const moeMatch = s.match(/(\d+)x(\d+\.?\d*)\s*b/i);
+    if (moeMatch) {
+      const experts = Number(moeMatch[1]);
+      const perExpert = Number(moeMatch[2]);
+      return Math.round(experts * perExpert * 1.15 * 10) / 10;
+    }
+    // Plain "7B" style
+    const bMatch = s.match(/(\d+\.?\d*)\s*b/i);
+    if (bMatch) return Math.round(Number(bMatch[1]) * 10) / 10;
+    // "300M" style
+    const mMatch = s.match(/(\d+\.?\d*)\s*m\b/i);
+    if (mMatch) return Math.round((Number(mMatch[1]) / 1000) * 10) / 10;
+    return null;
+  }
+
+  /**
+   * Estimate total parameter count in billions.
+   * Priority: known table (total_b) → regex fallback.
+   */
+  function estimateTotalParamCount(modelName: string | null | undefined): number | null {
+    if (!modelName) return null;
+    const known = lookupKnownModelSize(modelName);
+    if (known) return known.total_b;
+    return estimateParameterCount(modelName);
+  }
+
+  /** Estimate quantization bits from a model name string.
+   *  When no quant pattern is found, defaults to fp16 for API-hosted
+   *  models and q4_k for local models. */
+  function estimateQuantization(modelName: string | null | undefined, loc: string | null | undefined): string | null {
+    if (modelName) {
+      const s = modelName.toLowerCase();
+      const qMatch = s.match(/q(\d+)[_\s]*[kK][_\s]*[mMsS]/i);
+      if (qMatch) return `q${qMatch[1]}_k`;
+      if (s.includes("fp16") || s.includes("f16")) return "fp16";
+      if (s.includes("bf16")) return "bf16";
+      if (s.includes("fp32") || s.includes("f32")) return "fp32";
+      if (s.includes("q8_0")) return "q8_0";
+      if (s.includes("q6_k")) return "q6_k";
+      if (s.includes("q5_k")) return "q5_k";
+      if (s.includes("q4_k")) return "q4_k";
+      if (s.includes("q3_k")) return "q3_k";
+      if (s.includes("q2_k")) return "q2_k";
+    }
+    // No name-based match — default by location
+    return loc === "local" ? "q4_k" : "fp16";
+  }
+
+  /** Quantization → normalized score (fp16=1.0 … q2=0.2). */
+  function quantizationScore(q: string | null): number {
+    if (!q) return 0.6; // unknown = middle ground
+    if (q === "fp32" || q === "fp16" || q === "bf16") return 1.0;
+    if (q.startsWith("q8")) return 0.8;
+    if (q.startsWith("q6")) return 0.6;
+    if (q.startsWith("q5")) return 0.5;
+    if (q.startsWith("q4")) return 0.4;
+    if (q.startsWith("q3")) return 0.3;
+    if (q.startsWith("q2")) return 0.2;
+    return 0.6;
+  }
+
+  app.post("/api/model-stats", async (req: FastifyRequest) => {
+    const body = (req.body ?? {}) as { config_ids?: number[] };
+    const configs = listModelConfigs();
+    const filtered = body.config_ids
+      ? configs.filter((c) => body.config_ids!.includes(c.id))
+      : configs;
+
+    const perfStats = getModelPerformanceStats();
+    const perfByConfig = new Map<number, { total_runs: number; total_tokens: number; avg_tokens_per_run: number }>();
+    for (const ps of perfStats) {
+      if (ps.config_id >= 0) {
+        perfByConfig.set(ps.config_id, {
+          total_runs: ps.total_runs,
+          total_tokens: ps.total_tokens,
+          avg_tokens_per_run: ps.avg_tokens_per_run,
+        });
+      }
+    }
+
+    const stats = filtered.map((cfg) => {
+      let extras: Record<string, unknown> = {};
+      try {
+        if (cfg.extra_json) extras = JSON.parse(cfg.extra_json) as Record<string, unknown>;
+      } catch { /* ignore */ }
+
+      const estimatedParams = estimateParameterCount(cfg.default_model);
+      const estimatedTotalParams = estimateTotalParamCount(cfg.default_model);
+      const loc = locationLabel(cfg.base_url);
+      const estimatedQuant = estimateQuantization(cfg.default_model, loc);
+      const userParams = typeof extras.parameter_count_b === "number" ? extras.parameter_count_b : null;
+      const userTotalParams = typeof extras.total_parameter_count_b === "number" ? extras.total_parameter_count_b : null;
+      const userActiveParams = typeof extras.active_parameter_count_b === "number" ? extras.active_parameter_count_b : null;
+      const userQuant = typeof extras.quantization === "string" ? extras.quantization : null;
+      const costInput = typeof extras.cost_per_1m_input === "number" ? extras.cost_per_1m_input : null;
+      const costOutput = typeof extras.cost_per_1m_output === "number" ? extras.cost_per_1m_output : null;
+
+      const perf = perfByConfig.get(cfg.id);
+
+      return {
+        config_id: cfg.id,
+        name: cfg.name ?? cfg.key,
+        model_id: cfg.default_model,
+        context_window: cfg.context_window,
+        max_tokens: cfg.max_tokens,
+        reasoning: cfg.reasoning === 1,
+        thinking_level: cfg.thinking_level,
+        thinking_format: cfg.thinking_format,
+        text_mode: cfg.text_mode === 1,
+        has_api_key: !!(cfg.api_key && cfg.api_key.length),
+        has_env_token: !!process.env.ORCHESTRA_TOKENS,
+        location: locationLabel(cfg.base_url),
+        parameter_count_b: userParams ?? estimatedParams,
+        parameter_count_estimated: estimatedParams,
+        total_parameter_count_b: userTotalParams ?? estimatedTotalParams ?? estimatedParams,
+        active_parameter_count_b: userActiveParams ?? (estimatedTotalParams !== estimatedParams ? estimatedParams : null),
+        quantization: userQuant ?? estimatedQuant,
+        quantization_estimated: estimatedQuant,
+        quantization_score: quantizationScore(userQuant ?? estimatedQuant),
+        cost_per_1m_input: costInput,
+        cost_per_1m_output: costOutput,
+        historical_runs: perf?.total_runs ?? 0,
+        historical_total_tokens: perf?.total_tokens ?? 0,
+        historical_avg_tokens_per_run: perf?.avg_tokens_per_run ?? 0,
+      };
+    });
+
+    return { stats };
+  });
+
+  // ---- Ping network: SSE stream — sends full list immediately, then updates as each ping returns ----
+  app.get("/api/ping-network/stream", async (req: FastifyRequest, reply: FastifyReply) => {
+    const configs = listModelConfigs();
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const send = (event: string, data: unknown) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    // 1. Immediately send the full list with "checking" status
+    send("init", {
+      configs: configs.map((cfg) => ({
+        config_id: cfg.id,
+        name: cfg.name ?? cfg.key,
+        base_url: (cfg.base_url ?? "").trim(),
+      })),
+    });
+
+    // 2. Ping each config and stream results as they complete
+    const promises = configs.map(async (cfg) => {
+      const baseUrl = (cfg.base_url ?? "").trim();
+      if (!baseUrl) {
+        send("result", {
+          config_id: cfg.id,
+          available: false,
+          error: "No base URL configured",
+        });
+        return;
+      }
+      try {
+        const url = baseUrl.replace(/\/+$/, "") + "/models";
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8_000);
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        const apiKey = cfg.api_key?.trim();
+        const envKey = envTokenForModel(cfg.name);
+        const authKey = apiKey || envKey;
+        if (authKey) headers.Authorization = `Bearer ${authKey}`;
+        const res = await fetch(url, { headers, signal: controller.signal });
+        clearTimeout(timer);
+        send("result", {
+          config_id: cfg.id,
+          available: res.ok,
+          error: res.ok ? undefined : `HTTP ${res.status}`,
+        });
+      } catch (err) {
+        send("result", {
+          config_id: cfg.id,
+          available: false,
+          error: (err as Error).message,
+        });
+      }
+    });
+
+    await Promise.all(promises);
+
+    // 3. Stream complete
+    send("done", {});
+    reply.raw.end();
   });
 }

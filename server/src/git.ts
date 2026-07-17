@@ -8,9 +8,23 @@
 
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export const STAGE_DIRS = ["INTAKE", "REFINING", "READY", "REVIEW", "epics"] as const;
+
+/**
+ * Rewrite absolute paths under the current user's home directory to use "~/" for
+ * brevity and privacy in API responses and UI. The original path is never
+ * modified in the database; this is a display-only transformation.
+ */
+export function sanitizePath(absPath: string): string {
+  const home = os.homedir();
+  if (absPath.startsWith(home + path.sep)) {
+    return "~" + absPath.slice(home.length);
+  }
+  return absPath;
+}
 export type StageDir = (typeof STAGE_DIRS)[number];
 
 /**

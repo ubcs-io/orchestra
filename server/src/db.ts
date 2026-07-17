@@ -167,6 +167,14 @@ export function initDb(): void {
       created_at    TEXT,
       updated_at    TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS task_chat_messages (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id    TEXT NOT NULL,
+      role       TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      created_at TEXT
+    );
   `);
 
   // New tasks columns (existing DBs only have the original db.py set). Must run
@@ -200,6 +208,11 @@ export function initDb(): void {
   addColumnIfMissing(d, "role_runs", "thinking_md", "thinking_md TEXT");
   // Open questions from record_findings (JSON array of strings).
   addColumnIfMissing(d, "role_runs", "open_questions_json", "open_questions_json TEXT");
+  // Audit-trail spine for the counter-review overhaul: a "critique" or
+  // "second_review" run points back at the primary run it judged via
+  // target_run_id; run_kind distinguishes the three kinds of role_runs row.
+  addColumnIfMissing(d, "role_runs", "target_run_id", "target_run_id INTEGER");
+  addColumnIfMissing(d, "role_runs", "run_kind", "run_kind TEXT DEFAULT 'primary'");
   // Orchestrator recap call — synthesized final disposition after all roles finish.
   addColumnIfMissing(d, "tasks", "recap_md", "recap_md TEXT");
   // Reasoning-model connection settings (editable per profile).
@@ -217,9 +230,21 @@ export function initDb(): void {
   addColumnIfMissing(d, "configs", "two_phase", "two_phase INTEGER DEFAULT 0");
   // Whether a role can spawn child tasks via decomposition.
   addColumnIfMissing(d, "roles", "can_create_subtasks", "can_create_subtasks INTEGER DEFAULT 0");
+  // JSON blob for pi Model compat options (supportsDeveloperRole, supportsReasoningEffort,
+  // maxTokensField, chatTemplateKwargs, etc.).
+  addColumnIfMissing(d, "configs", "compat_json", "compat_json TEXT");
+  // Per-thinking-level reasoning token budgets (JSON: {"minimal": 1024, "low": 4096, …}).
+  // Passed to pi's SettingsManager so providers that support token-based thinking caps
+  // can constrain reasoning tokens separately from the max_tokens output budget.
+  addColumnIfMissing(d, "configs", "thinking_budgets", "thinking_budgets TEXT");
+  // Display ordering for model config cards (user-controlled drag-and-drop).
+  addColumnIfMissing(d, "configs", "ordering", "ordering INTEGER DEFAULT 0");
 
   // Agent network linking: custom flow template per task.
   addColumnIfMissing(d, "tasks", "network_id", "network_id TEXT");
+  // Links a "decompose question" child task back to the question that spawned it.
+  addColumnIfMissing(d, "tasks", "origin_role_key", "origin_role_key TEXT");
+  addColumnIfMissing(d, "tasks", "origin_question", "origin_question TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -230,6 +255,8 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_configs_project ON configs(project_id);
     CREATE INDEX IF NOT EXISTS idx_agent_networks_project ON agent_networks(project_id);
     CREATE INDEX IF NOT EXISTS idx_agent_networks_intake ON agent_networks(intake_kind);
+    CREATE INDEX IF NOT EXISTS idx_task_chat_messages_task ON task_chat_messages(task_id);
+    CREATE INDEX IF NOT EXISTS idx_role_runs_target ON role_runs(target_run_id);
   `);
 }
 
@@ -293,6 +320,8 @@ export interface TaskRow {
   recap_md: string | null;
   paused: number | null;
   network_id: string | null;
+  origin_role_key: string | null;
+  origin_question: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -321,6 +350,9 @@ export interface ConfigRow {
   text_mode: number | null;
   two_phase: number | null;
   extra_json: string | null;
+  compat_json: string | null;
+  thinking_budgets: string | null;
+  ordering: number;
   created_at: string;
   updated_at: string;
 }
@@ -341,6 +373,8 @@ export interface RoleRunRow {
   stalled: number | null;
   thinking_md: string | null;
   open_questions_json: string | null;
+  target_run_id: number | null;
+  run_kind: string;
   depth: number;
   model: string | null;
   tokens: number | null;
@@ -354,6 +388,14 @@ export interface InterventionRow {
   payload_json: string | null;
   created_by: string | null;
   consumed_at: string | null;
+  created_at: string;
+}
+
+export interface TaskChatMessageRow {
+  id: number;
+  task_id: string;
+  role: string;
+  content: string;
   created_at: string;
 }
 
@@ -597,6 +639,8 @@ export function upsertConfig(input: {
   text_mode?: number | null;
   two_phase?: number | null;
   extra_json?: string | null;
+  compat_json?: string | null;
+  thinking_budgets?: string | null;
 }): ConfigRow {
   const d = getDb();
   const ts = now();
@@ -612,29 +656,31 @@ export function upsertConfig(input: {
   const base: Partial<ConfigRow> = existing ?? {};
   const keep = <T>(next: T | null | undefined, prior: T | null | undefined): T | null =>
     next !== undefined ? (next as T | null) : (prior ?? null);
-  const merged = {
-    name: keep(input.name, base.name),
-    base_url: keep(input.base_url, base.base_url),
-    api_key: keep(input.api_key, base.api_key),
-    api: keep(input.api, base.api),
-    default_model: keep(input.default_model, base.default_model),
-    context_window: keep(input.context_window, base.context_window),
-    max_tokens: keep(input.max_tokens, base.max_tokens),
-    request_timeout_ms: keep(input.request_timeout_ms, base.request_timeout_ms),
-    reasoning: keep(input.reasoning, base.reasoning),
-    thinking_level: keep(input.thinking_level, base.thinking_level),
-    thinking_format: keep(input.thinking_format, base.thinking_format),
-    text_mode: keep(input.text_mode, base.text_mode),
-    two_phase: keep(input.two_phase, base.two_phase),
-    extra_json: keep(input.extra_json, base.extra_json),
-  };
+    const merged = {
+      name: keep(input.name, base.name),
+      base_url: keep(input.base_url, base.base_url),
+      api_key: keep(input.api_key, base.api_key),
+      api: keep(input.api, base.api),
+      default_model: keep(input.default_model, base.default_model),
+      context_window: keep(input.context_window, base.context_window),
+      max_tokens: keep(input.max_tokens, base.max_tokens),
+      request_timeout_ms: keep(input.request_timeout_ms, base.request_timeout_ms),
+      reasoning: keep(input.reasoning, base.reasoning),
+      thinking_level: keep(input.thinking_level, base.thinking_level),
+      thinking_format: keep(input.thinking_format, base.thinking_format),
+      text_mode: keep(input.text_mode, base.text_mode),
+      two_phase: keep(input.two_phase, base.two_phase),
+      extra_json: keep(input.extra_json, base.extra_json),
+      compat_json: keep(input.compat_json, base.compat_json),
+      thinking_budgets: keep(input.thinking_budgets, base.thinking_budgets),
+    };
 
   if (existing) {
     d.prepare(
       `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
         default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
-        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, updated_at=@ts WHERE id=@id`,
+        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
     return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
   }
@@ -642,9 +688,9 @@ export function upsertConfig(input: {
   const info = d
     .prepare(
       `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
-         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, two_phase, extra_json, created_at, updated_at)
+         context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format, text_mode, two_phase, extra_json, compat_json, thinking_budgets, created_at, updated_at)
        VALUES (@project_id, @key, @name, @base_url, @api_key, @api, @default_model,
-         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @ts, @ts)`,
+         @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @compat_json, @thinking_budgets, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
   return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
@@ -669,6 +715,9 @@ export function createTask(input: {
   step_number?: number | null;
   artifact_path?: string | null;
   refinement_plan_json?: string | null;
+  network_id?: string | null;
+  origin_role_key?: string | null;
+  origin_question?: string | null;
 }): TaskRow {
   const d = getDb();
   const ts = now();
@@ -676,9 +725,11 @@ export function createTask(input: {
   const info = d
     .prepare(
       `INSERT INTO tasks (task_id, name, status, model, content, project_id, stage, level, intake_kind,
-         exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json, created_at, updated_at)
+         exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json,
+         network_id, origin_role_key, origin_question, created_at, updated_at)
        VALUES (@task_id, @name, @status, @model, @content, @project_id, @stage, @level, @intake_kind,
-         @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json, @ts, @ts)`,
+         @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json,
+         @network_id, @origin_role_key, @origin_question, @ts, @ts)`,
     )
     .run({
       task_id: taskId,
@@ -696,6 +747,9 @@ export function createTask(input: {
       step_number: input.step_number ?? null,
       artifact_path: input.artifact_path ?? null,
       refinement_plan_json: input.refinement_plan_json ?? null,
+      network_id: input.network_id ?? null,
+      origin_role_key: input.origin_role_key ?? null,
+      origin_question: input.origin_question ?? null,
       ts,
     });
   return getTask(Number(info.lastInsertRowid))!;
@@ -881,6 +935,10 @@ export function createRoleRun(input: {
   stalled?: number | null;
   thinking_md?: string | null;
   open_questions_json?: string | null;
+  /** The primary run this critiques/second-reviews, if this is not itself a primary run. */
+  target_run_id?: number | null;
+  /** "primary" (default) | "critique" | "second_review". */
+  run_kind?: string;
   depth?: number;
   model?: string | null;
   tokens?: number | null;
@@ -891,10 +949,10 @@ export function createRoleRun(input: {
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
          criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, stalled, thinking_md,
-         open_questions_json, depth, model, tokens, created_at)
+         open_questions_json, target_run_id, run_kind, depth, model, tokens, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
          @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @stalled, @thinking_md,
-         @open_questions_json, @depth, @model, @tokens, @ts)`,
+         @open_questions_json, @target_run_id, @run_kind, @depth, @model, @tokens, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -911,6 +969,8 @@ export function createRoleRun(input: {
       stalled: input.stalled ?? 0,
       thinking_md: input.thinking_md ?? null,
       open_questions_json: input.open_questions_json ?? null,
+      target_run_id: input.target_run_id ?? null,
+      run_kind: input.run_kind ?? "primary",
       depth: input.depth ?? 1,
       model: input.model ?? null,
       tokens: input.tokens ?? null,
@@ -923,6 +983,13 @@ export function listRoleRuns(taskId: string): RoleRunRow[] {
   return getDb()
     .prepare(`SELECT * FROM role_runs WHERE task_id = ? ORDER BY id ASC`)
     .all(taskId) as RoleRunRow[];
+}
+
+/** Critique/second-review runs recorded against a specific primary run. */
+export function listCritiquesForRun(runId: number): RoleRunRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM role_runs WHERE target_run_id = ? ORDER BY id ASC`)
+    .all(runId) as RoleRunRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +1035,34 @@ export function listInterventions(taskId: string): InterventionRow[] {
 
 export function markInterventionConsumed(id: number): void {
   getDb().prepare(`UPDATE interventions SET consumed_at = ? WHERE id = ?`).run(now(), id);
+}
+
+// ---------------------------------------------------------------------------
+// Task chat messages (freeform chat against a decomposed question subtask)
+// ---------------------------------------------------------------------------
+
+export function createChatMessage(input: {
+  task_id: string;
+  role: "user" | "assistant";
+  content: string;
+}): TaskChatMessageRow {
+  const d = getDb();
+  const ts = now();
+  const info = d
+    .prepare(
+      `INSERT INTO task_chat_messages (task_id, role, content, created_at)
+       VALUES (@task_id, @role, @content, @ts)`,
+    )
+    .run({ task_id: input.task_id, role: input.role, content: input.content, ts });
+  return d
+    .prepare(`SELECT * FROM task_chat_messages WHERE id = ?`)
+    .get(Number(info.lastInsertRowid)) as TaskChatMessageRow;
+}
+
+export function listChatMessages(taskId: string): TaskChatMessageRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM task_chat_messages WHERE task_id = ? ORDER BY id ASC`)
+    .all(taskId) as TaskChatMessageRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,7 +1199,7 @@ export function setDefaultNetwork(
   return getNetwork(network.id);
 }
 
-export function deleteNetwork(identifier: number | string): void {
+  export function deleteNetwork(identifier: number | string): void {
   const d = getDb();
   const network = getNetwork(identifier);
   if (!network || network.is_system) return; // cannot delete system networks
@@ -1115,7 +1210,287 @@ export function deleteNetwork(identifier: number | string): void {
   d.prepare(`DELETE FROM agent_networks WHERE ${keyCol} = ?`).run(keyVal);
 }
 
-/** Duplicate a network (creates a new user-editable copy). */
+// ---------------------------------------------------------------------------
+// Model performance stats (historical TPS from role_runs)
+// ---------------------------------------------------------------------------
+
+export interface ModelPerformanceRow {
+  config_id: number;
+  config_name: string | null;
+  model_id: string | null;
+  total_runs: number;
+  total_tokens: number;
+  avg_tokens_per_run: number;
+}
+
+/** Aggregate token usage from role_runs, keyed by the model identifier string. */
+export function getModelPerformanceStats(): ModelPerformanceRow[] {
+  const d = getDb();
+  const raw = d.prepare(`
+    SELECT
+      r.model AS model_id,
+      COUNT(*) AS total_runs,
+      COALESCE(SUM(r.tokens), 0) AS total_tokens
+    FROM role_runs r
+    WHERE r.model IS NOT NULL AND r.tokens IS NOT NULL AND r.tokens > 0
+    GROUP BY r.model
+  `).all() as Array<{ model_id: string; total_runs: number; total_tokens: number }>;
+
+  // Match runs to configs by model name (the config's default_model field).
+  const configs = listModelConfigs();
+  const result: ModelPerformanceRow[] = [];
+
+  for (const row of raw) {
+    // Find configs where default_model matches this model_id
+    const matching = configs.filter((c) => c.default_model === row.model_id);
+    if (matching.length > 0) {
+      for (const cfg of matching) {
+        result.push({
+          config_id: cfg.id,
+          config_name: cfg.name,
+          model_id: row.model_id,
+          total_runs: row.total_runs,
+          total_tokens: row.total_tokens,
+          avg_tokens_per_run: row.total_runs > 0 ? Math.round(row.total_tokens / row.total_runs) : 0,
+        });
+      }
+    } else {
+      // Model name appears in runs but doesn't match any config's default_model
+      result.push({
+        config_id: -1,
+        config_name: null,
+        model_id: row.model_id,
+        total_runs: row.total_runs,
+        total_tokens: row.total_tokens,
+        avg_tokens_per_run: row.total_runs > 0 ? Math.round(row.total_tokens / row.total_runs) : 0,
+      });
+    }
+  }
+
+  return result;
+}
+
+  // ---------------------------------------------------------------------------
+  // Model Configs (named connection profiles beyond the global default)
+  // ---------------------------------------------------------------------------
+
+  /** Return all model configs including the global default row. Sorted by user ordering. */
+  export function listModelConfigs(): ConfigRow[] {
+    return getDb()
+      .prepare(`SELECT * FROM configs ORDER BY ordering ASC, id ASC`)
+      .all() as ConfigRow[];
+  }
+
+  export function getConfigById(id: number): ConfigRow | undefined {
+    return getDb().prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow | undefined;
+  }
+
+  /** Create a named model config. Throws if name already exists. */
+  export function createModelConfig(input: {
+    name: string;
+    base_url?: string | null;
+    api_key?: string | null;
+    api?: string | null;
+    default_model?: string | null;
+    context_window?: number | null;
+    max_tokens?: number | null;
+    request_timeout_ms?: number | null;
+    reasoning?: boolean;
+    thinking_level?: string | null;
+    thinking_format?: string | null;
+    text_mode?: boolean;
+    two_phase?: boolean;
+    extra_json?: string | null;
+    compat_json?: string | null;
+    thinking_budgets?: string | null;
+  }): ConfigRow {
+    const d = getDb();
+    const existing = d.prepare(`SELECT id FROM configs WHERE name = ?`).get(input.name) as { id: number } | undefined;
+    if (existing) throw new Error(`A model config named "${input.name}" already exists.`);
+    const ts = now();
+    const key = `model_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Place new config at the end: ordering = max(existing) + 1
+    const maxOrd = d.prepare(
+      `SELECT COALESCE(MAX(ordering), -1) AS m FROM configs WHERE project_id IS NULL`,
+    ).get() as { m: number };
+    const ordering = maxOrd.m + 1;
+
+    const info = d
+      .prepare(
+        `INSERT INTO configs (project_id, key, name, base_url, api_key, api, default_model,
+           context_window, max_tokens, request_timeout_ms, reasoning, thinking_level, thinking_format,
+           text_mode, two_phase, extra_json, compat_json, thinking_budgets, ordering, created_at, updated_at)
+         VALUES (NULL, @key, @name, @base_url, @api_key, @api, @default_model,
+           @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format,
+           @text_mode, @two_phase, @extra_json, @compat_json, @thinking_budgets, @ordering, @ts, @ts)`,
+      )
+      .run({
+        key,
+        name: input.name,
+        base_url: input.base_url ?? null,
+        api_key: input.api_key ?? null,
+        api: input.api ?? "openai-completions",
+        default_model: input.default_model ?? null,
+        context_window: input.context_window ?? null,
+        max_tokens: input.max_tokens ?? null,
+        request_timeout_ms: input.request_timeout_ms ?? null,
+        reasoning: input.reasoning ? 1 : 0,
+        thinking_level: input.thinking_level ?? null,
+        thinking_format: input.thinking_format ?? null,
+        text_mode: input.text_mode ? 1 : 0,
+        two_phase: input.two_phase ? 1 : 0,
+        extra_json: input.extra_json ?? null,
+        compat_json: input.compat_json ?? null,
+        thinking_budgets: input.thinking_budgets ?? null,
+        ordering,
+        ts,
+      });
+    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
+  }
+
+  /** Update a model config by id. */
+  export function updateModelConfig(id: number, input: {
+    name?: string | null;
+    base_url?: string | null;
+    api_key?: string | null;
+    api?: string | null;
+    default_model?: string | null;
+    context_window?: number | null;
+    max_tokens?: number | null;
+    request_timeout_ms?: number | null;
+    reasoning?: number | null;
+    thinking_level?: string | null;
+    thinking_format?: string | null;
+    text_mode?: number | null;
+    two_phase?: number | null;
+    extra_json?: string | null;
+    compat_json?: string | null;
+    thinking_budgets?: string | null;
+  }): ConfigRow {
+    const d = getDb();
+    const existing = getConfigById(id);
+    if (!existing) throw new Error("Model config not found.");
+
+    // Name uniqueness check if name is changing
+    if (input.name !== undefined && input.name !== existing.name) {
+      const dup = d.prepare(`SELECT id FROM configs WHERE name = ? AND id != ?`).get(input.name, id) as { id: number } | undefined;
+      if (dup) throw new Error(`A model config named "${input.name}" already exists.`);
+    }
+
+    const keep = <T>(next: T | null | undefined, prior: T | null | undefined): T | null =>
+      next !== undefined ? (next as T | null) : (prior ?? null);
+
+    const merged = {
+      name: keep(input.name, existing.name),
+      base_url: keep(input.base_url, existing.base_url),
+      api_key: keep(input.api_key, existing.api_key),
+      api: keep(input.api, existing.api),
+      default_model: keep(input.default_model, existing.default_model),
+      context_window: keep(input.context_window, existing.context_window),
+      max_tokens: keep(input.max_tokens, existing.max_tokens),
+      request_timeout_ms: keep(input.request_timeout_ms, existing.request_timeout_ms),
+      reasoning: keep(input.reasoning, existing.reasoning),
+      thinking_level: keep(input.thinking_level, existing.thinking_level),
+      thinking_format: keep(input.thinking_format, existing.thinking_format),
+      text_mode: keep(input.text_mode, existing.text_mode),
+      two_phase: keep(input.two_phase, existing.two_phase),
+      extra_json: keep(input.extra_json, existing.extra_json),
+      compat_json: keep(input.compat_json, existing.compat_json),
+      thinking_budgets: keep(input.thinking_budgets, existing.thinking_budgets),
+    };
+
+    const ts = now();
+    d.prepare(
+      `UPDATE configs SET name=@name, base_url=@base_url, api_key=@api_key, api=@api,
+        default_model=@default_model, context_window=@context_window, max_tokens=@max_tokens,
+        request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
+        thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase,
+        extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, updated_at=@ts WHERE id=@id`,
+    ).run({ ...merged, id, ts });
+    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
+  }
+
+  /** Delete a model config by id. Refuses to delete the global default row. */
+  export function deleteModelConfig(id: number): void {
+    const d = getDb();
+    const existing = getConfigById(id);
+    if (!existing) return;
+    if (existing.project_id === null && existing.key === "default") {
+      throw new Error("Cannot delete the global default config.");
+    }
+    d.prepare(`DELETE FROM configs WHERE id = ?`).run(id);
+  }
+
+  /** Duplicate a model config with a new unique name. The copy gets a fresh key and empty api_key. */
+  export function duplicateModelConfig(id: number, newName?: string): ConfigRow {
+    const existing = getConfigById(id);
+    if (!existing) throw new Error("Model config not found.");
+    return createModelConfig({
+      name: newName ?? `${existing.name ?? "model"} (copy)`,
+      base_url: existing.base_url,
+      api: existing.api,
+      default_model: existing.default_model,
+      context_window: existing.context_window,
+      max_tokens: existing.max_tokens,
+      request_timeout_ms: existing.request_timeout_ms,
+      reasoning: existing.reasoning === 1,
+      thinking_level: existing.thinking_level,
+      thinking_format: existing.thinking_format,
+      text_mode: existing.text_mode === 1,
+      two_phase: existing.two_phase === 1,
+      extra_json: existing.extra_json,
+      compat_json: existing.compat_json,
+      thinking_budgets: existing.thinking_budgets,
+    });
+  }
+
+  /**
+   * Promote a model config to be the new global default.
+   * The current default (key='default') is demoted to a regular key,
+   * and the target config's key is changed to 'default'.
+   * Throws if the target is already the default.
+   */
+  export function setDefaultModelConfig(id: number): ConfigRow {
+    const d = getDb();
+    const target = getConfigById(id);
+    if (!target) throw new Error("Model config not found.");
+    if (target.project_id === null && target.key === "default") {
+      throw new Error("This config is already the default.");
+    }
+
+    // Demote the current default: give it a generated key
+    const currentDefault = d
+      .prepare(`SELECT * FROM configs WHERE project_id IS NULL AND key = 'default'`)
+      .get() as ConfigRow | undefined;
+    if (currentDefault) {
+      const newKey = `model_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      d.prepare(`UPDATE configs SET key = ? WHERE id = ?`).run(newKey, currentDefault.id);
+    }
+
+    // Promote the target
+    const ts = now();
+    d.prepare(`UPDATE configs SET key = 'default', updated_at = ? WHERE id = ?`).run(ts, id);
+    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
+  }
+
+  /**
+   * Reorder model configs. Accepts an array of config IDs in the desired order.
+   * Assigns ordering = index for each ID in a single transaction.
+   * IDs not in the list are left untouched.
+   */
+  export function reorderModelConfigs(ids: number[]): void {
+    const d = getDb();
+    const stmt = d.prepare(`UPDATE configs SET ordering = ? WHERE id = ?`);
+    const tx = d.transaction((idList: number[]) => {
+      for (let i = 0; i < idList.length; i++) {
+        stmt.run(i, idList[i]);
+      }
+    });
+    tx(ids);
+  }
+
+  /** Duplicate a network (creates a new user-editable copy). */
 export function duplicateNetwork(identifier: number | string, newName?: string, targetProjectId?: number | null): AgentNetworkRow {
   const network = getNetwork(identifier);
   if (!network) throw new Error("Network not found");

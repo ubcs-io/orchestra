@@ -16,7 +16,9 @@ export interface TaskEvent {
     | "tool_start"
     | "tool_end"
     | "status"
-    | "task_update";
+    | "task_update"
+    | "recap_start"
+    | "recap_end";
   /** Arbitrary event-specific payload (delta, tool name, role key, stage, …). */
   data?: unknown;
   ts: number;

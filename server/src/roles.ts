@@ -6,6 +6,7 @@
  * routing templates; users can override per task (§5.5 steering).
  */
 
+import { createHash } from "node:crypto";
 import { countGlobalRoles, createNetwork, getDb, getMeta, listNetworks, setMeta, upsertRole } from "./db.js";
 
 /** Read-only pi built-in tools given to code-inspecting roles. */
@@ -93,6 +94,8 @@ export interface Criterion {
   concern?: string;
 }
 
+export type ReviewDepth = "none" | "terminal_only" | "every_step";
+
 export interface FlowTemplate {
   /** Shared label for a family of intake kinds, e.g. "bug", "security". */
   key: string;
@@ -106,6 +109,11 @@ export interface FlowTemplate {
   mandatoryConcerns: string[];
   /** Loop-back attempts before escalating to human REVIEW. */
   maxLoopbacks: number;
+  /** How often the adversarial `critic` role checks a step's output for a domain
+   *  violation ("would I reject a PR for this?") before the deterministic gate
+   *  runs: "none" (off), "terminal_only" (at the reviewer step only, alongside
+   *  its criteria check), "every_step" (after every non-exempt producer step). */
+  reviewDepth: ReviewDepth;
 }
 
 const BUG_CRITERIA: Criterion[] = [
@@ -160,51 +168,51 @@ const RESEARCH_CRITERIA: Criterion[] = [
 export const FLOW_TEMPLATES: Record<IntakeKind, FlowTemplate> = {
   error_file: {
     key: "bug", rigor: "standard", reviewerRole: "bug_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA,
+    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "bug_investigator", "architecture_review", "test_strategy", "bug_review", "decomposition"],
   },
   bug: {
     key: "bug", rigor: "standard", reviewerRole: "bug_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA,
+    mandatoryConcerns: ["correctness", "tests"], criteria: BUG_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "bug_investigator", "architecture_review", "test_strategy", "bug_review", "decomposition"],
   },
   security: {
     key: "security", rigor: "high", reviewerRole: "security_review_adversary", maxLoopbacks: 1,
-    mandatoryConcerns: ["security", "privacy"], criteria: SECURITY_CRITERIA,
+    mandatoryConcerns: ["security", "privacy"], criteria: SECURITY_CRITERIA, reviewDepth: "every_step",
     steps: ["intake_triage", "explorer", "security_review", "privacy_review", "architecture_review", "test_strategy", "security_review_adversary", "decomposition"],
   },
   feature: {
     key: "feature", rigor: "standard", reviewerRole: "spec_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness", "security", "tests"], criteria: FEATURE_CRITERIA,
+    mandatoryConcerns: ["correctness", "security", "tests"], criteria: FEATURE_CRITERIA, reviewDepth: "every_step",
     steps: ["intake_triage", "requirements_analyst", "explorer", "architecture_review", "api_design", "data_schema_review", "security_review", "test_strategy", "spec_review", "decomposition"],
   },
   manual: {
     key: "spec", rigor: "standard", reviewerRole: "spec_review", maxLoopbacks: 2,
-    mandatoryConcerns: ["correctness"], criteria: MANUAL_CRITERIA,
+    mandatoryConcerns: ["correctness"], criteria: MANUAL_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "requirements_analyst", "architecture_review", "test_strategy", "spec_review", "decomposition"],
   },
   chore: {
     key: "chore", rigor: "low", reviewerRole: "spec_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: CHORE_CRITERIA,
+    mandatoryConcerns: [], criteria: CHORE_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "style_conventions", "test_strategy", "spec_review", "decomposition"],
   },
   spike: {
     key: "spike", rigor: "low", reviewerRole: "spec_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: SPIKE_CRITERIA,
+    mandatoryConcerns: [], criteria: SPIKE_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "explorer", "options_exploration", "architecture_review", "spec_review", "decomposition"],
   },
   research: {
     key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
+    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "user_research", "options_exploration", "edge_case_analysis", "brief_review", "research_synthesis"],
   },
   ux: {
     key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
-    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
+    mandatoryConcerns: [], criteria: RESEARCH_CRITERIA, reviewDepth: "terminal_only",
     steps: ["intake_triage", "ux_review", "user_research", "options_exploration", "edge_case_analysis", "brief_review", "research_synthesis"],
   },
   question: {
-    key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1,
+    key: "research", rigor: "low", reviewerRole: "brief_review", maxLoopbacks: 1, reviewDepth: "terminal_only",
     mandatoryConcerns: [], criteria: RESEARCH_CRITERIA,
     steps: ["intake_triage", "explorer", "options_exploration", "brief_review", "research_synthesis"],
   },
@@ -213,6 +221,11 @@ export const FLOW_TEMPLATES: Record<IntakeKind, FlowTemplate> = {
 /** Resolve the flow for an intake kind (falls back to the manual flow). */
 export function flowForIntake(kind: IntakeKind): FlowTemplate {
   return FLOW_TEMPLATES[kind] ?? FLOW_TEMPLATES.manual;
+}
+
+/** Whether a role is excluded from "every_step" adversarial critique (see RoleSeed.critiqueExempt). */
+export function isCritiqueExempt(roleKey: string): boolean {
+  return DEFAULT_ROLES.find((r) => r.key === roleKey)?.critiqueExempt ?? false;
 }
 
 /**
@@ -238,6 +251,9 @@ export interface RoleSeed {
   appliesTo: IntakeKind[];
   persona: string;
   can_create_subtasks?: boolean;
+  /** Excluded from "every_step" adversarial critique — for pure administrative/
+   *  synthesis roles where a domain-violation check isn't meaningful. */
+  critiqueExempt?: boolean;
 }
 
 const ALL: IntakeKind[] = [
@@ -262,14 +278,19 @@ do NOT attempt to explore the repository or claim to read files. Work from what 
 Your output budget is limited: be decisive and finish promptly. Do NOT narrate a plan to explore.`.trim();
 
 /**
- * Shared output contract appended to every role's system prompt. Every role MUST
- * finish by calling `record_findings` exactly once — that structured call is how
- * the Orchestrator captures verdict + coverage without fragile text parsing.
+ * Shared output contract appended to every role's system prompt. Defines the
+ * findings schema (verdict, summary, coverage, section_md) every role must
+ * report — deliberately mechanism-agnostic (no mention of `record_findings` or
+ * any other submission mechanism), since whether that's a tool call or structured
+ * text depends on the connection's textMode/twoPhase settings, which aren't known
+ * at role-seed time. The mechanism-specific instruction is appended at runtime by
+ * agent.ts's TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION / TWO_PHASE_EXPLORE_CONTRACT.
  * (The tool-aware "How to work" preamble is prepended by `buildRoleSystemPrompt`.)
  */
 export const OUTPUT_CONTRACT = `
 ## How to finish (required)
-When done, call the \`record_findings\` tool EXACTLY ONCE with:
+When you are done, your findings must convey the following. (The exact submission
+mechanism — a tool call or structured text — is specified elsewhere in your instructions.)
 - verdict: one of "pass" (your concern is adequately addressed), "needs_more"
   (more refinement needed before this is actionable), "blocker" (a hard problem
   must be resolved first), or "needs_human" (ambiguity only a person can resolve).
@@ -391,6 +412,15 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: NO_TOOLS,
     appliesTo: ["feature", "manual", "chore"],
     persona: `You clarify user-facing intent and write crisp acceptance criteria. Surface ambiguities explicitly; when a requirement is genuinely underspecified and cannot be safely assumed, set verdict "needs_human" so it routes to human review rather than being guessed.`,
+    critiqueExempt: true,
+  },
+  {
+    key: "critic",
+    title: "Critic (Adversarial Domain Reviewer)",
+    ordering: 15,
+    tools: NO_TOOLS,
+    appliesTo: ALL,
+    persona: `You review ONE finished step's output, not the whole task. Your bar is deliberately extreme: does this specific finding/decision violate a domain you're responsible for so badly that you would reject a PR implementing it — not "could be better," not "I'd have done it differently." Silence is the default and expected outcome; only speak up for genuine, concrete, high-severity violations (e.g., exposing PII, an authz bypass, an irreversible data-loss migration, a legal/compliance breach). Set verdict "blocker" only for such a violation, "needs_human" if it's ambiguous but serious enough that a person must decide, and "pass" otherwise — if in doubt, pass.`,
   },
   {
     key: "architecture_review",
@@ -563,41 +593,66 @@ export function buildRoleSystemPrompt(persona: string, tools: string[] = READ_ON
 }
 
 /**
- * Bump when the default personas / contract change so existing DBs re-seed the
- * global rows. Project-override rows (project_id set) are never touched.
+ * The exact seed payload for one role — used both to compute the content hash
+ * and to upsert the row, so the two can never drift out of sync with each other.
  */
-export const ROLES_SEED_VERSION = 3;
+function roleSeedPayload(r: RoleSeed) {
+  return {
+    key: r.key,
+    title: r.title,
+    ordering: r.ordering,
+    appliesTo: r.appliesTo,
+    tools: r.tools,
+    can_create_subtasks: r.can_create_subtasks,
+    system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
+  };
+}
 
 /**
- * Seed (or refresh) the global default role catalog. Idempotent within a version:
- * runs on first boot, and again when ROLES_SEED_VERSION increases so prompt fixes
- * propagate to existing databases. Only global (project_id NULL) rows are upserted.
+ * Hash of everything seedGlobalRoles() is about to persist. Comparing this
+ * against the last-seeded hash (instead of a hand-maintained version number)
+ * means any change to a persona, OUTPUT_CONTRACT, tool list, ordering, etc.
+ * automatically triggers a reseed on next boot — there is no version bump to
+ * remember (or forget mid-session, as happened here once already).
+ */
+function computeRolesSeedHash(): string {
+  const payload = DEFAULT_ROLES.map(roleSeedPayload);
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+/**
+ * Seed (or refresh) the global default role catalog. Idempotent: runs on first
+ * boot, and again whenever the seed content's hash changes, so prompt fixes
+ * automatically propagate to existing databases. Only global (project_id NULL)
+ * rows are upserted; project overrides are never touched.
  */
 export function seedGlobalRoles(): void {
-  const stored = Number(getMeta("roles_seed_version") ?? "0");
-  if (countGlobalRoles() > 0 && stored >= ROLES_SEED_VERSION) return;
+  const hash = computeRolesSeedHash();
+  const stored = getMeta("roles_seed_hash");
+  if (countGlobalRoles() > 0 && stored === hash) return;
   for (const r of DEFAULT_ROLES) {
+    const p = roleSeedPayload(r);
     upsertRole({
       project_id: null,
-      key: r.key,
-      title: r.title,
+      key: p.key,
+      title: p.title,
       enabled: true,
-      applies_to: JSON.stringify(r.appliesTo),
-      ordering: r.ordering,
-      system_prompt: buildRoleSystemPrompt(r.persona, r.tools),
-      tools_json: JSON.stringify(r.tools),
-      can_create_subtasks: r.can_create_subtasks,
+      applies_to: JSON.stringify(p.appliesTo),
+      ordering: p.ordering,
+      system_prompt: p.system_prompt,
+      tools_json: JSON.stringify(p.tools),
+      can_create_subtasks: p.can_create_subtasks,
     });
   }
-  setMeta("roles_seed_version", String(ROLES_SEED_VERSION));
-  console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (v${ROLES_SEED_VERSION})`);
+  setMeta("roles_seed_hash", hash);
+  console.log(`[roles] seeded/updated ${DEFAULT_ROLES.length} global roles (hash ${hash.slice(0, 8)})`);
 }
 
 // ---------------------------------------------------------------------------
 // Network seeding — creates system agent_networks from built-in flow templates
 // ---------------------------------------------------------------------------
 
-const NETWORKS_SEED_VERSION = 5;
+const NETWORKS_SEED_VERSION = 6;
 
 const GRID = 20;
 /** Horizontal + vertical offset per sequential node in the waterfall layout.
@@ -615,10 +670,24 @@ const WATERFALL_ORIGIN_Y = 80;
  */
 export interface NetworkGraph {
   version: number;
-  nodes: { id: string; roleKey: string; position: { x: number; y: number }; criteria?: unknown[] }[];
+  nodes: {
+    id: string;
+    roleKey: string;
+    position: { x: number; y: number };
+    criteria?: unknown[];
+    /** Role keys that critique this node's output (groundwork for a future
+     *  all-roles-critique-all-nodes option; today always ["critic"] or unset). */
+    critics?: string[];
+  }[];
   edges: unknown[];
   layout: { gridSize: number; snapToGrid: boolean };
-  metadata: { rigor?: string; maxLoopbacks?: number; mandatoryConcerns?: string[]; reviewerRole?: string };
+  metadata: {
+    rigor?: string;
+    maxLoopbacks?: number;
+    mandatoryConcerns?: string[];
+    reviewerRole?: string;
+    reviewDepth?: ReviewDepth;
+  };
 }
 
 export function applyWaterfallLayout(graph: NetworkGraph): NetworkGraph {
@@ -686,6 +755,8 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
     // a single unreadably wide horizontal row.
     const ORIGIN_X = 100;
     const ORIGIN_Y = 80;
+    const critics =
+      template.reviewDepth === "none" || isTerminal || isReviewer ? undefined : ["critic"];
     return {
       id: `n${i + 1}`,
       roleKey,
@@ -694,6 +765,7 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
         y: snap(ORIGIN_Y + i * STEP, GRID),
       },
       criteria: nodeCriteria,
+      critics,
     };
   });
 
@@ -729,6 +801,7 @@ function flowToGraph(template: FlowTemplate, intakeKind: IntakeKind): string {
       maxLoopbacks: template.maxLoopbacks,
       mandatoryConcerns: template.mandatoryConcerns,
       reviewerRole: template.reviewerRole,
+      reviewDepth: template.reviewDepth,
     },
   };
 

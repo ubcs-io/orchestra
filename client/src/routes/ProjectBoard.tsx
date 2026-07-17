@@ -16,14 +16,24 @@ function planProgress(task: Task): string {
 }
 
 function TaskCard({ task }: { task: Task }) {
+  const isWontDo = task.exit_state === "wont_do";
   return (
-    <Link to="/tasks/$taskId" params={{ taskId: task.task_id }} className="card" style={{ display: "block", color: "inherit" }}>
+    <Link
+      to="/tasks/$taskId"
+      params={{ taskId: task.task_id }}
+      className={`card${isWontDo ? " card--wont-do" : ""}`}
+      style={{ display: "block", color: "inherit" }}
+    >
       <div className="title">{task.name ?? task.task_id.slice(0, 8)}</div>
       <div className="meta">
-        <span className="pill dim">{task.level}</span>
+        <span className="pill dim">{task.intake_kind ?? task.level}</span>
         <span>{planProgress(task)}</span>
         {task.paused === 1 && <span className="pill warn">paused</span>}
-        {task.exit_state && <span className={`pill ${task.exit_state === "ready_for_work" ? "ok" : "human"}`}>{task.exit_state}</span>}
+        {task.exit_state && (
+          <span className={`pill ${isWontDo ? "dim" : task.exit_state === "ready_for_work" ? "ok" : "human"}`}>
+            {task.exit_state.replace(/_/g, " ")}
+          </span>
+        )}
       </div>
     </Link>
   );

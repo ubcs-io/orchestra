@@ -11,8 +11,9 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, verdictClass, type TaskDetail as TD, type RoleRun, type CoverageMap, type AgentNetworkGraph } from "../api";
+import { api, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
+import { ReviewCTA } from "../components/ReviewCTA";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -77,53 +78,6 @@ function parseQuestion(raw: string): ParsedQuestion {
   return { text: q || raw.trim(), defaultAnswer: dflt, options: opts };
 }
 
-/** Extract actionable next-step items from a task's recap and coverage data. */
-function extractActionItems(recap_md: string | null, coverage: CoverageMap | null, runs: RoleRun[]): string[] {
-  const items: string[] = [];
-
-  // 1. Parse recommendation bullets from the recap (## Recommendation or ## Next Steps).
-  if (recap_md) {
-    const headerRe = /^##\s+(?:Recommendation|Next\s+Steps?|Follow.?up)/im;
-    const headerMatch = recap_md.match(headerRe);
-    if (headerMatch) {
-      const afterHeader = recap_md.slice(headerMatch.index! + headerMatch[0].length);
-      const nextHeader = afterHeader.search(/^##\s+/m);
-      const section = nextHeader >= 0 ? afterHeader.slice(0, nextHeader) : afterHeader;
-      const bulletRe = /^[-*]\s+(.+)$/gm;
-      let bm;
-      while ((bm = bulletRe.exec(section)) !== null) {
-        const text = bm[1]!.trim();
-        if (text && !text.startsWith("---")) {
-          items.push(text.slice(0, 200));
-        }
-      }
-    }
-  }
-
-  // 2. Fallback: decomposition role output for [epic]/[story]/[task] bullets.
-  if (items.length === 0) {
-    const decomp = runs.find((r) => r.role_key === "decomposition");
-    if (decomp?.output_md) {
-      const labelRe = /\[(epic|story|task)\]\s*(.+)/gi;
-      let lm;
-      while ((lm = labelRe.exec(decomp.output_md)) !== null) {
-        items.push(lm[2]!.trim().slice(0, 200));
-      }
-    }
-  }
-
-  // 3. Fallback: coverage gaps.
-  if (items.length === 0 && coverage) {
-    for (const [concern, entry] of Object.entries(coverage)) {
-      if (entry.status === "never") {
-        items.push(`${concern} — not yet evaluated`);
-      }
-    }
-  }
-
-  return items.slice(0, 8);
-}
-
 /** Collect all open questions grouped by role, skipping runs with no questions. */
 function collectQuestions(runs: RoleRun[]): Array<{ runId: number; roleKey: string; questions: string[] }> {
   const groups: Array<{ runId: number; roleKey: string; questions: string[] }> = [];
@@ -157,19 +111,40 @@ export interface ActivityState {
   roleEndTime: number | null;
   /** Completed role stats — persist across role_start so the TPS / timing stay visible. */
   lastRole: { role: string; tokens: number; elapsedSec: number } | null;
-  /** TPS values from all completed runs so far, for min/max display. */
-  tpsHistory: number[];
+  /** TPS values per role from all completed runs, for per-role min/max display. */
+  tpsHistory: Record<string, number[]>;
+  /** Whether the final recap LLM call is still in progress. */
+  recapGenerating: boolean;
 }
 
-function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }) {
-  const [lines, setLines] = useState<string[]>([]);
+/** Structured line item for the live activity console — replaces raw strings. */
+export interface LineItem {
+  kind: "role_start" | "role_end" | "text" | "thinking" | "tool_start" | "tool_end" | "status" | "separator";
+  content: string;
+  meta?: {
+    role?: string;
+    depth?: number;
+    verdict?: string;
+    flags?: string;
+    tool?: string;
+    isError?: boolean;
+    /** Raw tool arguments for pretty-printing as JSON. */
+    jsonArgs?: unknown;
+    repeatCount?: number;
+    aborted?: boolean;
+  };
+}
+
+function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { current: string | null }, resetKey: number) {
+  const [lines, setLines] = useState<LineItem[]>([]);
   const [activity, setActivity] = useState<ActivityState>({
     currentRole: null,
     disposition: null,
     roleStartTime: null,
     roleEndTime: null,
     lastRole: null,
-    tpsHistory: [],
+    tpsHistory: {},
+    recapGenerating: false,
   });
   const bufRef = useRef("");
   const thinkRef = useRef("");
@@ -177,9 +152,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
   const repeatRef = useRef(0);
   useEffect(() => {
     setLines([]);
-    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: [] });
-    // Mid-run recovery: if we connected after role_start was published but data is
-    // already streaming, recover the active role from the plan.
+    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: {}, recapGenerating: false });
     const role = nextRoleRef.current;
     if (role) {
       setActivity((a) => a.currentRole ? a : { ...a, currentRole: role, disposition: "reading", roleStartTime: Date.now() });
@@ -189,7 +162,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     lastToolRef.current = "";
     repeatRef.current = 0;
     const es = new EventSource(`/api/tasks/${taskId}/stream`);
-    const push = (s: string) => setLines((prev) => [...prev.slice(-400), s]);
+    const push = (item: LineItem) => setLines((prev) => [...prev.slice(-400), item]);
 
     const flushRepeat = () => {
       lastToolRef.current = "";
@@ -198,7 +171,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
 
     es.addEventListener("role_start", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
-      push(`\n▶ ROLE ${d.role} (depth ${d.depth})`);
+      push({ kind: "role_start", content: `▶ ROLE ${d.role}`, meta: { role: d.role, depth: d.depth } });
       bufRef.current = "";
       thinkRef.current = "";
       flushRepeat();
@@ -207,11 +180,12 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     es.addEventListener("text", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       bufRef.current += d.delta ?? "";
-      thinkRef.current = ""; // answer resumed → start a fresh reasoning line next time
+      thinkRef.current = "";
       flushRepeat();
       setLines((prev) => {
-        const rest = prev[prev.length - 1]?.startsWith("  ") ? prev.slice(0, -1) : prev;
-        return [...rest, "  " + bufRef.current.slice(-1200)];
+        const last = prev[prev.length - 1];
+        const rest = last?.kind === "text" ? prev.slice(0, -1) : prev;
+        return [...rest, { kind: "text", content: bufRef.current.slice(-1200) }];
       });
       setActivity((a) => a.disposition !== "responding" ? { ...a, disposition: "responding" } : a);
     });
@@ -221,8 +195,9 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       bufRef.current = "";
       flushRepeat();
       setLines((prev) => {
-        const rest = prev[prev.length - 1]?.startsWith("💭") ? prev.slice(0, -1) : prev;
-        return [...rest, "💭 " + thinkRef.current.slice(-1200)];
+        const last = prev[prev.length - 1];
+        const rest = last?.kind === "thinking" ? prev.slice(0, -1) : prev;
+        return [...rest, { kind: "thinking", content: thinkRef.current.slice(-1200) }];
       });
       setActivity((a) => a.disposition !== "thinking" ? { ...a, disposition: "thinking" } : a);
     });
@@ -231,16 +206,14 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       if (d.tool === lastToolRef.current) {
         repeatRef.current += 1;
         if (repeatRef.current === 2) {
-          // first repeat: collapse the previous 2-line pair into one
-          setLines((prev) => [...prev.slice(0, -2).slice(-400), `  ⚙ ${d.tool} 2x`]);
+          setLines((prev) => [...prev.slice(0, -2).slice(-400), { kind: "tool_start", content: d.tool, meta: { tool: d.tool, repeatCount: 2, jsonArgs: d.args } }]);
         } else {
-          // subsequent repeat: replace the collapsed line with updated count
-          setLines((prev) => [...prev.slice(0, -1).slice(-400), `  ⚙ ${d.tool} ${repeatRef.current}x`]);
+          setLines((prev) => [...prev.slice(0, -1).slice(-400), { kind: "tool_start", content: d.tool, meta: { tool: d.tool, repeatCount: repeatRef.current, jsonArgs: d.args } }]);
         }
       } else {
         lastToolRef.current = d.tool;
         repeatRef.current = 1;
-        push(`  ⚙ ${d.tool}(${JSON.stringify(d.args).slice(0, 80)})`);
+        push({ kind: "tool_start", content: d.tool, meta: { tool: d.tool, jsonArgs: d.args } });
       }
       bufRef.current = "";
       thinkRef.current = "";
@@ -249,9 +222,9 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     es.addEventListener("tool_end", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
       if (repeatRef.current > 1) {
-        setLines((prev) => [...prev.slice(0, -1).slice(-400), `  ⚙ ${d.tool} ${repeatRef.current}x ${d.isError ? "✗" : "✓"}`]);
+        setLines((prev) => [...prev.slice(0, -1).slice(-400), { kind: "tool_end", content: d.tool, meta: { tool: d.tool, repeatCount: repeatRef.current, isError: d.isError } }]);
       } else {
-        push(`  ⚙ ${d.tool} ${d.isError ? "✗" : "✓"}`);
+        push({ kind: "tool_end", content: d.tool, meta: { tool: d.tool, isError: d.isError } });
       }
     });
     es.addEventListener("role_end", (e) => {
@@ -260,7 +233,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
         d.fallback ? "no verdict" : "",
         d.stopReason === "length" ? "TRUNCATED" : "",
       ].filter(Boolean).join(", ");
-      push(`■ ${d.role} → ${d.verdict ?? (d.error ? "error" : "done")}${flags ? ` [${flags}]` : ""}`);
+      push({ kind: "role_end", content: `${d.verdict ?? (d.error ? "error" : "done")}`, meta: { role: d.role, verdict: d.verdict ?? "done", flags: flags || undefined, aborted: d.error ?? false } });
       onActivity();
       flushRepeat();
       setActivity((a) => {
@@ -270,8 +243,11 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
           ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed }
           : a.lastRole;
         const tps = lastRole ? lastRole.tokens / lastRole.elapsedSec : null;
-        const tpsHistory = tps != null ? [...a.tpsHistory, tps] : a.tpsHistory;
+        const tpsHistory = tps != null
+          ? { ...a.tpsHistory, [d.role]: [...(a.tpsHistory[d.role] ?? []), tps] }
+          : a.tpsHistory;
         return {
+          ...a,
           currentRole: d.role,
           disposition: "done",
           roleStartTime: a.roleStartTime,
@@ -281,13 +257,301 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
         };
       });
     });
+    es.addEventListener("recap_start", () => {
+      setActivity((a) => ({ ...a, recapGenerating: true }));
+    });
+    es.addEventListener("recap_end", () => {
+      setActivity((a) => ({ ...a, recapGenerating: false }));
+    });
     es.addEventListener("task_update", () => onActivity());
     es.onerror = () => {}; // browser auto-reconnects
 
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
+  }, [taskId, resetKey]);
   return { lines, activity };
+}
+
+// ---- Markdown syntax colorizer (colors syntax without rendering) ----
+
+interface MdSpan {
+  text: string;
+  cls?: string;
+}
+
+function tokenizeMarkdown(text: string): MdSpan[] {
+  const spans: MdSpan[] = [];
+  let i = 0;
+
+  while (i < text.length) {
+    // Fenced code blocks (``` ... ```) — must be checked before inline code
+    if (text.startsWith("```", i)) {
+      const fenceStart = i;
+      const end = text.indexOf("\n```", i + 3);
+      if (end >= 0) {
+        const fenceEnd = end + 4;
+        const fenceLine = text.slice(fenceStart, text.indexOf("\n", fenceStart) >= 0 ? text.indexOf("\n", fenceStart) : fenceStart + 3);
+        spans.push({ text: "\n", cls: "" });
+        spans.push({ text: fenceLine, cls: "md-fence-open" });
+        spans.push({ text: text.slice(fenceStart + fenceLine.length, fenceEnd - 3), cls: "md-fence-body" });
+        spans.push({ text: "```", cls: "md-fence-close" });
+        spans.push({ text: "\n", cls: "" });
+        i = fenceEnd;
+        continue;
+      }
+      // Unterminated — treat as inline code
+      spans.push({ text: "```", cls: "md-code" });
+      i += 3;
+      continue;
+    }
+
+    // Inline code (`code`)
+    if (text[i] === "`") {
+      const endTick = text.indexOf("`", i + 1);
+      if (endTick >= 0) {
+        spans.push({ text: text.slice(i, endTick + 1), cls: "md-code" });
+        i = endTick + 1;
+        continue;
+      }
+    }
+
+    // Bold (**text**)
+    if (text.startsWith("**", i)) {
+      const endBold = text.indexOf("**", i + 2);
+      if (endBold >= 0) {
+        spans.push({ text: "**", cls: "md-bold-marker" });
+        spans.push({ text: text.slice(i + 2, endBold), cls: "md-bold" });
+        spans.push({ text: "**", cls: "md-bold-marker" });
+        i = endBold + 2;
+        continue;
+      }
+    }
+
+    // Italic (*text*)
+    if (text[i] === "*" && text[i + 1] !== "*") {
+      const endItalic = text.indexOf("*", i + 1);
+      if (endItalic >= 0) {
+        spans.push({ text: "*", cls: "md-italic-marker" });
+        spans.push({ text: text.slice(i + 1, endItalic), cls: "md-italic" });
+        spans.push({ text: "*", cls: "md-italic-marker" });
+        i = endItalic + 1;
+        continue;
+      }
+    }
+
+    // Links [text](url)
+    if (text[i] === "[" && text.indexOf("](", i + 1) >= 0) {
+      const linkTextEnd = text.indexOf("](", i);
+      const linkUrlEnd = text.indexOf(")", linkTextEnd + 2);
+      if (linkUrlEnd >= 0) {
+        spans.push({ text: "[", cls: "md-link-bracket" });
+        spans.push({ text: text.slice(i + 1, linkTextEnd), cls: "md-link-text" });
+        spans.push({ text: "](", cls: "md-link-bracket" });
+        spans.push({ text: text.slice(linkTextEnd + 2, linkUrlEnd), cls: "md-link-url" });
+        spans.push({ text: ")", cls: "md-link-bracket" });
+        i = linkUrlEnd + 1;
+        continue;
+      }
+    }
+
+    // Heading lines (## Heading at start of line, or after newline in middle of text)
+    if ((i === 0 || text[i - 1] === "\n") && text[i] === "#") {
+      let hashEnd = i;
+      while (hashEnd < text.length && text[hashEnd] === "#") hashEnd++;
+      const hashCount = hashEnd - i;
+      if (hashCount >= 1 && hashCount <= 4 && text[hashEnd] === " ") {
+        const newlineEnd = text.indexOf("\n", hashEnd);
+        const headingEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+        const headingText = text.slice(i, headingEnd);
+        spans.push({ text: headingText, cls: `md-h${hashCount}` });
+        i = headingEnd;
+        continue;
+      }
+    }
+
+    // Blockquote lines (> ...)
+    if ((i === 0 || text[i - 1] === "\n") && text[i] === ">") {
+      const newlineEnd = text.indexOf("\n", i);
+      const lineEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+      spans.push({ text: text.slice(i, lineEnd), cls: "md-blockquote" });
+      i = lineEnd;
+      continue;
+    }
+
+    // Unordered list items (-  or *  at start of line)
+    if ((i === 0 || text[i - 1] === "\n") && (text[i] === "-" || text[i] === "*") && text[i + 1] === " ") {
+      const newlineEnd = text.indexOf("\n", i);
+      const lineEnd = newlineEnd >= 0 ? newlineEnd : text.length;
+      spans.push({ text: text.slice(i, i + 2), cls: "md-list-marker" });
+      spans.push({ text: text.slice(i + 2, lineEnd), cls: "" });
+      i = lineEnd;
+      continue;
+    }
+
+    // Horizontal rule (---)
+    if ((i === 0 || text[i - 1] === "\n") && text.startsWith("---", i) && (i + 3 >= text.length || text[i + 3] === "\n")) {
+      spans.push({ text: "---", cls: "md-hr" });
+      i += 3;
+      continue;
+    }
+
+    // Plain text — consume until the next special character or end
+    const nextSpecial = findNextSpecial(text, i);
+    if (nextSpecial > i) {
+      spans.push({ text: text.slice(i, nextSpecial), cls: "" });
+      i = nextSpecial;
+    } else {
+      spans.push({ text: text.slice(i), cls: "" });
+      break;
+    }
+  }
+
+  return spans;
+}
+
+function findNextSpecial(text: string, start: number): number {
+  for (let j = start; j < text.length; j++) {
+    if (text[j] === "`" || text[j] === "[" || text[j] === "*" ||
+        (j === start || text[j - 1] === "\n" ? text[j] === "#" || text[j] === ">" || text[j] === "-" : false)) {
+      return j;
+    }
+  }
+  return text.length;
+}
+
+/** Apply JSON syntax coloring return React elements. */
+function jsonSpans(value: unknown): React.ReactNode {
+  const json = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const spans: MdSpan[] = [];
+  let i = 0;
+
+  while (i < json.length) {
+    // String values
+    if (json[i] === '"') {
+      const end = json.indexOf('"', i + 1);
+      // Handle escaped quotes
+      let escEnd = end;
+      while (escEnd > 0 && json[escEnd - 1] === "\\") {
+        escEnd = json.indexOf('"', escEnd + 1);
+      }
+      const actualEnd = escEnd >= 0 ? escEnd + 1 : json.length;
+      spans.push({ text: json.slice(i, actualEnd), cls: "json-string" });
+      i = actualEnd;
+      continue;
+    }
+    // Numbers
+    if (/^-?\d/.test(json[i]) && (i === 0 || /[\s:,\[\n]/.test(json[i - 1]))) {
+      let numEnd = i + 1;
+      while (numEnd < json.length && /[\d.eE+\-]/.test(json[numEnd])) numEnd++;
+      spans.push({ text: json.slice(i, numEnd), cls: "json-number" });
+      i = numEnd;
+      continue;
+    }
+    // Boolean / null
+    if (json.slice(i).match(/^(true|false|null)/)) {
+      const word = json.slice(i).match(/^(true|false|null)/)![0];
+      spans.push({ text: word, cls: "json-keyword" });
+      i += word.length;
+      continue;
+    }
+    // Keys (anything between quotes before a colon)
+    // Plain chars
+    let plainEnd = i + 1;
+    while (plainEnd < json.length && !'"-0123456789tefnul'.includes(json[plainEnd])) plainEnd++;
+    spans.push({ text: json.slice(i, plainEnd), cls: "json-punct" });
+    i = plainEnd;
+  }
+
+  return spans.map((s, idx) =>
+    s.cls ? <span key={idx} className={s.cls}>{s.text}</span> : s.text
+  );
+}
+
+/** Colorize markdown text — applies syntax coloring spans, preserving the raw text. */
+function colorizeMarkdown(text: string): React.ReactNode {
+  const spans = tokenizeMarkdown(text);
+  return spans.map((s, idx) =>
+    s.cls ? <span key={idx} className={s.cls}>{s.text}</span> : s.text
+  );
+}
+
+/** Verdict → pill class and color for role_end display. */
+function verdictStyle(verdict: string): { cls: string; color: string } {
+  switch (verdict) {
+    case "pass": return { cls: "pill ok", color: "var(--ok)" };
+    case "needs_more": return { cls: "pill warn", color: "var(--warn)" };
+    case "blocker": return { cls: "pill bad", color: "var(--bad)" };
+    case "needs_human": return { cls: "pill human", color: "var(--human)" };
+    default: return { cls: "pill dim", color: "var(--ink-dim)" };
+  }
+}
+
+function LiveLine({ item }: { item: LineItem }) {
+  switch (item.kind) {
+    case "role_start":
+      return (
+        <div className="live-role-start">
+          <span className="live-role-icon">{"▶"}</span>
+          <span className="live-role-key">{item.meta?.role}</span>
+          {item.meta?.depth != null && <span className="live-role-depth">depth {item.meta.depth}</span>}
+        </div>
+      );
+
+    case "role_end": {
+      const vs = verdictStyle(item.meta?.verdict ?? "done");
+      return (
+        <div className="live-role-end">
+          <span className="live-role-end-marker">{item.meta?.aborted ? "✕" : "■"}</span>
+          <span className="live-role-key">{item.meta?.role}</span>
+          <span className="live-role-arrow">→</span>
+          <span className={`${vs.cls}`} style={{ borderColor: vs.color, color: vs.color }}>{item.content}</span>
+          {item.meta?.flags && <span className="live-role-flags">[{item.meta.flags}]</span>}
+        </div>
+      );
+    }
+
+    case "tool_start": {
+      const rc = item.meta?.repeatCount;
+      return (
+        <div className="live-tool-start">
+          <span className="live-tool-icon">{"⚙"}</span>
+          <span className="live-tool-name">{item.content}</span>
+          {rc && rc > 1 ? (
+            <span className="live-tool-repeat">{rc}x</span>
+          ) : null}
+          {item.meta?.jsonArgs != null && (
+            <pre className="live-json">{jsonSpans(item.meta.jsonArgs)}</pre>
+          )}
+        </div>
+      );
+    }
+
+    case "tool_end": {
+      const rc = item.meta?.repeatCount;
+      return (
+        <div className="live-tool-end">
+          <span className="live-tool-icon">{"⚙"}</span>
+          <span className="live-tool-name">{item.content}</span>
+          {rc && rc > 1 ? <span className="live-tool-repeat">{rc}x</span> : null}
+          <span className={item.meta?.isError ? "live-tool-result error" : "live-tool-result ok"}>
+            {item.meta?.isError ? "✗" : "✓"}
+          </span>
+        </div>
+      );
+    }
+
+    case "text":
+      return <div className="live-text">{colorizeMarkdown(item.content)}</div>;
+
+    case "thinking":
+      return <div className="live-thinking"><span className="live-thinking-prefix">{"💭"}</span> {colorizeMarkdown(item.content)}</div>;
+
+    case "status":
+      return <div className="live-status">{item.content}</div>;
+
+    default:
+      return <div className="live-text">{item.content}</div>;
+  }
 }
 
 function TaskNetworkGraph({
@@ -445,7 +709,8 @@ export function TaskDetail() {
   const q = useQuery({ queryKey: ["task", taskId], queryFn: () => api.task(taskId), refetchInterval: 4000 });
   const refresh = () => qc.invalidateQueries({ queryKey: ["task", taskId] });
   const nextRoleRef = useRef<string | null>(null);
-  const { lines, activity } = useTaskStream(taskId, refresh, nextRoleRef);
+  const [resetKey, setResetKey] = useState(0);
+  const { lines, activity } = useTaskStream(taskId, refresh, nextRoleRef, resetKey);
   const liveRef = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
 
@@ -481,9 +746,6 @@ export function TaskDetail() {
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
-
-  // Subtask creation state
-  const [creatingSubtaskKey, setCreatingSubtaskKey] = useState<string | null>(null);
 
   // Scheduler state for banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -530,22 +792,11 @@ export function TaskDetail() {
   const doReset = async () => {
     try {
       await api.resetTask(taskId);
+      setResetKey((k) => k + 1);
       refresh();
       setResetModal(false);
     } catch (e: unknown) {
       // error will show via query refetch
-    }
-  };
-
-  const createSubtask = async (name: string) => {
-    setCreatingSubtaskKey(name);
-    try {
-      await api.createSubtask(taskId, { name });
-      refresh();
-    } catch (e: unknown) {
-      // error will show via query refetch
-    } finally {
-      setCreatingSubtaskKey(null);
     }
   };
 
@@ -567,9 +818,6 @@ export function TaskDetail() {
       return next;
     });
   };
-
-  const isFinished = t.stage === "ready" || t.stage === "review";
-  const actionItems = isFinished ? extractActionItems(d.recap_md, d.coverage, d.runs) : [];
 
   return (
     <div>
@@ -623,6 +871,7 @@ export function TaskDetail() {
         )}
         <h2 style={{ margin: 0, color: "var(--brass)" }}>{t.name ?? t.task_id.slice(0, 8)}</h2>
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
+        {t.exit_state === "wont_do" && <span className="pill dim">won't do</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
@@ -630,13 +879,6 @@ export function TaskDetail() {
           <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}
       </div>
-
-      {t.review_reason && (
-        <div className="panel" style={{ borderColor: "var(--human)" }}>
-          <h2>Needs review</h2>
-          <p>{t.review_reason}</p>
-        </div>
-      )}
 
       {t.network_id && t.stage !== "intake" && (
         <div className="panel task-network-panel">
@@ -659,32 +901,27 @@ export function TaskDetail() {
 
       <div className="detail-grid">
         <div>
+          {/* Show recap for review/ready, then the ReviewCTA actions */}
           {t.stage === "ready" || t.stage === "review" ? (
-            <div className="panel">
-              <h2>Final Status</h2>
-              {d.recap_md ? (
-                <div
-                  className="section-md rendered-md"
-                  style={{ marginBottom: 16 }}
-                  dangerouslySetInnerHTML={{ __html: marked.parse(d.recap_md) as string }}
-                />
-              ) : (
-                <p className="muted">Waiting for orchestrator recap…</p>
+            <>
+              {activity.recapGenerating && !d.recap_md && (
+                <div className="panel">
+                  <div className="recap-loading">
+                    <span className="in-progress-pulse" />
+                    <span>Generating final assessment…</span>
+                  </div>
+                </div>
               )}
-              <div className="row" style={{ marginTop: 8 }}>
-                {t.stage === "review" && (
-                  <>
-                    <span className="pill human">needs review</span>
-                    <span className="muted">{t.review_reason ?? "Task requires human judgement."}</span>
-                  </>
-                )}
-                {t.stage === "ready" && (
-                  <>
-                    <span className="pill ok">{t.exit_state ?? "complete"}</span>
-                    <span className="muted">Task is ready for implementation.</span>
-                  </>
-                )}
-              </div>
+              {d.recap_md && (
+                <div className="panel">
+                  <h2>Final Status</h2>
+                  <div
+                    className="section-md rendered-md"
+                    style={{ marginBottom: 16 }}
+                    dangerouslySetInnerHTML={{ __html: marked.parse(d.recap_md) as string }}
+                  />
+                </div>
+              )}
               {d.runs.some((r) => r.output_md) && (
                 <details style={{ marginTop: 16 }}>
                   <summary className="muted" style={{ cursor: "pointer" }}>Per-role findings</summary>
@@ -702,12 +939,12 @@ export function TaskDetail() {
                   </div>
                 </details>
               )}
-            </div>
+            </>
           ) : (
             <div className="panel">
               <h2>Live activity</h2>
               <div className="live" ref={liveRef} onScroll={handleLiveScroll}>
-                {lines.length ? lines.join("\n") : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
+                {lines.length ? lines.map((item, i) => <LiveLine key={i} item={item} />) : <span className="muted">Waiting for the active role… (start the loop if stopped)</span>}
                 {!pinned && (
                   <button className="live-jump" onClick={jumpToLive}>
                     ↓ latest
@@ -865,9 +1102,15 @@ export function TaskDetail() {
                 <div className="in-progress-stat">
                   <span className="muted">tps</span>
                   <span className="pill dim">
-                    {activity.tpsHistory.length > 0
-                      ? `min ${Math.min(...activity.tpsHistory).toFixed(0)} / cur — / max ${Math.max(...activity.tpsHistory).toFixed(0)}`
-                      : "—"}
+                    {(() => {
+                      const roleHistory = activity.currentRole ? activity.tpsHistory[activity.currentRole] : undefined;
+                      if (roleHistory && roleHistory.length > 0) {
+                        const minTps = Math.min(...roleHistory).toFixed(0);
+                        const maxTps = Math.max(...roleHistory).toFixed(0);
+                        return minTps === maxTps ? `${minTps} tps` : `min ${minTps} / max ${maxTps} tps`;
+                      }
+                      return "—";
+                    })()}
                   </span>
                 </div>
               </div>
@@ -902,23 +1145,26 @@ export function TaskDetail() {
             </div>
           )}
 
-          {d.runs.length > 0 && (
-            <div className="row" style={{ marginBottom: 8 }}>
-              <button
-                className="small"
-                onClick={() => {
-                  if (collapsedRuns.size === d.runs.length) {
-                    setCollapsedRuns(new Set());
-                  } else {
-                    setCollapsedRuns(new Set(d.runs.map((r) => r.id)));
-                  }
-                }}
-              >
-                {collapsedRuns.size === d.runs.length ? "expand all" : "collapse all"}
-              </button>
-            </div>
-          )}
-          {d.runs.map((r) => {
+          {(() => {
+            const primaryRuns = d.runs.filter((r) => !r.run_kind || r.run_kind === "primary");
+            return primaryRuns.length > 0 && (
+              <div className="row" style={{ marginBottom: 8 }}>
+                <button
+                  className="small"
+                  onClick={() => {
+                    if (collapsedRuns.size === primaryRuns.length) {
+                      setCollapsedRuns(new Set());
+                    } else {
+                      setCollapsedRuns(new Set(primaryRuns.map((r) => r.id)));
+                    }
+                  }}
+                >
+                  {collapsedRuns.size === primaryRuns.length ? "expand all" : "collapse all"}
+                </button>
+              </div>
+            );
+          })()}
+          {d.runs.filter((r) => !r.run_kind || r.run_kind === "primary").map((r) => {
             const isCollapsed = collapsedRuns.has(r.id);
             const toggle = () =>
               setCollapsedRuns((prev) => {
@@ -958,17 +1204,17 @@ export function TaskDetail() {
                     deepen
                   </button>
                   {t.project_id != null && (
-                    <button
+                    <Link
+                      to="/projects/$projectId/roles"
+                      params={{ projectId: String(t.project_id) }}
+                      search={{ role: r.role_key }}
                       className="small"
                       title={`View ${r.role_key} configuration`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        window.open(`/projects/${t.project_id}/roles`, "_blank");
-                      }}
-                      style={{ fontSize: 14, lineHeight: 1 }}
+                      onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                      style={{ fontSize: 14, lineHeight: 1, textDecoration: "none" }}
                     >
                       👤
-                    </button>
+                    </Link>
                   )}
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
@@ -981,6 +1227,26 @@ export function TaskDetail() {
                     <pre className="reasoning-body muted" style={{ whiteSpace: "pre-wrap", overflowWrap: "break-word", fontSize: 12, marginTop: 6 }}>{r.thinking_md}</pre>
                   </details>
                 )}
+                {!isCollapsed && (() => {
+                  const critiques = d.runs.filter((cr) => cr.target_run_id === r.id);
+                  if (!critiques.length) return null;
+                  return (
+                    <div style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--line)" }}>
+                      {critiques.map((cr) => (
+                        <div key={cr.id} className="row" style={{ alignItems: "flex-start", gap: 6, marginBottom: 6 }}>
+                          <span
+                            className="pill dim"
+                            title={cr.run_kind === "second_review" ? "Orchestrator second review" : "Adversarial critique"}
+                          >
+                            {cr.run_kind === "second_review" ? "second review" : "critic"}
+                          </span>
+                          <span className={`pill ${verdictClass(cr.verdict)}`}>{cr.verdict ?? "?"}</span>
+                          {cr.summary && <span className="muted" style={{ fontSize: 13 }}>{cr.summary}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -1003,28 +1269,18 @@ export function TaskDetail() {
         </div>
 
         <div>
-          {isFinished && (
-            <div className="panel">
-              <h2>Next Steps</h2>
-              {actionItems.length > 0 ? (
-                <div className="next-steps-list">
-                  {actionItems.map((item, i) => (
-                    <div key={i} className="next-step-item">
-                      <span className="next-step-text">{item}</span>
-                      <button
-                        className="small primary"
-                        disabled={creatingSubtaskKey === item}
-                        onClick={() => createSubtask(item)}
-                      >
-                        {creatingSubtaskKey === item ? "…" : "+ subtask"}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="muted">No follow-up steps identified.</p>
-              )}
-            </div>
+
+          {/* Immediate next steps — shown when task is in review or ready */}
+          {(t.stage === "ready" || t.stage === "review") && (
+            <ReviewCTA
+              taskId={taskId}
+              task={t}
+              recapMd={d.recap_md}
+              coverage={d.coverage}
+              runs={d.runs}
+              childTasks={d.children}
+              onMutate={refresh}
+            />
           )}
 
           {/* Current state panel — shown whenever there's meaningful state */}
@@ -1208,7 +1464,7 @@ export function TaskDetail() {
             )}
           </div>
 
-          {questionGroups.length > 0 && (
+          {questionGroups.length > 0 && t.stage !== "review" && t.stage !== "ready" && (
             <div className="panel">
               <h2>Questions</h2>
               <div className="questions-panel">

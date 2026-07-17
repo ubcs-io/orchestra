@@ -16,8 +16,9 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type AgentNetworkGraph, type NetworkEdge } from "../api";
+import { api, type AgentNetworkGraph, type NetworkEdge, type ModelConfig } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
+import { ModelPicker } from "./RolesEditor";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -87,6 +88,8 @@ function ProjectSelectModal({
 function RoleEditModal({
   role,
   projectId,
+  modelConfigs,
+  defaultModelConfigName,
   onSave,
   onCancel,
   isSaving,
@@ -101,6 +104,8 @@ function RoleEditModal({
     can_create_subtasks: number;
   };
   projectId: number | null;
+  modelConfigs: ModelConfig[];
+  defaultModelConfigName: string;
   onSave: (body: {
     enabled: number;
     can_create_subtasks: number;
@@ -177,10 +182,11 @@ function RoleEditModal({
         <input value={tools} onChange={(e) => setTools(e.target.value)} />
 
         <label>Model override (optional)</label>
-        <input
+        <ModelPicker
           value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder={projectId != null ? "(project default)" : "(global default)"}
+          onChange={setModel}
+          configs={modelConfigs}
+          defaultConfigName={defaultModelConfigName}
         />
 
         <label>System prompt</label>
@@ -224,6 +230,10 @@ export function NetworkEditor() {
   });
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
   const projectsQ = useQuery({ queryKey: ["projects"], queryFn: () => api.projects() });
+  const modelConfigsQ = useQuery({ queryKey: ["model-configs"], queryFn: api.modelConfigs });
+  const modelConfigs = modelConfigsQ.data?.configs ?? [];
+  const defaultModelConfigName =
+    modelConfigs.find((c) => c.project_id === null && c.key === "default")?.name ?? "(none)";
 
   // --- Parse current graph ---
   const currentNetwork = networkQ.data?.network ?? null;
@@ -236,12 +246,29 @@ export function NetworkEditor() {
     }
   }, [currentNetwork]);
 
+  // Helper: navigate to the role config page if project is set, otherwise open inline modal
+  const handleRoleClick = useCallback(
+    (roleKey: string) => {
+      if (currentNetwork?.project_id != null) {
+        navigate({
+          to: "/projects/$projectId/roles",
+          params: { projectId: String(currentNetwork.project_id) },
+          search: { role: roleKey },
+        });
+      } else {
+        setRoleModalKey(roleKey);
+      }
+    },
+    [currentNetwork, navigate],
+  );
+
   // --- UI & modal state (must come before initialNodes which references setRoleModalKey) ---
   const [name, setName] = useState("New Network");
   const [description, setDescription] = useState("");
   const [intakeKind, setIntakeKind] = useState("manual");
   const [rigor, setRigor] = useState<"low" | "standard" | "high">("standard");
   const [maxLoopbacks, setMaxLoopbacks] = useState(2);
+  const [reviewDepth, setReviewDepth] = useState<"none" | "terminal_only" | "every_step">("terminal_only");
   const [snapToGrid, setSnapToGrid] = useState(true);
 
   // Selection state — driven by React Flow's onSelectionChange for full
@@ -269,10 +296,10 @@ export function NetworkEditor() {
         roleKey: n.roleKey,
         criteriaCount: n.criteria?.length ?? 0,
         depth: n.overrides?.depth,
-        onPersonClick: () => setRoleModalKey(n.roleKey),
+        onPersonClick: () => handleRoleClick(n.roleKey),
       },
     }));
-  }, [parsedGraph, rolesQ.data]);
+  }, [parsedGraph, rolesQ.data, handleRoleClick]);
 
   const initialEdges: Edge[] = useMemo(() => {
     if (!parsedGraph?.edges) return [];
@@ -329,6 +356,7 @@ export function NetworkEditor() {
     if (parsedGraph) {
       setRigor(parsedGraph.metadata?.rigor ?? "standard");
       setMaxLoopbacks(parsedGraph.metadata?.maxLoopbacks ?? 2);
+      setReviewDepth(parsedGraph.metadata?.reviewDepth ?? "terminal_only");
       setSnapToGrid(parsedGraph.layout?.snapToGrid ?? true);
     }
   }, [currentNetwork, parsedGraph]);
@@ -435,13 +463,13 @@ export function NetworkEditor() {
           label: rolesQ.data?.roles.find((r) => r.key === roleKey)?.title ?? roleKey,
           roleKey,
           criteriaCount: 0,
-          onPersonClick: () => setRoleModalKey(roleKey),
+          onPersonClick: () => handleRoleClick(roleKey),
         },
       };
 
       setNodes((nds) => [...nds, newNode]);
     },
-    [setNodes, rolesQ.data],
+    [setNodes, rolesQ.data, handleRoleClick],
   );
 
   // --- Edge property handlers ---
@@ -528,10 +556,11 @@ export function NetworkEditor() {
         maxLoopbacks,
         mandatoryConcerns: parsedGraph?.metadata?.mandatoryConcerns ?? [],
         reviewerRole: parsedGraph?.metadata?.reviewerRole,
+        reviewDepth,
       },
     };
     return JSON.stringify(graph);
-  }, [nodes, edges, snapToGrid, rigor, maxLoopbacks, parsedGraph]);
+  }, [nodes, edges, snapToGrid, rigor, maxLoopbacks, reviewDepth, parsedGraph]);
 
   // --- Save mutation ---
   const saveMutation = useMutation({
@@ -743,6 +772,16 @@ export function NetworkEditor() {
                 disabled={isReadOnly}
               />
             </label>
+            <select
+              value={reviewDepth}
+              onChange={(e) => setReviewDepth(e.target.value as "none" | "terminal_only" | "every_step")}
+              disabled={isReadOnly}
+              title="How often the adversarial critic checks a step's output for a domain violation before the gate runs"
+            >
+              <option value="none">Critique: Off</option>
+              <option value="terminal_only">Critique: Reviewer step only</option>
+              <option value="every_step">Critique: Every step</option>
+            </select>
             <div className="row">
               {!isReadOnly && (
                 <button
@@ -990,14 +1029,16 @@ export function NetworkEditor() {
         />
       )}
 
-      {/* Role Edit Modal */}
-      {roleModalKey && (() => {
+      {/* Role Edit Modal — only shown for global networks without a project */}
+      {roleModalKey && currentNetwork?.project_id == null && (() => {
         const role = rolesQ.data?.roles.find((r) => r.key === roleModalKey);
         if (!role) return null;
         return (
           <RoleEditModal
             role={role}
-            projectId={currentNetwork?.project_id ?? null}
+            projectId={null}
+            modelConfigs={modelConfigs}
+            defaultModelConfigName={defaultModelConfigName}
             onSave={(body) => roleSaveMutation.mutate(body)}
             onCancel={() => setRoleModalKey(null)}
             isSaving={roleSaveMutation.isPending}

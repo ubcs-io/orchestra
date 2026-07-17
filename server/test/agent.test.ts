@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createStallDetector, createThinkSplitter } from "../src/agent";
+import { createStallDetector, createThinkSplitter, extractFindingsFromText } from "../src/agent";
 
 /** Feed chunks through a splitter and concatenate the routed output. */
 function run(chunks: string[]): { text: string; thinking: string } {
@@ -140,5 +140,67 @@ describe("twoPhase contract (pure)", () => {
     const { TWO_PHASE_FORMALIZE_PROMPT } = await import("../src/roles.js");
     expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/```json/);
     expect(TWO_PHASE_FORMALIZE_PROMPT).toMatch(/verdict/);
+  });
+});
+
+describe("record_findings availability claim (persisted vs runtime)", () => {
+  // Regression coverage for the "record_findings IS available... Tool record_findings
+  // not found" contradiction: OUTPUT_CONTRACT is baked into every role's system_prompt
+  // and persisted in the DB, so it must never assert tool availability — only the
+  // runtime-computed discipline suffixes (TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION)
+  // may do that, since only they know whether the tool is actually registered.
+  const AVAILABILITY_CLAIM = /is available to you|will (never|not) (get|receive) a ["']?tool not found/i;
+
+  it("OUTPUT_CONTRACT (persisted) never asserts record_findings tool availability", async () => {
+    const { OUTPUT_CONTRACT } = await import("../src/roles.js");
+    expect(OUTPUT_CONTRACT).not.toMatch(AVAILABILITY_CLAIM);
+  });
+
+  it("buildRoleSystemPrompt (persisted) + TEXT_MODE_INSTRUCTION never asserts availability", async () => {
+    const { buildRoleSystemPrompt } = await import("../src/roles.js");
+    const { TEXT_MODE_INSTRUCTION } = await import("../src/agent.js");
+    const prompt = buildRoleSystemPrompt("You are a test role.") + TEXT_MODE_INSTRUCTION;
+    expect(prompt).not.toMatch(AVAILABILITY_CLAIM);
+    // The negative claim ("you do NOT have a record_findings tool") must still be present.
+    expect(prompt).toMatch(/do NOT have a `?record_findings`? tool/);
+  });
+
+  it("buildRoleSystemPrompt (persisted) + TOOL_CALL_DISCIPLINE instructs calling record_findings", async () => {
+    const { buildRoleSystemPrompt } = await import("../src/roles.js");
+    const { TOOL_CALL_DISCIPLINE } = await import("../src/agent.js");
+    const prompt = buildRoleSystemPrompt("You are a test role.") + TOOL_CALL_DISCIPLINE;
+    expect(prompt).toMatch(/call the `record_findings` tool/);
+    expect(prompt).toMatch(AVAILABILITY_CLAIM);
+  });
+});
+
+describe("extractFindingsFromText (salvage path)", () => {
+  it("parses a well-formed closed fence", () => {
+    const text =
+      '```json\n{"verdict":"pass","summary":"ok","open_questions":[],"coverage":[],"section_md":"# done"}\n```';
+    const findings = extractFindingsFromText(text);
+    expect(findings?.verdict).toBe("pass");
+    expect(findings?.summary).toBe("ok");
+  });
+
+  it("salvages fields from an unclosed fence containing an escaped quote without corrupting them", () => {
+    // Truncated mid-response (e.g. cut off by the pre-emptive nudge) — the closed
+    // `summary` field contains an escaped quote, and `section_md` (the last field)
+    // is cut off with no closing fence. Before the fix, the salvage regex's capture
+    // group (already valid JSON string content) was re-escaped a second time,
+    // corrupting `\"` into `\\"` and throwing inside JSON.parse.
+    const text =
+      '```json\n{"verdict":"needs_more","summary":"the \\"foo\\" case is unhandled","section_md":"trunc';
+    const findings = extractFindingsFromText(text);
+    expect(findings).not.toBeNull();
+    expect(findings?.verdict).toBe("needs_more");
+    expect(findings?.summary).toBe('the "foo" case is unhandled');
+    expect(findings?.open_questions).toEqual([]);
+    expect(findings?.coverage).toEqual([]);
+  });
+
+  it("does not throw on a value containing a lone unescaped backslash near a quote", () => {
+    const text = '```json\n{"verdict":"blocker","summary":"path is C:\\\\Users\\\\x","section_md":"trunc';
+    expect(() => extractFindingsFromText(text)).not.toThrow();
   });
 });
