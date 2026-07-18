@@ -61,6 +61,8 @@ header.topbar .spacer { flex: 1; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .muted { color: var(--ink-dim); }
 .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
+button.pill { background: transparent; cursor: pointer; }
+button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .pill.ok { color: var(--ok); border-color: var(--ok); }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
@@ -1893,4 +1895,69 @@ button.review-cta-escape.danger:hover {
   padding: 0 5px;
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+/* ---- Diff viewer (DiffPanel) ---- */
+.diff-modal {
+  max-width: 760px;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.diff-add { color: var(--ok); }
+.diff-del { color: var(--bad); }
+.diff-file-list {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.diff-file + .diff-file { border-top: 1px solid var(--line); }
+.diff-file-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.diff-file-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.diff-file-stats { font-size: 11px; white-space: nowrap; }
+.diff-file-body { overflow-x: auto; }
+.diff-body { font-size: 12px; }
+.diff-line {
+  display: flex;
+  gap: 8px;
+  padding: 0 8px;
+  white-space: pre;
+}
+.diff-line-no {
+  color: var(--ink-dim);
+  width: 34px;
+  text-align: right;
+  flex-shrink: 0;
+  user-select: none;
+}
+.diff-line-marker { width: 8px; flex-shrink: 0; }
+.diff-line-text { white-space: pre; }
+.diff-line.diff-add { background: rgba(79, 170, 106, 0.12); }
+.diff-line.diff-add .diff-line-text,
+.diff-line.diff-add .diff-line-marker { color: var(--ok); }
+.diff-line.diff-del { background: rgba(204, 91, 91, 0.12); }
+.diff-line.diff-del .diff-line-text,
+.diff-line.diff-del .diff-line-marker { color: var(--bad); }
+.diff-line.diff-hunk {
+  color: var(--brass-dim);
+  background: var(--panel);
+  padding: 2px 8px;
+  margin-top: 4px;
 }

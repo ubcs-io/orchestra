@@ -49,17 +49,23 @@ import {
   updateTask,
   upsertConfig,
   upsertRole,
+  type ProjectRow,
 } from "../db.js";
 import { resolveHarnessPolicy, validateToolsJson } from "../harness-policy.js";
 import {
   commitArtifacts,
+  diffFilePatch,
+  diffSummary,
+  headSha,
   isGitRepo,
+  pushBranchToGithub,
   removeFile,
   removeWorktree,
   sanitizePath,
   scaffoldPlanning,
   writeArtifact,
 } from "../git.js";
+import { createPullRequest, resolveGithubToken, resolveOwnerRepo } from "../github.js";
 import { discoverModels } from "../providers.js";
 import {
   envTokenForModel,
@@ -87,6 +93,14 @@ import { publish } from "../bus.js";
 
 function bad(reply: FastifyReply, code: number, message: string) {
   return reply.code(code).send({ error: message });
+}
+
+/** Project row for API responses: sanitizes repo_path and strips the raw
+ *  github_token (only its presence is exposed) so a plaintext PAT never
+ *  leaves the server. */
+function projectResponse(p: ProjectRow): Omit<ProjectRow, "github_token"> & { has_github_token: boolean } {
+  const { github_token, ...rest } = p;
+  return { ...rest, repo_path: sanitizePath(p.repo_path), has_github_token: !!github_token };
 }
 
 function taskDetail(taskId: string) {
@@ -593,7 +607,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
           else external_calls++;
         }
       }
-      return { ...p, repo_path: sanitizePath(p.repo_path), models, internal_calls, external_calls };
+      return { ...projectResponse(p), models, internal_calls, external_calls };
     });
     return { projects: enriched };
   });
@@ -628,21 +642,21 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       default_model: body.default_model ?? null,
     });
     scaffoldPlanning(project.repo_path, project.planning_dir);
-    return { project: { ...project, repo_path: sanitizePath(project.repo_path) } };
+    return { project: projectResponse(project) };
   });
 
   app.get("/api/projects/:id", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     const project = getProject(id);
     if (!project) return bad(reply, 404, "project not found");
-    return { project: { ...project, repo_path: sanitizePath(project.repo_path) }, roles: listRoles(id) };
+    return { project: projectResponse(project), roles: listRoles(id) };
   });
 
   app.patch("/api/projects/:id", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     if (!getProject(id)) return bad(reply, 404, "project not found");
     const updated = updateProject(id, (req.body ?? {}) as Record<string, unknown>);
-    return { project: updated ? { ...updated, repo_path: sanitizePath(updated.repo_path) } : updated };
+    return { project: updated ? projectResponse(updated) : updated };
   });
 
   app.delete("/api/projects/:id", async (req: FastifyRequest) => {
@@ -824,6 +838,99 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       return bad(reply, 400, (err as Error).message);
     }
     return taskDetail(taskId);
+  });
+
+  /** Shared setup for the diff/push/PR routes: resolves the task, its project,
+   *  and the repo path to run git against, or sends the appropriate 400/404. */
+  function taskGitContext(
+    reply: FastifyReply,
+    taskId: string,
+  ): { task: NonNullable<ReturnType<typeof getTask>>; project: NonNullable<ReturnType<typeof getProject>>; repoPath: string } | null {
+    const task = getTask(taskId);
+    if (!task) {
+      bad(reply, 404, "task not found");
+      return null;
+    }
+    if (!task.git_branch || !task.git_base_branch) {
+      bad(reply, 400, "task has no checkpoint branch");
+      return null;
+    }
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+    if (!project) {
+      bad(reply, 400, "project not found for task");
+      return null;
+    }
+    return { task, project, repoPath: taskRepoPath(task, project) };
+  }
+
+  // File-level diff of a task's branch against its base — powers the
+  // pre-push review panel. Not gated on reconcile_status: any task with a
+  // checkpoint branch can be diffed.
+  app.get("/api/tasks/:id/diff", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    try {
+      const files = diffSummary(ctx.repoPath, ctx.task.git_base_branch!, ctx.task.git_branch!);
+      return { base: ctx.task.git_base_branch, branch: ctx.task.git_branch, files };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
+  });
+
+  // Unified patch text for a single file, fetched lazily as the user expands it.
+  app.get("/api/tasks/:id/diff/file", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    const q = req.query as { path?: string; oldPath?: string };
+    if (!q.path) return bad(reply, 400, "path is required");
+    try {
+      const patch = diffFilePatch(ctx.repoPath, ctx.task.git_base_branch!, ctx.task.git_branch!, q.path, q.oldPath);
+      return { path: q.path, patch };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
+  });
+
+  // Push a task's branch to GitHub (no PR).
+  app.post("/api/tasks/:id/github/push", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    const token = resolveGithubToken(ctx.project);
+    if (!token) return bad(reply, 400, "no GitHub token configured for this project — add one in project settings");
+    try {
+      const { owner, repo } = resolveOwnerRepo(ctx.project, ctx.repoPath);
+      pushBranchToGithub(ctx.repoPath, ctx.task.git_branch!, owner, repo, token);
+      updateTask(ctx.task.task_id, { github_pushed_sha: headSha(ctx.repoPath) });
+      return { pushed: true, branch: ctx.task.git_branch, owner, repo };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
+  });
+
+  // Push (for freshness) then open a PR from the task's branch onto its base.
+  app.post("/api/tasks/:id/github/pr", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    const token = resolveGithubToken(ctx.project);
+    if (!token) return bad(reply, 400, "no GitHub token configured for this project — add one in project settings");
+    const body = (req.body ?? {}) as { title?: string; body?: string };
+    try {
+      const { owner, repo } = resolveOwnerRepo(ctx.project, ctx.repoPath);
+      pushBranchToGithub(ctx.repoPath, ctx.task.git_branch!, owner, repo, token);
+      const { url } = await createPullRequest({
+        owner,
+        repo,
+        token,
+        head: ctx.task.git_branch!,
+        base: ctx.task.git_base_branch!,
+        title: body.title || ctx.task.name || ctx.task.git_branch!,
+        body: body.body || (ctx.task.recap_md ? ctx.task.recap_md.slice(0, 2000) : "Opened by Orchestra."),
+      });
+      updateTask(ctx.task.task_id, { github_pr_url: url, github_pushed_sha: headSha(ctx.repoPath) });
+      return { pr_url: url };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
   });
 
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.

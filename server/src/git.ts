@@ -489,3 +489,130 @@ function repoRootOf(repoPath: string): string | undefined {
     return undefined;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Diffing: task branch vs. its base, for the pre-push review UI
+// ---------------------------------------------------------------------------
+
+export interface DiffFileSummary {
+  path: string;
+  oldPath?: string;
+  status: "added" | "deleted" | "modified" | "renamed" | "copied";
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+function statusFromCode(code: string): DiffFileSummary["status"] {
+  switch (code[0]) {
+    case "A":
+      return "added";
+    case "D":
+      return "deleted";
+    case "R":
+      return "renamed";
+    case "C":
+      return "copied";
+    default:
+      return "modified";
+  }
+}
+
+/** `--numstat`'s rename column is `old => new` (or `common/{old => new}/suffix`
+ *  when the unchanged path prefix/suffix is shared) rather than two separate
+ *  fields — pull out just the resulting (new) path so it can be matched up
+ *  against `--name-status`'s entry for the same file. */
+function numstatNewPath(raw: string): string {
+  const brace = /^(.*)\{.* => (.*)\}(.*)$/.exec(raw);
+  if (brace) return `${brace[1]}${brace[2]}${brace[3]}`;
+  if (raw.includes(" => ")) {
+    const parts = raw.split(" => ");
+    return parts[parts.length - 1]!;
+  }
+  return raw;
+}
+
+/**
+ * File-level summary of everything `head` changed relative to where it
+ * diverged from `base` (triple-dot / merge-base diff — matches GitHub's PR
+ * "compare" semantics, so it's unaffected by unrelated commits landing on
+ * `base` after the task branch forked off it).
+ */
+export function diffSummary(repoPath: string, base: string, head: string): DiffFileSummary[] {
+  const range = `${base}...${head}`;
+  const nameStatusRaw = git(repoPath, ["diff", "--name-status", "-M", "--diff-filter=ACDMR", range]);
+  const numstatRaw = git(repoPath, ["diff", "--numstat", "-M", "--diff-filter=ACDMR", range]);
+
+  const stats = new Map<string, { additions: number; deletions: number; binary: boolean }>();
+  for (const line of numstatRaw.split("\n")) {
+    if (!line) continue;
+    const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line);
+    if (!m) continue;
+    const [, addRaw, delRaw, rawPath] = m as unknown as [string, string, string, string];
+    const binary = addRaw === "-" || delRaw === "-";
+    stats.set(numstatNewPath(rawPath), {
+      additions: binary ? 0 : Number(addRaw),
+      deletions: binary ? 0 : Number(delRaw),
+      binary,
+    });
+  }
+
+  const files: DiffFileSummary[] = [];
+  for (const line of nameStatusRaw.split("\n")) {
+    if (!line) continue;
+    const parts = line.split("\t");
+    const status = statusFromCode(parts[0]!);
+    const renamedOrCopied = status === "renamed" || status === "copied";
+    const newPath = renamedOrCopied ? parts[2]! : parts[1]!;
+    const oldPath = renamedOrCopied ? parts[1] : undefined;
+    const stat = stats.get(newPath) ?? { additions: 0, deletions: 0, binary: false };
+    files.push({ path: newPath, oldPath, status, additions: stat.additions, deletions: stat.deletions, binary: stat.binary });
+  }
+  return files;
+}
+
+/** Unified patch text for exactly one file's change between `base` and `head`
+ *  — fetched lazily per file (rather than one patch for the whole branch) so
+ *  the initial diff view stays cheap even for a task that touched many files.
+ *
+ *  For a renamed/copied file, `oldPath` must also be passed (from the matching
+ *  `DiffFileSummary.oldPath`) — restricting `git diff` to just the new path
+ *  hides the old side of the rename entirely, so git can't pair them up and
+ *  falls back to showing the whole file as a fresh addition instead of the
+ *  actual (often much smaller) rename+edit diff. */
+export function diffFilePatch(repoPath: string, base: string, head: string, filePath: string, oldPath?: string): string {
+  const pathArgs = oldPath && oldPath !== filePath ? [oldPath, filePath] : [filePath];
+  return git(repoPath, ["diff", "--unified=3", "-M", `${base}...${head}`, "--", ...pathArgs]);
+}
+
+// ---------------------------------------------------------------------------
+// GitHub push
+// ---------------------------------------------------------------------------
+
+/** The URL configured for a remote (e.g. "origin"), or null if it isn't set. */
+export function remoteUrl(repoPath: string, name = "origin"): string | null {
+  try {
+    return git(repoPath, ["remote", "get-url", name]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Push `branch` to a GitHub repo using `token` for auth, without touching the
+ * repo's configured remotes or writing anything token-bearing to `.git/config`
+ * — the token-embedded URL is passed as the push destination directly.
+ *
+ * A non-interactive server process has no credential helper to lean on for a
+ * private/HTTPS remote, so the token has to be embedded here; in exchange,
+ * any thrown error is scrubbed of the token first; `execSync`'s own error
+ * message otherwise echoes the full shell command (token included) verbatim.
+ */
+export function pushBranchToGithub(repoPath: string, branch: string, owner: string, repo: string, token: string): void {
+  const authedUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+  try {
+    git(repoPath, ["push", authedUrl, `${branch}:${branch}`]);
+  } catch (err) {
+    throw new Error(`git push failed: ${(err as Error).message.split(token).join("***")}`);
+  }
+}

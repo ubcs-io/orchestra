@@ -9,6 +9,10 @@ export interface Project {
   planning_dir: string;
   default_model: string | null;
   models: string[];
+  /** Whether a GitHub token is configured (push/PR flow) — the raw token itself
+   *  is never sent to the client. */
+  has_github_token?: boolean;
+  github_repo?: string | null;
 }
 
 export interface Task {
@@ -42,6 +46,9 @@ export interface Task {
    *  manual review instead of auto-merging into base. */
   reconcile_status: string | null;
   reconcile_detail: string | null;
+  /** Set once "Push & open PR" has succeeded for this task's branch. */
+  github_pr_url: string | null;
+  github_pushed_sha: string | null;
   created_at: string | null;
 }
 
@@ -394,6 +401,21 @@ export interface PingResultInit {
   }>;
 }
 
+export interface DiffFile {
+  path: string;
+  oldPath?: string;
+  status: "added" | "deleted" | "modified" | "renamed" | "copied";
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+export interface TaskDiff {
+  base: string;
+  branch: string;
+  files: DiffFile[];
+}
+
 export interface RoleStats {
   role_key: string;
   total_calls: number;
@@ -424,8 +446,10 @@ export const api = {
   project: (id: number) => req<{ project: Project; roles: Role[] }>(`/api/projects/${id}`),
   createProject: (body: { name: string; repo_path: string; default_model?: string }) =>
     req<{ project: Project }>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
-  updateProject: (id: number, body: { default_model?: string | null }) =>
-    req<{ project: Project }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateProject: (
+    id: number,
+    body: { default_model?: string | null; github_token?: string | null; github_repo?: string | null },
+  ) => req<{ project: Project }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   roles: (projectId: number) => req<{ roles: Role[] }>(`/api/projects/${projectId}/roles`),
   saveRole: (projectId: number, key: string, body: Partial<Role>) =>
@@ -454,6 +478,22 @@ export const api = {
     req<TaskDetail>(`/api/tasks/${taskId}/restore`, {
       method: "POST",
       body: JSON.stringify({ role_run_id: roleRunId }),
+    }),
+
+  taskDiff: (taskId: string) => req<TaskDiff>(`/api/tasks/${taskId}/diff`),
+  taskDiffFile: (taskId: string, path: string, oldPath?: string) =>
+    req<{ path: string; patch: string }>(
+      `/api/tasks/${taskId}/diff/file?path=${encodeURIComponent(path)}${oldPath ? `&oldPath=${encodeURIComponent(oldPath)}` : ""}`,
+    ),
+
+  githubPush: (taskId: string) =>
+    req<{ pushed: boolean; branch: string; owner: string; repo: string }>(`/api/tasks/${taskId}/github/push`, {
+      method: "POST",
+    }),
+  githubOpenPr: (taskId: string, body?: { title?: string; body?: string }) =>
+    req<{ pr_url: string }>(`/api/tasks/${taskId}/github/pr`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
     }),
 
   updateTask: (taskId: string, body: { name?: string; content?: string }) =>

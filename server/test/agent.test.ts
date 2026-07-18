@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { createStallDetector, createThinkSplitter, extractFindingsFromText } from "../src/agent";
+import {
+  createFenceTracker,
+  createStallDetector,
+  createThinkSplitter,
+  extractFindingsFromText,
+} from "../src/agent";
 
 /** Feed chunks through a splitter and concatenate the routed output. */
 function run(chunks: string[]): { text: string; thinking: string } {
@@ -47,6 +52,132 @@ describe("createThinkSplitter", () => {
     const second = s.push("k>secret</think>ok");
     expect(second.thinking).toBe("secret");
     expect(first.text + second.text + s.flush().text).toBe("answer ok");
+  });
+});
+
+describe("createFenceTracker", () => {
+  it("passes plain text through untouched when no fence appears", () => {
+    const t = createFenceTracker();
+    const r = t.push("just some narration, no code blocks here.");
+    expect(r.outside).toBe("just some narration, no code blocks here.");
+    expect(r.inside).toBe("");
+  });
+
+  it("routes a self-contained fence's interior to inside, surrounding text to outside", () => {
+    const t = createFenceTracker();
+    const r = t.push("before ```middle``` after");
+    expect(r.outside).toBe("before ``` after");
+    expect(r.inside).toBe("middle```");
+  });
+
+  it("handles the fence marker split across chunk boundaries", () => {
+    const t = createFenceTracker();
+    let outside = "";
+    let inside = "";
+    for (const c of ["before ``", "`middle``", "` after"]) {
+      const r = t.push(c);
+      outside += r.outside;
+      inside += r.inside;
+    }
+    expect(outside).toBe("before ``` after");
+    expect(inside).toBe("middle```");
+  });
+
+  it("reset() clears state so a fence left open doesn't leak into the next turn", () => {
+    const t = createFenceTracker();
+    t.push("open ```unterminated json here");
+    t.reset();
+    const r = t.push("fresh text");
+    expect(r.outside).toBe("fresh text");
+    expect(r.inside).toBe("");
+  });
+});
+
+describe("fence-aware stall suppression (integration)", () => {
+  /** Mirrors the runRole() wiring: feed each chunk to the fence tracker, only the
+   *  portion outside a fence reaches the stall detector. Returns whether stalled
+   *  was ever raised. */
+  function runFenceGated(chunks: string[]): boolean {
+    const fence = createFenceTracker();
+    const detector = createStallDetector();
+    let stalled = false;
+    for (const c of chunks) {
+      if (detector.push(fence.push(c).outside)) stalled = true;
+    }
+    return stalled;
+  }
+
+  it("does not flag a JSON payload whose coverage/criteria_results entries share a status line", () => {
+    // Reproduces the reported bug: the model finishes reasoning, then emits a
+    // record_findings JSON block where several coverage entries share the exact
+    // same status line — legitimate repetition, not narration.
+    const preamble = "Now I have a thorough understanding of the problem. Let me compile my findings.\n\n";
+    const jsonBlock =
+      "```json\n" +
+      "{\n" +
+      '  "verdict": "pass",\n' +
+      '  "coverage": [\n' +
+      "    {\n" +
+      '      "concern": "correctness",\n' +
+      '      "status": "considered",\n' +
+      '      "note": "reviewed the pipeline"\n' +
+      "    },\n" +
+      "    {\n" +
+      '      "concern": "performance",\n' +
+      '      "status": "considered",\n' +
+      '      "note": "checked the hot path"\n' +
+      "    },\n" +
+      "    {\n" +
+      '      "concern": "security",\n' +
+      '      "status": "considered",\n' +
+      '      "note": "checked auth"\n' +
+      "    },\n" +
+      "    {\n" +
+      '      "concern": "data",\n' +
+      '      "status": "considered",\n' +
+      '      "note": "checked storage"\n' +
+      "    },\n" +
+      "    {\n" +
+      '      "concern": "ux",\n' +
+      '      "status": "considered",\n' +
+      '      "note": "checked the viewer"\n' +
+      "    }\n" +
+      "  ]\n" +
+      "}\n" +
+      "```";
+    expect(runFenceGated([preamble, jsonBlock])).toBe(false);
+  });
+
+  it("still flags a genuine narration loop outside any fence", () => {
+    const chunks = Array(6).fill("Let me call record_findings now.\n");
+    expect(runFenceGated(chunks)).toBe(true);
+  });
+
+  it("fence content doesn't get polluted by, or pollute, narration counting", () => {
+    // 4 narration repeats (below threshold) followed by fenced JSON with repeated
+    // status lines: neither alone crosses the threshold, and the fence's repeats
+    // must not add to the narration count computed before it opened.
+    const narration = Array(4).fill("Let me call record_findings now.\n");
+    const jsonBlock =
+      "```json\n" +
+      '{"coverage":[' +
+      Array(5)
+        .fill('{"status":"considered"}')
+        .join(",\n") +
+      "]}\n```";
+    expect(runFenceGated([...narration, jsonBlock])).toBe(false);
+  });
+
+  it("resumes stall detection once the fence closes", () => {
+    const jsonBlock =
+      "```json\n" +
+      '{"coverage":[' +
+      Array(5)
+        .fill('{"status":"considered"}')
+        .join(",\n") +
+      "]}\n```\n";
+    const narration = Array(6).fill("Let me call record_findings now.\n");
+    expect(runFenceGated([jsonBlock, ...narration])).toBe(true);
   });
 });
 

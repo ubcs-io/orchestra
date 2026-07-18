@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, STAGES, type Plan, type Task } from "../api";
 import { buildRelationGroups, type RelationGroup } from "../relations";
 import { ModelBubble } from "../components/ModelBubble";
+import { GitHubBubble } from "../components/GitHubBubble";
 
 function planProgress(task: Task): string {
   if (!task.refinement_plan_json) return "not planned";
@@ -106,6 +107,7 @@ export function ProjectBoard() {
             roles={projectQ.data.roles}
           />
         )}
+        {projectQ.data && <GitHubBubble project={projectQ.data.project} />}
         <div className="spacer" style={{ flex: 1 }} />
         <Link to="/projects/$projectId/roles" params={{ projectId }}>edit roles →</Link>
       </div>

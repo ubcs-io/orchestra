@@ -2,11 +2,13 @@
 
 **A configurable, Git-backed, code-planning refinement utility.**
 
+Smaller local LLMs fail at tasks which require large context windows or are poorly scoped; frontier models struggle with this as well, but they can afford to solve the problem with more hardware - you can't. The point of Orchestra is to offer **tighter control and visibility over long-running, nebulous work**, it breaks tasks into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably. 
+
+Letting a local model burn tokens on a dead-end exploration feels more productive when you can easily travel back to a checkpoint and see *where* the task went sideways.  Fewer blind re-runs means better output.
+
+Connect any git repository, drop in work that ranges from a bare error log to an open-ended research prompt, and a single orchestrator routes it through a chain of specialized "software-company role" agents — powered by [pi](https://github.com/earendil-works/pi) over any OpenAI-compatible endpoint — until it becomes **actionable**: either a decomposed **spec** (epic → story → task) or a **research brief** (approaches, trade-offs, edge cases, recommendation).  Mix and match API and local models in a single workflow to maximize the value of your frontier API calls.
+
 **[Read the docs →](https://ubcs-io.github.io/orchestra/)**
-
-Connect any git repository, drop in work that ranges from a bare error log to an open-ended research prompt, and a single orchestrator routes it through a chain of specialized "software-company role" agents — powered by [pi](https://github.com/earendil-works/pi) over any OpenAI-compatible endpoint — until it becomes **actionable**: either a decomposed **spec** (epic → story → task) or a **research brief** (approaches, trade-offs, edge cases, recommendation).
-
-The point is **tighter control and visibility over long-running, nebulous work**. LLMs fail at big vague tasks; Orchestra breaks them into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably.
 
 ![Orchestra dashboard — task board, network health, and registered projects](docs/public/screenshots/dashboard.png)
 
@@ -28,7 +30,7 @@ INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY 
 3. **Plan.** A routing template (flow) for the intake kind becomes the task's ordered list of roles. Each flow includes a **counter-reviewer** — a gate role that verifies prior output against predefined acceptance criteria — plus configurable loop-back and rigor settings.
 4. **Run.** One role at a time runs as a pi agent session, in that task's own dedicated git worktree: it reads/greps the real repo, then records a structured verdict + a **coverage** declaration (which concerns it examined vs. skipped) + any **open questions** it couldn't fully resolve (each with its own best-effort guess and confidence, so it doesn't have to stall the pipeline) + a markdown section, which is appended to the artifact and committed (`refine(<role>): <task> — <purpose>`). That commit is recorded as the run's checkpoint. Roles that support unreliable models can run in **two-phase** mode (exploration → formalization) or **text mode** (JSON output via markdown instead of native tool calls).
 5. **Critique.** Depending on the flow's `reviewDepth` (`none` / `terminal_only` / `every_step`), a scoped adversarial **`critic`** role runs immediately after a step to check that single step's output for a domain-ending violation (PII exposure, authz bypass, irreversible data loss, etc.) — silence is the expected outcome, so it only speaks up for genuine, high-severity issues. Its verdict is folded into the step's effective verdict (never silently downgraded), and it's stored as its own `role_runs` row (`run_kind: "critique"`, linked via `target_run_id`) rather than replacing the primary run.
-6. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). A step-level critique blocker can also trigger a bounded loop-back independent of the flow's own reviewer. Spec tasks also spawn an epic→story→task child tree. On exit to READY, the task's dedicated branch is reconciled back into its base branch (best-effort — a conflict is recorded on the task rather than blocking the transition).
+6. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). A step-level critique blocker can also trigger a bounded loop-back independent of the flow's own reviewer. Spec tasks also spawn an epic→story→task child tree. On exit to READY, the task's dedicated branch is reconciled back into its base branch — unless the task actually wrote source code (see below), in which case it's left as `pending_human_merge` for manual review instead of auto-merging (a plain artifact-only conflict is still recorded on the task rather than blocking the transition).
 
 State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirrors it on disk so the refinement history is version-controlled and PR-able.
 
@@ -38,7 +40,7 @@ Every task runs against its **own git worktree and branch** (`<repo>/.orchestra-
 
 - **Tasks run concurrently** — the scheduler dispatches up to `maxConcurrentTasks` (default `3`) tasks' next role-step per round, each isolated in its own worktree, instead of the old strict one-role-at-a-time loop. A single task is still sequential against itself (a restore or answer-reincorporation can never race that task's own in-flight step) — only *distinct* tasks now overlap.
 - **Every completed role run leaves a checkpoint** — its post-commit SHA. `POST /api/tasks/:id/restore` (or the Task Detail role-run history) rolls a task back to right after any of its own prior roles, discarding everything after it.
-- **Branches reconcile once, on completion** — nothing is merged into your base branch mid-refinement; only the final gate step on Exit to READY merges the task branch back in, after first absorbing base into it.
+- **Branches reconcile once, on completion** — nothing is merged into your base branch mid-refinement; only the final gate step on Exit to READY merges the task branch back in, after first absorbing base into it. A task that actually wrote source code (see below) skips this auto-merge entirely and is left `pending_human_merge`.
 - **Worktrees are disk-cleaned on delete/reset; branches aren't** — a worktree is silently recreated the next time a task needs one (including after a restore), so no state is lost, just the checkout.
 
 ### Intake kinds & flow rigor
@@ -70,6 +72,24 @@ Ten intake kinds are supported, each with a dedicated flow:
 - **Review CTA & question decomposition** — the Task Detail page surfaces a review call-to-action distilled from the artifact's action items, coverage gaps, and open questions raised by roles; any open question can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), which itself gets a full task page (and can recursively decompose its own open questions) plus an inline chat box on the parent for quick follow-up without leaving the page.
 
 ![Interactive live view — SSE role/tool stream, current state, steering, and coverage map](docs/public/screenshots/interactive-live-view.png)
+
+### Writing source code directly (opt-in)
+
+By default every role is read-only against the target repo — only `PLANNING/` artifacts are ever written. A project can opt into letting roles edit real source too:
+
+- **Per-project harness policy** — off by default. Toggle `allowWrite` for a project from its **Roles Editor** (`GET`/`PATCH /api/projects/:id/harness-policy`); until it's on, `write`/`edit` can't be added to any role's tool list, even by editing `tools_json` directly.
+- **`write`/`edit` are guarded, worktree-jailed tools** — once policy allows it, they can be granted per role like any other tool. A role using them still runs inside that task's own git worktree, so writes can never touch anything outside the task's disposable checkout.
+- **`developer` role** — a new seeded role (write/edit capable, `NO_TOOLS` by default) intended as the target for this override. It's deliberately **not wired into any built-in flow template**, so upgrading Orchestra never starts writing source on its own; you add it to a project's flow or a custom network explicitly.
+- **No silent auto-merge for code changes** — a task whose role run actually wrote/edited a file (`tasks.wrote_source`) is exempt from the normal branch-reconciliation-on-exit-to-READY behavior; its branch is left as `reconcile_status: "pending_human_merge"` for review via the diff panel below, instead of being merged into base automatically.
+- **Visibility** — the Settings safety dashboard shows whether any project has write/edit enabled and which roles hold it (`GET /api/safety`'s `harness_policy`), plus whether source-code writes are currently possible at all.
+
+### GitHub — inline diff review, push, and PR
+
+Any task with a checkpoint branch can be reviewed and landed without leaving Orchestra:
+
+- **Inline diff panel** — Task Detail's "review branch" pill (shown once a task is `pending_human_merge`) opens a file-level diff of the task's branch against its base (`GET /api/tasks/:id/diff`, matching GitHub's PR "compare" semantics), with unified per-file patches fetched lazily as you expand them (`GET /api/tasks/:id/diff/file`).
+- **Push & open PR** — with a GitHub token configured, push the branch (`POST /api/tasks/:id/github/push`) or push-and-open a PR against the task's base branch (`POST /api/tasks/:id/github/pr`); the resulting PR URL is stored on the task and surfaced as a link.
+- **Per-project GitHub config** — set via the **GitHub bubble** on the Projects page: a repo-scoped PAT (write-only once saved — never echoed back) and an optional `owner/repo` override for when it can't be derived from the repo's `origin` remote. Falls back to a shared `githubToken` / `ORCHESTRA_GITHUB_TOKEN` config value if no per-project token is set.
 
 ### Agent Networks
 
@@ -146,6 +166,7 @@ Resolution order (lowest → highest precedence): built-in defaults → `config.
 | `port` | `ORCHESTRA_PORT` | `5001` | HTTP port (UI + API + SSE). |
 | `providerBaseUrl` | `ORCHESTRA_BASE_URL` | `http://192.168.1.2:8080/v1` | OpenAI-compatible **base** URL (not the `/chat/completions` path). |
 | `apiKey` | `ORCHESTRA_API_KEY` | `""` | Bearer token; empty if the endpoint has no auth. |
+| `githubToken` | `ORCHESTRA_GITHUB_TOKEN` | `""` | Fallback GitHub PAT for pushing task branches / opening PRs, used when a project has no per-project token set. |
 | `defaultModelId` | `ORCHESTRA_MODEL` | `deepseek-r1:latest` | Model used when a project/role doesn't override. |
 | `contextWindow` / `maxTokens` | `ORCHESTRA_MAX_TOKENS` | `128000` / `16384` | Advertised to pi for the local model. |
 | `reasoning` | — | `true` | Whether the model is a reasoning model (enables pi thinking level). Set `false` for plain instruct models. |
@@ -197,16 +218,18 @@ server/                one Node daemon (we own main())
   src/db.ts            better-sqlite3 schema + CRUD (idempotent, WAL)
   src/providers.ts     pi provider registration + model discovery
   src/agent.ts         runRole(): one pi agent session per role (text mode, two-phase, think splitting)
-  src/roles.ts         role catalog (24 roles), flow templates, acceptance criteria, seed data
+  src/roles.ts         role catalog (25 roles), flow templates, acceptance criteria, seed data
   src/orchestrator.ts  ingest → plan → run → critique → gate + scheduler + loop-back
   src/router.ts        strategic LLM routing advisors (question distillation, escalation, borderline gate, second review)
-  src/git.ts           PLANNING scaffold + sandboxed artifact writes/commits + per-task worktrees + branch reconciliation
+  src/harness-policy.ts per-project write/edit tool policy + tools_json validation
+  src/git.ts           PLANNING scaffold + sandboxed artifact writes/commits + per-task worktrees + branch reconciliation + diffing
+  src/github.ts        GitHub REST glue: push a task branch, open a PR
   src/bus.ts           in-process pub/sub for the SSE stream
   src/routes/          Fastify REST (api.ts) + SSE (sse.ts) + safety controls (safety.ts)
   test/                Vitest test suite (agent, db, git, orchestrator, roles, router)
 client/                Vite + React SPA
   src/routes/          Projects, ProjectBoard (kanban), TaskDetail, RolesEditor, Settings, Models, NetworkEditor
-  src/components/      ReviewCTA (review action items + open questions), QuestionDecompose (spin a question into a subtask), NetworkNodeCard
+  src/components/      ReviewCTA (review action items + open questions), QuestionDecompose (spin a question into a subtask), NetworkNodeCard, DiffPanel (branch diff + push/PR), GitHubBubble (per-project token config)
   src/api.ts           typed API client
 ```
 
@@ -225,7 +248,7 @@ client/                Vite + React SPA
 
 ## Roles
 
-24 roles are seeded as global defaults and are **customizable per project** (edit prompt, tools, model, enable/disable — a project override wins by key). Each flow template selects a subset and order per intake kind, with a counter-reviewer gating before the terminal role, and a cross-cutting `critic` role that can run after any non-terminal step depending on the flow's `reviewDepth`.
+25 roles are seeded as global defaults and are **customizable per project** (edit prompt, tools, model, enable/disable — a project override wins by key). Each flow template selects a subset and order per intake kind, with a counter-reviewer gating before the terminal role, and a cross-cutting `critic` role that can run after any non-terminal step depending on the flow's `reviewDepth`.
 
 ### Spec-track roles
 
@@ -245,6 +268,7 @@ client/                Vite + React SPA
 | `test_strategy` | Test Strategy (QA / SDET) | read-only | feature, bug, error_file, manual, chore, security |
 | `dependency_integration` | Dependency & Integration (Build / DevEx) | read-only | feature |
 | `decomposition` | Decomposition (Tech Lead / Scrum Master) | read-only | all spec kinds *(terminal role)* |
+| `developer` | Developer (Implementation Engineer) | none by default *(write/edit opt-in, see [above](#writing-source-code-directly-opt-in))* | not wired into any built-in flow — add explicitly via a project role override or custom network |
 
 ### Research/UX-track roles
 
@@ -309,6 +333,7 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | GET | `/api/scheduler` · POST `/api/scheduler/{start,stop}` · POST `/api/tick` | Loop control / manual single step. |
 | GET · POST | `/api/projects` · GET · PATCH · DELETE `/api/projects/:id` | Projects. |
 | GET | `/api/projects/:id/roles` · PUT `/api/projects/:id/roles/:key` | Per-project role config (prompt, tools, model, enabled). |
+| GET · PATCH | `/api/projects/:id/harness-policy` | Per-project write/edit tool policy (`allowWrite`). |
 | POST | `/api/projects/:id/intake` | Submit an intake (writes into `INTAKE/`). |
 | POST | `/api/tasks` | Create a manual task (without a repo file). |
 | GET | `/api/networks` | List all networks (system + custom). |
@@ -325,6 +350,8 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | PATCH | `/api/tasks/:id` | Edit a task's name/content while in intake stage. |
 | POST | `/api/tasks/:id/reset` | Reset a task to intake state (clears history). |
 | POST | `/api/tasks/:id/restore` | Roll a task back to the git checkpoint left by one of its own role runs (`{ role_run_id }`). |
+| GET | `/api/tasks/:id/diff` · GET `/api/tasks/:id/diff/file` | File-level diff / single-file unified patch of a task's branch vs. its base. |
+| POST | `/api/tasks/:id/github/push` · POST `/api/tasks/:id/github/pr` | Push a task's branch to GitHub / push-and-open a PR against its base branch. |
 | POST | `/api/tasks/:id/subtasks` | Create a child task under a parent. |
 | POST | `/api/tasks/:id/questions/decompose` | Spin an open review question off into its own child Question Flow subtask (idempotent per question). |
 | POST | `/api/tasks/:id/chat` | Send a follow-up chat message against a task (used by the inline decomposed-child preview). |
@@ -342,4 +369,4 @@ The single process is designed to run on a headless box under **systemd** (or pm
 
 ## Status
 
-The full pipeline — ingest, planning, concurrent role execution across per-task git worktrees (including two-phase and text mode for unreliable tool-calling models), per-step adversarial critique, gating with counter-reviewers and loop-back, checkpoint restore, branch reconciliation, optional LLM routing advisors (including answer reincorporation), coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs with usage stats and network ping, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions, critique, concurrent scheduling), router (advisory call points, fallback behavior), database, git operations (worktrees, reconciliation), and roles.
+The full pipeline — ingest, planning, concurrent role execution across per-task git worktrees (including two-phase and text mode for unreliable tool-calling models), per-step adversarial critique, gating with counter-reviewers and loop-back, checkpoint restore, branch reconciliation, opt-in write/edit tools for roles that actually implement code (gated by per-project harness policy, exempt from auto-merge), inline diff review + GitHub push/PR, optional LLM routing advisors (including answer reincorporation), coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs with usage stats and network ping, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall/fence detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions, critique, concurrent scheduling), router (advisory call points, fallback behavior), database, git operations (worktrees, reconciliation, diffing), and roles.
