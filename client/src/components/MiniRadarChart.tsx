@@ -84,7 +84,9 @@ export function MiniRadarChart({ stats, modelCallCounts }: MiniRadarChartProps) 
       "Params (log)": logScale(s.total_parameter_count_b ?? s.parameter_count_b, maxParams),
     },
     calls: getCalls(s),
-  }));
+  }))
+    .sort((a, b) => b.calls - a.calls)
+    .slice(0, 5);
 
   const dims = 200;
   const cx = dims / 2;

@@ -271,6 +271,18 @@ export function initDb(): void {
   // source code goes to reconcile_status "pending_human_merge" instead of
   // auto-merging its branch into base — see orchestrator.ts's ready-transition.
   addColumnIfMissing(d, "tasks", "wrote_source", "wrote_source INTEGER DEFAULT 0");
+  // Per-project GitHub PAT, stored plaintext like configs.api_key (no encryption
+  // layer exists anywhere in this app) — used to push a task's branch and open
+  // PRs. Falls back to ORCHESTRA_GITHUB_TOKEN when unset. github_repo is an
+  // optional "owner/repo" override; when null it's parsed from the "origin" remote.
+  addColumnIfMissing(d, "projects", "github_token", "github_token TEXT");
+  addColumnIfMissing(d, "projects", "github_repo", "github_repo TEXT");
+  // Set once a task's branch has been pushed / had a PR opened via the
+  // review-diff UI. github_pr_url flips the "pending human merge" badge to a
+  // link; github_pushed_sha is tracked for a future "N commits since you
+  // pushed" indicator (not surfaced directly yet).
+  addColumnIfMissing(d, "tasks", "github_pr_url", "github_pr_url TEXT");
+  addColumnIfMissing(d, "tasks", "github_pushed_sha", "github_pushed_sha TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -299,6 +311,8 @@ export interface ProjectRow {
   default_provider: string | null;
   config_json: string | null;
   main_branch: string | null;
+  github_token: string | null;
+  github_repo: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -356,6 +370,8 @@ export interface TaskRow {
   reconcile_status: string | null;
   reconcile_detail: string | null;
   wrote_source: number | null;
+  github_pr_url: string | null;
+  github_pushed_sha: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -504,6 +520,8 @@ const PROJECT_UPDATABLE = new Set([
   "default_provider",
   "config_json",
   "main_branch",
+  "github_token",
+  "github_repo",
 ]);
 
 export function updateProject(id: number, fields: Record<string, unknown>): ProjectRow | undefined {
@@ -942,6 +960,8 @@ const TASK_UPDATABLE = new Set([
   "reconcile_status",
   "reconcile_detail",
   "wrote_source",
+  "github_pr_url",
+  "github_pushed_sha",
 ]);
 
 export function updateTask(
@@ -1019,6 +1039,8 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       git_worktree_path = NULL,
       reconcile_status = NULL,
       reconcile_detail = NULL,
+      github_pr_url = NULL,
+      github_pushed_sha = NULL,
       parent_task_id = NULL,
       task_type = 'root',
       step_number = NULL,

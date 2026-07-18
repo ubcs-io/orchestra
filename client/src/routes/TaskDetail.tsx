@@ -14,6 +14,7 @@ import "@xyflow/react/dist/style.css";
 import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
+import { DiffPanel } from "../components/DiffPanel";
 import { ReviewCTA, collectQuestions, type ClientOpenQuestion } from "../components/ReviewCTA";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
 
@@ -781,6 +782,7 @@ export function TaskDetail() {
   const [removePlan, setRemovePlan] = useState(false);
   const [restoreTarget, setRestoreTarget] = useState<RoleRun | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [diffOpen, setDiffOpen] = useState(false);
 
   const intervene = useMutation({
     mutationFn: ({ kind, payload }: { kind: string; payload?: unknown }) => api.intervene(taskId, kind, payload),
@@ -1027,9 +1029,24 @@ export function TaskDetail() {
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
         {t.reconcile_status === "pending_human_merge" && (
-          <span className="pill warn" title={t.reconcile_detail ?? undefined}>
-            pending human merge{t.git_branch ? ` — review branch "${t.git_branch}"` : ""}
-          </span>
+          t.github_pr_url ? (
+            <a className="pill ok" href={t.github_pr_url} target="_blank" rel="noreferrer" onClick={() => setDiffOpen(true)}>
+              PR open →
+            </a>
+          ) : (
+            <button type="button" className="pill warn" title={t.reconcile_detail ?? undefined} onClick={() => setDiffOpen(true)}>
+              review branch "{t.git_branch}"
+            </button>
+          )
+        )}
+        {diffOpen && (
+          <DiffPanel
+            taskId={t.task_id}
+            task={t}
+            projectHasGithubToken={projectQ.data?.project.has_github_token ?? false}
+            onClose={() => setDiffOpen(false)}
+            onMutate={refresh}
+          />
         )}
         {t.stage === "intake" && t.project_id != null && (
           <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />

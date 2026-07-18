@@ -22,6 +22,9 @@ export interface Config {
   providerBaseUrl: string;
   /** Bearer token for the endpoint; empty when local auth is disabled. */
   apiKey: string;
+  /** Fallback GitHub PAT used to push/open PRs for projects with no per-project
+   *  github_token set (see projects.github_token, github.ts resolveGithubToken). */
+  githubToken: string;
   /** Model id used when a project/role does not override it. */
   defaultModelId: string;
   /** Context window / max output tokens advertised to pi for the local model. */
@@ -76,6 +79,7 @@ const DEFAULTS: Config = {
   port: 5001,
   providerBaseUrl: "http://192.168.1.2:8080/v1",
   apiKey: "",
+  githubToken: "",
   defaultModelId: "deepseek-r1:latest",
   contextWindow: 128_000,
   maxTokens: 32_768,
@@ -109,6 +113,7 @@ function readEnv(): Partial<Config> {
   if (e.ORCHESTRA_PORT) out.port = Number(e.ORCHESTRA_PORT);
   if (e.ORCHESTRA_BASE_URL) out.providerBaseUrl = e.ORCHESTRA_BASE_URL;
   if (e.ORCHESTRA_API_KEY) out.apiKey = e.ORCHESTRA_API_KEY;
+  if (e.ORCHESTRA_GITHUB_TOKEN) out.githubToken = e.ORCHESTRA_GITHUB_TOKEN;
   if (e.ORCHESTRA_MODEL) out.defaultModelId = e.ORCHESTRA_MODEL;
   if (e.ORCHESTRA_DB_PATH) out.dbPath = e.ORCHESTRA_DB_PATH;
   if (e.ORCHESTRA_REQUEST_TIMEOUT_MS) out.requestTimeoutMs = Number(e.ORCHESTRA_REQUEST_TIMEOUT_MS);
