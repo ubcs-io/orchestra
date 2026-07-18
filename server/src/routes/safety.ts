@@ -14,9 +14,10 @@ import {
   READ_ONLY_TOOLS,
   READ_ONLY_TOOLS_WITH_GIT,
 } from "../roles.js";
-import { getGlobalConfig, getMeta, listRoles, setMeta } from "../db.js";
+import { getGlobalConfig, getMeta, listProjects, listRoles, setMeta } from "../db.js";
 import { resolveConnection } from "../settings.js";
 import { getConfig } from "../config.js";
+import { DEFAULT_HARNESS_POLICY, WRITE_TOOL_NAMES, resolveHarnessPolicy } from "../harness-policy.js";
 
 function resolveRoleToolBudget(): number {
   const meta = getMeta("safety.role_tool_budget");
@@ -82,14 +83,42 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
       };
     }
 
+    // Per-project harness policy + live write/edit grants — unlike roles_summary
+    // above (a global-catalog-shape summary), this inspects each project's own
+    // merged roles (listRoles(p.id): globals overridden by that project's rows),
+    // since a project can grant write/edit via a role override without ever
+    // touching the global catalog.
+    const writeToolSet = new Set<string>(WRITE_TOOL_NAMES);
+    let projectsWithWrite = 0;
+    const projectSummaries = listProjects().map((p) => {
+      const policy = resolveHarnessPolicy(p.config_json);
+      const rolesWithWrite = listRoles(p.id)
+        .filter((r) => {
+          if (!r.enabled || !r.tools_json) return false;
+          const roleTools = JSON.parse(r.tools_json) as string[];
+          return roleTools.some((t) => writeToolSet.has(t));
+        })
+        .map((r) => r.key);
+      if (rolesWithWrite.length > 0) projectsWithWrite++;
+      return { id: p.id, name: p.name, allow_write: policy.allowWrite, roles_with_write: rolesWithWrite };
+    });
+
     return {
       agent_tools: {
-        mode: "read_only",
-        write_scope: "PLANNING/ only (sandboxed artifact writes via write_artifact tool)",
+        mode: projectsWithWrite > 0 ? "mixed" : "read_only",
+        write_scope:
+          projectsWithWrite > 0
+            ? "PLANNING/ (always, via write_artifact) plus source files inside the task's git worktree for roles granted write/edit"
+            : "PLANNING/ only (sandboxed artifact writes via write_artifact tool)",
         shell_access: false,
         cross_repo_access: false,
-        source_code_writes: false,
+        source_code_writes: projectsWithWrite > 0,
         git_history_available: gitHistoryCount > 0,
+        worktree_jail: true,
+      },
+      harness_policy: {
+        global_default: DEFAULT_HARNESS_POLICY,
+        projects: projectSummaries,
       },
       limits: {
         role_tool_budget: resolveRoleToolBudget(),

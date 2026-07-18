@@ -50,6 +50,7 @@ import {
   upsertConfig,
   upsertRole,
 } from "../db.js";
+import { resolveHarnessPolicy, validateToolsJson } from "../harness-policy.js";
 import {
   commitArtifacts,
   isGitRepo,
@@ -663,8 +664,15 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   app.put("/api/projects/:id/roles/:key", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string; key: string }).id);
     const key = (req.params as { key: string }).key;
-    if (!getProject(id)) return bad(reply, 404, "project not found");
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
     const body = (req.body ?? {}) as Record<string, unknown>;
+
+    if (typeof body.tools_json === "string") {
+      const validation = validateToolsJson(body.tools_json, resolveHarnessPolicy(project.config_json));
+      if (!validation.ok) return bad(reply, 400, validation.error);
+    }
+
     const role = upsertRole({
       project_id: id,
       key,
@@ -677,6 +685,41 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       can_create_subtasks: body.can_create_subtasks as boolean | undefined,
     });
     return { role };
+  });
+
+  // ---- Harness policy (per project): gates write/edit tool grants ----
+  app.get("/api/projects/:id/harness-policy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { policy: resolveHarnessPolicy(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/harness-policy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { allowWrite?: boolean };
+    if (typeof body.allowWrite !== "boolean") return bad(reply, 400, "allowWrite (boolean) is required");
+
+    // Merge into the existing config_json.harness sub-key, preserving any other
+    // top-level keys (e.g. router) already present — same merge-not-clobber
+    // approach the roles PUT above uses for tools_json. Deliberately not the
+    // generic PATCH /api/projects/:id (which accepts arbitrary config_json with
+    // no shape validation) — a policy gating real filesystem writes must not be
+    // silently disabled by a malformed/blank config_json PATCH.
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = {
+      ...existing,
+      harness: { ...(existing.harness as object | undefined), allowWrite: body.allowWrite },
+    };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    return { policy: resolveHarnessPolicy(updated?.config_json ?? null) };
   });
 
   // ---- Tasks ----

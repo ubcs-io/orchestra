@@ -1026,6 +1026,11 @@ export function TaskDetail() {
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
+        {t.reconcile_status === "pending_human_merge" && (
+          <span className="pill warn" title={t.reconcile_detail ?? undefined}>
+            pending human merge{t.git_branch ? ` — review branch "${t.git_branch}"` : ""}
+          </span>
+        )}
         {t.stage === "intake" && t.project_id != null && (
           <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}

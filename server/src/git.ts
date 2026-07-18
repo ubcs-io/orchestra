@@ -371,6 +371,46 @@ export function pruneWorktrees(repoPath: string): void {
   }
 }
 
+/** True if `repoPath` is a per-task worktree (`<repo>/.orchestra-worktrees/<taskId>`),
+ *  not a bare project checkout. The guarded write/edit tools (agent.ts) must only
+ *  ever be registered against a worktree — runRole() asserts this before wiring
+ *  them in, since a shared checkout has no per-task isolation. */
+export function isWorktreePath(repoPath: string): boolean {
+  return repoPath.split(path.sep).includes(WORKTREES_DIR);
+}
+
+/**
+ * Validate that an absolute path pi's write/edit tools have already resolved
+ * (via their own unguarded `path.resolve(cwd, input)`) still lands inside
+ * `worktreeRoot`, and isn't the worktree's own `.git` entry. Throws on any
+ * violation — the caller (a guarded write/edit operation in agent.ts) lets
+ * this propagate so pi's tool-call machinery turns it into a normal error
+ * tool result, the same way a validation failure in any other tool does.
+ *
+ * Mirrors `resolveInPlanning`'s escape check above, applied to the worktree
+ * root instead of the PLANNING tree.
+ *
+ * `.git` under a worktree root is a *file* (not a directory) containing
+ * `gitdir: <repo>/.git/worktrees/<taskId>` — overwriting it lets a write call
+ * repoint the task's git identity anywhere on disk, silently breaking
+ * worktree isolation for every subsequent git operation against this path.
+ * Blocked outright rather than validated by content.
+ */
+export function assertInsideWorktree(worktreeRoot: string, absPath: string): string {
+  const resolved = path.resolve(absPath);
+  const rel = path.relative(worktreeRoot, resolved);
+  if (rel === "") {
+    throw new Error("refusing to write the worktree root itself");
+  }
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`path escapes task worktree sandbox: ${absPath}`);
+  }
+  if (rel === ".git" || rel.startsWith(`.git${path.sep}`)) {
+    throw new Error(`refusing to write git-internal path: ${rel}`);
+  }
+  return resolved;
+}
+
 // ---------------------------------------------------------------------------
 // Branch reconciliation
 // ---------------------------------------------------------------------------

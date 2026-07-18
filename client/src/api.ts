@@ -34,6 +34,14 @@ export interface Task {
   /** Set when a later answer invalidated an assumption the parent task made
    *  while spawning this decomposition child — flagged for human triage. */
   stale_reason: string | null;
+  git_branch: string | null;
+  git_base_branch: string | null;
+  /** Outcome of merging this task's branch back into base on completion.
+   *  "pending_human_merge" means a role wrote real source (not just PLANNING
+   *  artifacts this run) — the branch was deliberately left unmerged for
+   *  manual review instead of auto-merging into base. */
+  reconcile_status: string | null;
+  reconcile_detail: string | null;
   created_at: string | null;
 }
 
@@ -294,6 +302,12 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Per-project write-access policy — see server/src/harness-policy.ts. */
+export interface HarnessPolicy {
+  allowWrite: boolean;
+  denyGlobs?: string[];
+}
+
 /** GET /api/safety response shape. */
 export interface SafetyResponse {
   agent_tools: {
@@ -303,6 +317,11 @@ export interface SafetyResponse {
     cross_repo_access: boolean;
     source_code_writes: boolean;
     git_history_available: boolean;
+    worktree_jail: boolean;
+  };
+  harness_policy: {
+    global_default: HarnessPolicy;
+    projects: Array<{ id: number; name: string; allow_write: boolean; roles_with_write: string[] }>;
   };
   limits: {
     role_tool_budget: number;
@@ -412,6 +431,14 @@ export const api = {
   saveRole: (projectId: number, key: string, body: Partial<Role>) =>
     req<{ role: Role }>(`/api/projects/${projectId}/roles/${key}`, {
       method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  harnessPolicy: (projectId: number) =>
+    req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`),
+  saveHarnessPolicy: (projectId: number, body: { allowWrite: boolean }) =>
+    req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`, {
+      method: "PATCH",
       body: JSON.stringify(body),
     }),
 

@@ -515,6 +515,23 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. In section_md, present the tree explicitly using nested bullets labeled [epic], [story], [task] so downstream tooling can parse it. Each atomic task must be independently actionable with acceptance criteria.`,
   },
 
+  // ---- Developer (write/edit capable) ----
+  // Not wired into any FLOW_TEMPLATES step, so upgrading Orchestra never starts
+  // writing source code on its own. tools starts empty (read-only-equivalent,
+  // i.e. no tools at all) — a project must explicitly grant "write"/"edit" via a
+  // project role override AND turn on that project's harness policy (allowWrite)
+  // before this role's write/edit tools become live (see harness-policy.ts,
+  // agent.ts's runRole()). Exists purely as a sensibly-named target for that
+  // override, instead of granting write/edit to e.g. "decomposition".
+  {
+    key: "developer",
+    title: "Developer (Implementation Engineer)",
+    ordering: 950,
+    tools: NO_TOOLS,
+    appliesTo: ALL,
+    persona: `You implement the refined work directly in the repository. Ground every change in the actual code: read the affected files before editing them, follow existing patterns and conventions, and make the smallest change that satisfies the acceptance criteria. Do not invent file names, symbols, or APIs — verify they exist first. This role only runs with write/edit tools when a project explicitly grants them; without them, treat this as a dry-run and describe the change you would make instead.`,
+  },
+
   // ---- Research / UX track (research_brief exit) ----
   {
     key: "ux_review",

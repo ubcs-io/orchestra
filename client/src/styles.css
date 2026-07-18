@@ -1415,6 +1415,11 @@ a.clickable-role:hover {
   color: var(--brass);
   line-height: 1.4;
 }
+.tag-chip-disabled {
+  background: rgba(120, 120, 120, 0.1);
+  border-color: var(--line);
+  color: var(--ink-dim);
+}
 .tag-remove {
   background: none;
   border: none;

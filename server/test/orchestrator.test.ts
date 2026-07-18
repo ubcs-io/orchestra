@@ -147,6 +147,7 @@ function fakeRunner(
     fallback: false,
     stalled: false,
     thinkingText: "",
+    filesWritten: [],
   });
 }
 
@@ -199,6 +200,7 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
       fallback: false,
       stalled: false,
       thinkingText: "",
+      filesWritten: [],
     };
   };
 }
@@ -327,6 +329,7 @@ describe("orchestrator loop (integration)", () => {
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
 
@@ -415,6 +418,7 @@ describe("orchestrator loop (integration)", () => {
       stalled: false,
       stopReason: "length",
       thinkingText: "the model was thinking hard",
+      filesWritten: [],
     }));
 
     await drainTicks(projectId, () => listRoleRuns(rootTask(projectId)!.task_id).length > 0, 5);
@@ -476,6 +480,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
 
@@ -515,6 +520,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
     setSecondReviewFn(async () => ({ decision: "accept", reasoning: "false positive, proceed" }));
@@ -557,6 +563,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
 
@@ -697,6 +704,7 @@ describe("best-effort guesses + auto-reincorporation", () => {
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     };
   }

@@ -266,6 +266,11 @@ export function initDb(): void {
   // hasn't reached a terminal role yet).
   addColumnIfMissing(d, "tasks", "reconcile_status", "reconcile_status TEXT");
   addColumnIfMissing(d, "tasks", "reconcile_detail", "reconcile_detail TEXT");
+  // Set when any role step wrote/edited a real file via the guarded write/edit
+  // tools (not just the PLANNING artifact). Gates auto-merge: a task that wrote
+  // source code goes to reconcile_status "pending_human_merge" instead of
+  // auto-merging its branch into base — see orchestrator.ts's ready-transition.
+  addColumnIfMissing(d, "tasks", "wrote_source", "wrote_source INTEGER DEFAULT 0");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -350,6 +355,7 @@ export interface TaskRow {
   git_worktree_path: string | null;
   reconcile_status: string | null;
   reconcile_detail: string | null;
+  wrote_source: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -935,6 +941,7 @@ const TASK_UPDATABLE = new Set([
   "git_worktree_path",
   "reconcile_status",
   "reconcile_detail",
+  "wrote_source",
 ]);
 
 export function updateTask(

@@ -10,6 +10,8 @@
 
 import {
   createAgentSession,
+  createEditToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -17,12 +19,16 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
-import { appendArtifactSection, resolveInPlanning } from "./git.js";
+import { appendArtifactSection, assertInsideWorktree, isWorktreePath, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
 import { resolveConnection, type Connection, type ThinkingBudgets } from "./settings.js";
 import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.js";
+import { DEFAULT_HARNESS_POLICY, WRITE_TOOL_NAMES, type HarnessPolicy } from "./harness-policy.js";
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
 export type CoverageStatus = "considered" | "skipped" | "out_of_scope";
@@ -100,6 +106,11 @@ export interface RoleRunResult {
   stopReason?: string;
   /** The model's reasoning trace (native reasoning channel + any inline <think>). */
   thinkingText: string;
+  /** Worktree-relative paths written/edited via the guarded write/edit tools
+   *  this run (empty unless the role was granted write/edit and the project's
+   *  harness policy allowed it) — the caller stages these into the same
+   *  checkpoint commit as the artifact section. */
+  filesWritten: string[];
 }
 
 export interface RunRoleParams {
@@ -135,6 +146,12 @@ export interface RunRoleParams {
    *  config's own settings instead of the project/global default connection.
    *  Falls back to `resolveConnection()` (today's behavior) when omitted. */
   connection?: Connection;
+  /** Resolved per-project harness policy — gates whether "write"/"edit" in
+   *  `tools` actually get registered as real, worktree-jailed tools. Omitted
+   *  → DEFAULT_HARNESS_POLICY (allowWrite: false), i.e. write/edit are
+   *  stripped even if present in `tools`. This is the authoritative runtime
+   *  enforcement point, independent of what's stored in the role's tools_json. */
+  harnessPolicy?: HarnessPolicy;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -730,8 +747,18 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   // `git_history` is a custom tool, not a pi builtin — pull it out of the builtin
   // allowlist and register it as a custom tool only for roles that opt in.
+  // `write`/`edit` are pi builtins too, but pi resolves their paths unguarded
+  // (plain path.resolve, no jail) — never let those reach the builtin allowlist
+  // either. They're only ever registered below as custom tools backed by our
+  // own worktree-jailed operations, and only when the resolved project harness
+  // policy allows it (independent of what the role's tools_json requests).
+  const harnessPolicy = params.harnessPolicy ?? DEFAULT_HARNESS_POLICY;
   const wantsGit = params.tools.includes(GIT_HISTORY_TOOL);
-  const builtinTools = params.tools.filter((t) => t !== GIT_HISTORY_TOOL);
+  const wantsWrite = params.tools.includes("write") && harnessPolicy.allowWrite;
+  const wantsEdit = params.tools.includes("edit") && harnessPolicy.allowWrite;
+  const builtinTools = params.tools.filter(
+    (t) => t !== GIT_HISTORY_TOOL && !(WRITE_TOOL_NAMES as readonly string[]).includes(t),
+  );
 
   // In textMode or twoPhase, strip record_findings from custom tools — the model
   // must output findings in text instead. write_artifact and git_history remain
@@ -740,6 +767,60 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const customTools: ReturnType<typeof defineTool>[] = [writeArtifact];
   if (wantsRecordFindings) customTools.unshift(recordFindings);
   if (wantsGit) customTools.push(gitHistory);
+
+  // Every fs operation the write/edit tools perform goes through this guard
+  // first — it's the only thing standing between a granted write/edit tool
+  // and the rest of the filesystem. A thrown error here propagates out of
+  // pi's tool `execute()` and is turned into a normal isError tool result by
+  // its agent-loop (verified against @earendil-works/pi-agent-core), so no
+  // try/catch is needed here.
+  const touchedRelPaths = new Set<string>();
+  if (wantsWrite || wantsEdit) {
+    if (!isWorktreePath(params.repoPath)) {
+      throw new Error(
+        `refusing to grant write/edit tools: repoPath "${params.repoPath}" is not an isolated task worktree`,
+      );
+    }
+    const guard = (absPath: string) => assertInsideWorktree(params.repoPath, absPath);
+    const recordTouched = (abs: string) => touchedRelPaths.add(path.relative(params.repoPath, abs));
+    if (wantsWrite) {
+      customTools.push(
+        defineTool(
+          createWriteToolDefinition(params.repoPath, {
+            operations: {
+              writeFile: async (absolutePath, content) => {
+                const abs = guard(absolutePath);
+                await fsp.writeFile(abs, content, "utf8");
+                recordTouched(abs);
+              },
+              mkdir: async (dir) => {
+                await fsp.mkdir(guard(dir), { recursive: true });
+              },
+            },
+          }),
+        ),
+      );
+    }
+    if (wantsEdit) {
+      customTools.push(
+        defineTool(
+          createEditToolDefinition(params.repoPath, {
+            operations: {
+              readFile: async (absolutePath) => fsp.readFile(guard(absolutePath)),
+              access: async (absolutePath) => {
+                await fsp.access(guard(absolutePath), fs.constants.R_OK | fs.constants.W_OK);
+              },
+              writeFile: async (absolutePath, content) => {
+                const abs = guard(absolutePath);
+                await fsp.writeFile(abs, content, "utf8");
+                recordTouched(abs);
+              },
+            },
+          }),
+        ),
+      );
+    }
+  }
 
   const { session } = await createAgentSession({
     cwd: params.repoPath,
@@ -1007,5 +1088,6 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     phase,
     stopReason,
     thinkingText,
+    filesWritten: [...touchedRelPaths],
   };
 }

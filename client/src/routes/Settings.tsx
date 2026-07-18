@@ -69,6 +69,7 @@ function SafetyDashboard() {
         <GatesCard data={data} />
         <div>
           <RolesSummary data={data} />
+          <HarnessPolicySummary data={data} />
           <SecurityPosture data={data} />
         </div>
       </div>
@@ -77,12 +78,19 @@ function SafetyDashboard() {
 }
 
 function ToolBoundaries({ data }: { data: SafetyResponse }) {
+  const t = data.agent_tools;
   const items: Array<{ label: string; ok: boolean; detail: string }> = [
     { label: "Read repo files", ok: true, detail: "read, grep, find, ls — scoped to registered repo" },
-    { label: "Git history", ok: true, detail: "read-only git log — scoped to registered repo" },
-    { label: "Write artifacts", ok: true, detail: "(sandbox uses write_artifact tool)" },
-    { label: "Shell / exec access", ok: false, detail: "no exec, shell, or system tools available to agents" },
-    { label: "Source code editing", ok: false, detail: "no write/edit tools — repository code is never modified" },
+    { label: "Git history", ok: t.git_history_available, detail: "read-only git log — scoped to registered repo" },
+    { label: "Write artifacts", ok: true, detail: "PLANNING/ only, always on (write_artifact tool)" },
+    { label: "Shell / exec access", ok: !t.shell_access, detail: "no exec, shell, or system tools available to agents" },
+    {
+      label: "Source code editing",
+      ok: !t.source_code_writes,
+      detail: t.source_code_writes
+        ? "write/edit granted to at least one role — jailed to that task's git worktree"
+        : "no write/edit tools — repository code is never modified",
+    },
     { label: "Cross-repo isolation", ok: true, detail: "each session locked to a single project's repoPath" },
   ];
 
@@ -235,6 +243,38 @@ function RolesSummary({ data }: { data: SafetyResponse }) {
       <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
         Edit per-role tools in the <strong>Roles Editor</strong> inside each project.
       </p>
+    </div>
+  );
+}
+
+function HarnessPolicySummary({ data }: { data: SafetyResponse }) {
+  const hp = data.harness_policy;
+  const withWrite = hp.projects.filter((p) => p.allow_write || p.roles_with_write.length > 0);
+
+  return (
+    <div className="panel" style={{ marginTop: 12 }}>
+      <strong style={{ marginBottom: 8, display: "block" }}>Harness Write Policy (per project)</strong>
+      <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+        Global default is <code>allowWrite: {String(hp.global_default.allowWrite)}</code>. Toggle a project's
+        policy from that project's Roles Editor.
+      </p>
+      {withWrite.length === 0 ? (
+        <span className="pill dim" style={{ fontSize: 11 }}>no project has write/edit enabled</span>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {withWrite.map((p) => (
+            <div key={p.id} className="row" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
+              <span className={`pill ${p.allow_write ? "ok" : "dim"}`} style={{ fontSize: 10 }}>
+                {p.allow_write ? "write enabled" : "write disabled"}
+              </span>
+              <strong style={{ fontSize: 12 }}>{p.name}</strong>
+              {p.roles_with_write.map((key) => (
+                <span key={key} className="pill dim" style={{ fontSize: 10 }}>{key}</span>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

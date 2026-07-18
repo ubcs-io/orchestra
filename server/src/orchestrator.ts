@@ -79,6 +79,7 @@ import {
 } from "./agent.js";
 import { getConfig } from "./config.js";
 import { resolveConnectionForModel } from "./settings.js";
+import { resolveHarnessPolicy } from "./harness-policy.js";
 import {
   resolveRouterConfig,
   distillQuestions,
@@ -915,6 +916,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   }
 
   const tools: string[] = role.tools_json ? (JSON.parse(role.tools_json) as string[]) : [];
+  const harnessPolicy = resolveHarnessPolicy(project.config_json);
   // Resolve the connection FROM the chosen model reference (a named model-config's
   // `name`, or a raw modelId) rather than always the project/global default — this
   // is what lets textMode/twoPhase/base_url vary per role when a model override
@@ -959,6 +961,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       twoPhase: connection.twoPhase,
       thinkingBudgets: connection.thinkingBudgets,
       connection,
+      harnessPolicy,
       onEvent: (ev) => publish(task.task_id, ev.type as never, sanitizeEventData(ev)),
       signal: ac.signal,
     });
@@ -1073,10 +1076,12 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   // Append the section to the artifact + commit. On success, the resulting
   // commit is this run's checkpoint — restore resets task.git_branch to it.
+  // Any files the role wrote/edited via the guarded write/edit tools ride
+  // along in the same checkpoint commit.
   appendArtifactSection(absArtifact, findings.section_md);
   const committed = commitArtifacts(
     repoPath,
-    [relArtifact],
+    [relArtifact, ...result.filesWritten],
     refineCommitMessage(step.role, task.name ?? task.task_id, findings.summary),
   );
   if (committed) {
@@ -1085,6 +1090,9 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     } catch (err) {
       console.warn(`[git] could not read checkpoint SHA for run ${run.id}: ${(err as Error).message}`);
     }
+  }
+  if (result.filesWritten.length > 0 && !task.wrote_source) {
+    task = updateTask(task.task_id, { wrote_source: 1 }) ?? task;
   }
 
   // Roll coverage up.
@@ -1239,6 +1247,7 @@ async function runCritiquePass(
       thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
       textMode: connection.textMode,
       twoPhase: connection.twoPhase,
+      harnessPolicy: resolveHarnessPolicy(project.config_json),
       thinkingBudgets: connection.thinkingBudgets,
       connection,
       signal: new AbortController().signal,
@@ -2003,17 +2012,30 @@ async function applyGate(
     // history is. The branch itself is left in place afterward either way,
     // for reference / possible manual resolution.
     if (task.git_branch && task.git_base_branch) {
-      const reconciled = reconcileBranch(repoPath, task.git_branch, task.git_base_branch);
-      updateTask(task.task_id, {
-        reconcile_status: reconciled.status,
-        reconcile_detail: reconciled.detail ?? null,
-      });
-      if (reconciled.status === "conflict" || reconciled.status === "error") {
-        console.warn(
-          `[git] reconciliation ${reconciled.status} for task ${task.task_id.slice(0, 8)}: ${reconciled.detail}`,
-        );
+      if (task.wrote_source) {
+        // A task that wrote real source (not just PLANNING artifacts) must not
+        // silently land in the base branch — the worktree jail protects the
+        // filesystem during the run, but auto-merging its commits would still
+        // hand agent-authored code changes to the user's working branch with
+        // no review step. Leave the branch in place for manual merge instead.
+        updateTask(task.task_id, {
+          reconcile_status: "pending_human_merge",
+          reconcile_detail: "task wrote source code — merge requires manual review",
+        });
+        publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: "pending_human_merge" });
+      } else {
+        const reconciled = reconcileBranch(repoPath, task.git_branch, task.git_base_branch);
+        updateTask(task.task_id, {
+          reconcile_status: reconciled.status,
+          reconcile_detail: reconciled.detail ?? null,
+        });
+        if (reconciled.status === "conflict" || reconciled.status === "error") {
+          console.warn(
+            `[git] reconciliation ${reconciled.status} for task ${task.task_id.slice(0, 8)}: ${reconciled.detail}`,
+          );
+        }
+        publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: reconciled.status });
       }
-      publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: reconciled.status });
     }
     if (task.git_base_branch) {
       try {
