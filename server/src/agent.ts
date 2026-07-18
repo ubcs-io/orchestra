@@ -10,6 +10,8 @@
 
 import {
   createAgentSession,
+  createEditToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -17,20 +19,38 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-ai/compat";
-import { appendArtifactSection, resolveInPlanning } from "./git.js";
+import { appendArtifactSection, assertInsideWorktree, isWorktreePath, resolveInPlanning } from "./git.js";
 import { ensureModel, getRegistry } from "./providers.js";
 import { resolveConnection, type Connection, type ThinkingBudgets } from "./settings.js";
 import { TWO_PHASE_EXPLORE_CONTRACT, TWO_PHASE_FORMALIZE_PROMPT } from "./roles.js";
+import { DEFAULT_HARNESS_POLICY, WRITE_TOOL_NAMES, type HarnessPolicy } from "./harness-policy.js";
 
 export type Verdict = "pass" | "needs_more" | "blocker" | "needs_human";
 export type CoverageStatus = "considered" | "skipped" | "out_of_scope";
+export type QuestionConfidence = "low" | "medium" | "high";
+/** Lifecycle of a role's best-effort guess: set once when recorded, then updated
+ *  when a human's later answer is compared against it (see orchestrator.ts). */
+export type QuestionResolution = "assumed" | "confirmed" | "invalidated";
 
 export interface CoverageItem {
   concern: string;
   status: CoverageStatus;
   note?: string;
+}
+
+/** An open question a role could not fully resolve, together with its own
+ *  best-effort guess — recorded so the pipeline can proceed past it instead of
+ *  stalling, and so a later human answer can be checked against the guess. */
+export interface OpenQuestion {
+  question: string;
+  assumed_answer: string;
+  confidence: QuestionConfidence;
+  resolved: QuestionResolution;
 }
 
 /** Whether a counter-reviewer judged an acceptance criterion satisfied. */
@@ -46,7 +66,7 @@ export interface CriteriaResult {
 export interface RoleFindings {
   verdict: Verdict;
   summary: string;
-  open_questions: string[];
+  open_questions: OpenQuestion[];
   coverage: CoverageItem[];
   section_md: string;
   /** Present only for counter-reviewer roles; one entry per acceptance criterion. */
@@ -86,6 +106,11 @@ export interface RoleRunResult {
   stopReason?: string;
   /** The model's reasoning trace (native reasoning channel + any inline <think>). */
   thinkingText: string;
+  /** Worktree-relative paths written/edited via the guarded write/edit tools
+   *  this run (empty unless the role was granted write/edit and the project's
+   *  harness policy allowed it) — the caller stages these into the same
+   *  checkpoint commit as the artifact section. */
+  filesWritten: string[];
 }
 
 export interface RunRoleParams {
@@ -121,6 +146,12 @@ export interface RunRoleParams {
    *  config's own settings instead of the project/global default connection.
    *  Falls back to `resolveConnection()` (today's behavior) when omitted. */
   connection?: Connection;
+  /** Resolved per-project harness policy — gates whether "write"/"edit" in
+   *  `tools` actually get registered as real, worktree-jailed tools. Omitted
+   *  → DEFAULT_HARNESS_POLICY (allowWrite: false), i.e. write/edit are
+   *  stripped even if present in `tools`. This is the authoritative runtime
+   *  enforcement point, independent of what's stored in the role's tools_json. */
+  harnessPolicy?: HarnessPolicy;
   onEvent?: (ev: RoleStreamEvent) => void;
   signal?: AbortSignal;
 }
@@ -147,6 +178,17 @@ const CriteriaResultSchema = Type.Object({
   note: Type.Optional(Type.String()),
 });
 
+const OpenQuestionSchema = Type.Object({
+  question: Type.String(),
+  assumed_answer: Type.String({
+    description:
+      "Your own best-effort guess at the answer. Never leave this empty — a low-" +
+      "confidence guess still lets the pipeline keep moving; a human can confirm or " +
+      "correct it later.",
+  }),
+  confidence: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
+});
+
 const RecordFindingsSchema = Type.Object({
   verdict: Type.Union([
     Type.Literal("pass"),
@@ -155,7 +197,7 @@ const RecordFindingsSchema = Type.Object({
     Type.Literal("needs_human"),
   ]),
   summary: Type.String(),
-  open_questions: Type.Optional(Type.Array(Type.String())),
+  open_questions: Type.Optional(Type.Array(OpenQuestionSchema)),
   coverage: Type.Optional(Type.Array(CoverageSchema)),
   section_md: Type.String(),
   criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
@@ -225,7 +267,7 @@ const STALL_REPEAT_THRESHOLD = 5;
 const STALL_MIN_SENTENCE_LEN = 20;
 
 export const TOOL_CALL_DISCIPLINE =
-  "\n\nWhen you are ready to use a tool, invoke it directly as a function call — never describe or " +
+  "When you are ready to use a tool, invoke it directly as a function call — never describe or " +
   'narrate the call in plain text (e.g. do not write "Let me call record_findings now" or similar). ' +
   "Plain text should contain your analysis, not announcements of tool use.\n\n" +
   "When you are done, call the `record_findings` tool EXACTLY ONCE with the fields described in " +
@@ -278,7 +320,7 @@ output your findings as a single JSON code block using EXACTLY this format:
 {
   "verdict": "pass",
   "summary": "One or two sentences capturing your key takeaway.",
-  "open_questions": [],
+  "open_questions": [{"question": "...", "assumed_answer": "your best guess", "confidence": "medium"}],
   "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}],
   "section_md": "## My Role\\n\\nFindings with concrete file references..."
 }
@@ -286,7 +328,7 @@ output your findings as a single JSON code block using EXACTLY this format:
 
 - **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
 - **summary**: brief key takeaway
-- **open_questions**: array of strings (empty if none)
+- **open_questions**: array of { question, assumed_answer, confidence } (empty if none). For EVERY open question, give your own best-effort guess at the answer plus a confidence ("low" | "medium" | "high") — never leave assumed_answer empty. Reserve "blocker"/"needs_human" ONLY for questions where no reasonable guess is possible at all; an ordinary open question with a guess attached should still get "pass" or "needs_more".
 - **coverage**: array of { concern, status, note } — status is "considered", "skipped", or "out_of_scope". Draw concerns from: correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs. Be honest about what you did NOT examine.
 - **section_md**: a markdown section (start with "## Your Role" heading) with concrete file references. This will be appended to the task's planning artifact.
 
@@ -467,6 +509,38 @@ export function extractFindingsFromText(text: string): RoleFindings | null {
   return tryParseFindings(text.trim());
 }
 
+/** Coerce loosely-typed model output into OpenQuestion[] — tolerates the old
+ *  plain-string form (models that ignore the updated instructions) alongside
+ *  the current { question, assumed_answer, confidence } shape. Not schema-
+ *  validated input (unlike the record_findings tool path), so every field is
+ *  checked defensively. */
+function normalizeOpenQuestions(raw: unknown): OpenQuestion[] {
+  if (!Array.isArray(raw)) return [];
+  const out: OpenQuestion[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      if (item.trim()) {
+        out.push({ question: item, assumed_answer: "", confidence: "low", resolved: "assumed" });
+      }
+    } else if (item && typeof item === "object") {
+      const o = item as Record<string, unknown>;
+      if (typeof o.question === "string" && o.question.trim()) {
+        const confidence =
+          o.confidence === "high" || o.confidence === "medium" || o.confidence === "low"
+            ? o.confidence
+            : "low";
+        out.push({
+          question: o.question,
+          assumed_answer: typeof o.assumed_answer === "string" ? o.assumed_answer : "",
+          confidence,
+          resolved: "assumed",
+        });
+      }
+    }
+  }
+  return out;
+}
+
 /** Best-effort extraction of RoleFindings fields from malformed/partial JSON
  *  by matching quoted field values with regex. Only returns a result when at
  *  least verdict and summary can be extracted. */
@@ -519,9 +593,7 @@ function tryParseFindings(json: string): RoleFindings | null {
     return {
       verdict,
       summary: obj.summary,
-      open_questions: Array.isArray(obj.open_questions)
-        ? obj.open_questions.filter((q): q is string => typeof q === "string")
-        : [],
+      open_questions: normalizeOpenQuestions(obj.open_questions),
       coverage: Array.isArray(obj.coverage)
         ? (obj.coverage as CoverageItem[])
         : [],
@@ -604,7 +676,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       captured = {
         verdict: p.verdict,
         summary: p.summary,
-        open_questions: p.open_questions ?? [],
+        open_questions: (p.open_questions ?? []).map((q) => ({ ...q, resolved: "assumed" as const })),
         coverage: (p.coverage ?? []) as CoverageItem[],
         section_md: p.section_md,
         criteria_results: (p.criteria_results ?? []) as CriteriaResult[],
@@ -662,7 +734,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     cwd: params.repoPath,
     agentDir: getAgentDir(),
     settingsManager,
-    systemPrompt: params.systemPrompt + disciplineSuffix,
+    systemPrompt: params.systemPrompt + "\n\n" + disciplineSuffix,
     noExtensions: true,
     noSkills: true,
     noPromptTemplates: true,
@@ -675,8 +747,18 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   // `git_history` is a custom tool, not a pi builtin — pull it out of the builtin
   // allowlist and register it as a custom tool only for roles that opt in.
+  // `write`/`edit` are pi builtins too, but pi resolves their paths unguarded
+  // (plain path.resolve, no jail) — never let those reach the builtin allowlist
+  // either. They're only ever registered below as custom tools backed by our
+  // own worktree-jailed operations, and only when the resolved project harness
+  // policy allows it (independent of what the role's tools_json requests).
+  const harnessPolicy = params.harnessPolicy ?? DEFAULT_HARNESS_POLICY;
   const wantsGit = params.tools.includes(GIT_HISTORY_TOOL);
-  const builtinTools = params.tools.filter((t) => t !== GIT_HISTORY_TOOL);
+  const wantsWrite = params.tools.includes("write") && harnessPolicy.allowWrite;
+  const wantsEdit = params.tools.includes("edit") && harnessPolicy.allowWrite;
+  const builtinTools = params.tools.filter(
+    (t) => t !== GIT_HISTORY_TOOL && !(WRITE_TOOL_NAMES as readonly string[]).includes(t),
+  );
 
   // In textMode or twoPhase, strip record_findings from custom tools — the model
   // must output findings in text instead. write_artifact and git_history remain
@@ -685,6 +767,60 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const customTools: ReturnType<typeof defineTool>[] = [writeArtifact];
   if (wantsRecordFindings) customTools.unshift(recordFindings);
   if (wantsGit) customTools.push(gitHistory);
+
+  // Every fs operation the write/edit tools perform goes through this guard
+  // first — it's the only thing standing between a granted write/edit tool
+  // and the rest of the filesystem. A thrown error here propagates out of
+  // pi's tool `execute()` and is turned into a normal isError tool result by
+  // its agent-loop (verified against @earendil-works/pi-agent-core), so no
+  // try/catch is needed here.
+  const touchedRelPaths = new Set<string>();
+  if (wantsWrite || wantsEdit) {
+    if (!isWorktreePath(params.repoPath)) {
+      throw new Error(
+        `refusing to grant write/edit tools: repoPath "${params.repoPath}" is not an isolated task worktree`,
+      );
+    }
+    const guard = (absPath: string) => assertInsideWorktree(params.repoPath, absPath);
+    const recordTouched = (abs: string) => touchedRelPaths.add(path.relative(params.repoPath, abs));
+    if (wantsWrite) {
+      customTools.push(
+        defineTool(
+          createWriteToolDefinition(params.repoPath, {
+            operations: {
+              writeFile: async (absolutePath, content) => {
+                const abs = guard(absolutePath);
+                await fsp.writeFile(abs, content, "utf8");
+                recordTouched(abs);
+              },
+              mkdir: async (dir) => {
+                await fsp.mkdir(guard(dir), { recursive: true });
+              },
+            },
+          }),
+        ),
+      );
+    }
+    if (wantsEdit) {
+      customTools.push(
+        defineTool(
+          createEditToolDefinition(params.repoPath, {
+            operations: {
+              readFile: async (absolutePath) => fsp.readFile(guard(absolutePath)),
+              access: async (absolutePath) => {
+                await fsp.access(guard(absolutePath), fs.constants.R_OK | fs.constants.W_OK);
+              },
+              writeFile: async (absolutePath, content) => {
+                const abs = guard(absolutePath);
+                await fsp.writeFile(abs, content, "utf8");
+                recordTouched(abs);
+              },
+            },
+          }),
+        ),
+      );
+    }
+  }
 
   const { session } = await createAgentSession({
     cwd: params.repoPath,
@@ -952,5 +1088,6 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     phase,
     stopReason,
     thinkingText,
+    filesWritten: [...touchedRelPaths],
   };
 }

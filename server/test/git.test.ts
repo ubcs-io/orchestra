@@ -5,13 +5,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   appendArtifactSection,
   commitArtifacts,
+  currentBranch,
+  ensureWorktree,
   isGitRepo,
   moveArtifact,
   readArtifact,
+  reconcileBranch,
   refineCommitMessage,
+  removeWorktree,
   resolveInPlanning,
   scaffoldPlanning,
   scanIntake,
+  worktreePath,
   writeArtifact,
 } from "../src/git";
 import { gitLog, tempGitRepo } from "./helpers";
@@ -135,6 +140,106 @@ describe("commits", () => {
     );
     const long = refineCommitMessage("x", "t", "p".repeat(300));
     expect(long.length).toBeLessThan(160);
+  });
+});
+
+describe("worktrees", () => {
+  it("creates an isolated worktree on its own branch, off base", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+
+    expect(fs.existsSync(path.join(dir, "README.md"))).toBe(true);
+    expect(currentBranch(dir)).toBe("orchestra/task-1");
+    // The main checkout is untouched — worktree creation never switches it.
+    expect(currentBranch(r)).toBe(base);
+  });
+
+  it("is idempotent — re-asserting an existing worktree does not error or recreate it", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+    writeArtifact(path.join(dir, "marker.txt"), "still here");
+    expect(() => ensureWorktree(r, dir, "orchestra/task-1", base)).not.toThrow();
+    expect(fs.existsSync(path.join(dir, "marker.txt"))).toBe(true);
+  });
+
+  it("removeWorktree deletes the directory and lets a later ensureWorktree reattach to the same branch", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+    writeArtifact(path.join(dir, "work.md"), "in progress");
+    commitArtifacts(dir, ["work.md"], "wip");
+
+    removeWorktree(r, dir);
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // The branch (and its commit) survives — only the worktree checkout was removed.
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+    expect(fs.existsSync(path.join(dir, "work.md"))).toBe(true);
+  });
+});
+
+describe("reconcileBranch", () => {
+  it("merges a clean task branch back into base", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+    writeArtifact(path.join(dir, "PLANNING", "READY", "a.md"), "done");
+    commitArtifacts(dir, [path.join("PLANNING", "READY", "a.md")], "ready: a");
+
+    const result = reconcileBranch(dir, "orchestra/task-1", base);
+    expect(result.status).toBe("merged");
+    expect(fs.existsSync(path.join(r, "PLANNING", "READY", "a.md"))).toBe(true);
+    expect(currentBranch(r)).toBe(base);
+  });
+
+  it("reports up_to_date when the task branch has nothing new to contribute", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+    // No commits on the task branch beyond base.
+    const result = reconcileBranch(dir, "orchestra/task-1", base);
+    expect(result.status).toBe("up_to_date");
+  });
+
+  it("reports a conflict and leaves the task branch clean when base and task diverge on the same file", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+
+    // Task branch changes README.md.
+    writeArtifact(path.join(dir, "README.md"), "# task version\n");
+    commitArtifacts(dir, ["README.md"], "task: rewrite readme");
+
+    // Base moves too, touching the same file differently.
+    writeArtifact(path.join(r, "README.md"), "# base version\n");
+    commitArtifacts(r, ["README.md"], "base: rewrite readme");
+
+    const result = reconcileBranch(dir, "orchestra/task-1", base);
+    expect(result.status).toBe("conflict");
+    expect(result.detail).toContain("README.md");
+
+    // The task branch was left clean (merge --abort), not mid-conflict.
+    const status = execFileSync("git", ["status", "--porcelain"], { cwd: dir, encoding: "utf8" }).trim();
+    expect(status).toBe("");
+    expect(fs.readFileSync(path.join(dir, "README.md"), "utf8")).toBe("# task version\n");
+  });
+
+  it("reports an error (not a conflict) when the base branch doesn't exist", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const dir = worktreePath(r, "task-1");
+    ensureWorktree(r, dir, "orchestra/task-1", base);
+
+    const result = reconcileBranch(dir, "orchestra/task-1", "does-not-exist");
+    expect(result.status).toBe("error");
   });
 });
 

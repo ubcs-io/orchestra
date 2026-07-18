@@ -43,6 +43,7 @@ function fakeJsonRunner(responseText: string): RoleRunner {
     fallback: false,
     stalled: false,
     thinkingText: "",
+    filesWritten: [],
   });
 }
 

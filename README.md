@@ -26,11 +26,20 @@ INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY 
 1. **Intake.** Drop a file into `<repo>/PLANNING/INTAKE/` (or use the UI). It can be a stack trace, a one-line request, or a research question.
 2. **Ingest.** The orchestrator picks it up, creates a task, infers its kind (a `.log`/traceback → `error_file`), seeds a markdown artifact in `PLANNING/REFINING/`, and commits it.
 3. **Plan.** A routing template (flow) for the intake kind becomes the task's ordered list of roles. Each flow includes a **counter-reviewer** — a gate role that verifies prior output against predefined acceptance criteria — plus configurable loop-back and rigor settings.
-4. **Run.** One role at a time runs as a pi agent session: it reads/greps the real repo, then records a structured verdict + a **coverage** declaration (which concerns it examined vs. skipped) + a markdown section, which is appended to the artifact and committed (`refine(<role>): <task> — <purpose>`). Roles that support unreliable models can run in **two-phase** mode (exploration → formalization) or **text mode** (JSON output via markdown instead of native tool calls).
+4. **Run.** One role at a time runs as a pi agent session, in that task's own dedicated git worktree: it reads/greps the real repo, then records a structured verdict + a **coverage** declaration (which concerns it examined vs. skipped) + any **open questions** it couldn't fully resolve (each with its own best-effort guess and confidence, so it doesn't have to stall the pipeline) + a markdown section, which is appended to the artifact and committed (`refine(<role>): <task> — <purpose>`). That commit is recorded as the run's checkpoint. Roles that support unreliable models can run in **two-phase** mode (exploration → formalization) or **text mode** (JSON output via markdown instead of native tool calls).
 5. **Critique.** Depending on the flow's `reviewDepth` (`none` / `terminal_only` / `every_step`), a scoped adversarial **`critic`** role runs immediately after a step to check that single step's output for a domain-ending violation (PII exposure, authz bypass, irreversible data loss, etc.) — silence is the expected outcome, so it only speaks up for genuine, high-severity issues. Its verdict is folded into the step's effective verdict (never silently downgraded), and it's stored as its own `role_runs` row (`run_kind: "critique"`, linked via `target_run_id`) rather than replacing the primary run.
-6. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). A step-level critique blocker can also trigger a bounded loop-back independent of the flow's own reviewer. Spec tasks also spawn an epic→story→task child tree.
+6. **Gate.** After each role the orchestrator decides: keep refining, escalate to **REVIEW** (an ambiguity/blocker needing a human), or, once the terminal role runs, exit to **READY**. The counter-reviewer checks criteria; unmet "must" criteria loop back to the responsible role (up to `maxLoopbacks` times). A step-level critique blocker can also trigger a bounded loop-back independent of the flow's own reviewer. Spec tasks also spawn an epic→story→task child tree. On exit to READY, the task's dedicated branch is reconciled back into its base branch (best-effort — a conflict is recorded on the task rather than blocking the transition).
 
 State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirrors it on disk so the refinement history is version-controlled and PR-able.
+
+### Per-task git worktrees & concurrency
+
+Every task runs against its **own git worktree and branch** (`<repo>/.orchestra-worktrees/<taskId>`, off the project's base branch), created the first time the task touches the repo. This means:
+
+- **Tasks run concurrently** — the scheduler dispatches up to `maxConcurrentTasks` (default `3`) tasks' next role-step per round, each isolated in its own worktree, instead of the old strict one-role-at-a-time loop. A single task is still sequential against itself (a restore or answer-reincorporation can never race that task's own in-flight step) — only *distinct* tasks now overlap.
+- **Every completed role run leaves a checkpoint** — its post-commit SHA. `POST /api/tasks/:id/restore` (or the Task Detail role-run history) rolls a task back to right after any of its own prior roles, discarding everything after it.
+- **Branches reconcile once, on completion** — nothing is merged into your base branch mid-refinement; only the final gate step on Exit to READY merges the task branch back in, after first absorbing base into it.
+- **Worktrees are disk-cleaned on delete/reset; branches aren't** — a worktree is silently recreated the next time a task needs one (including after a restore), so no state is lost, just the checkout.
 
 ### Intake kinds & flow rigor
 
@@ -56,7 +65,8 @@ Ten intake kinds are supported, each with a dedicated flow:
 ### Live visibility & steering
 - **Live pane** — Server-Sent Events stream the active role's reasoning and every file it reads, in real time, as structured typed events (role/tool boundaries, thinking, text, status) with inline markdown highlighting — not just a raw log.
 - **Coverage map** — each role declares which concerns (correctness, security, privacy, performance, accessibility, edge-cases, tests, dependencies, data, ux, docs) it examined, skipped, or ignored, so *omissions are visible* (you can see privacy was never looked at).
-- **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, create child **subtasks**, mark a task **won't do**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
+- **Steering** — per task you can pause/resume, re-run or **deepen** a role, **inject** a one-off role mid-plan, add a steer note / pin a question, **reset** a task to intake, **restore** it to the git checkpoint left by any of its own prior roles, create child **subtasks**, mark a task **won't do**, or **promote** an injected role into standing project policy that auto-runs on future tasks.
+- **Open questions & answer reincorporation** — a role can record open questions it couldn't fully resolve, each with its own best-effort guess and confidence, instead of stalling the pipeline on them. Answer one later (even after the task reaches REVIEW) and, if the optional `answerReincorporation` router advisor is enabled, a genuinely contradicting answer automatically restores the task to that role's checkpoint and re-runs downstream work with the correction.
 - **Review CTA & question decomposition** — the Task Detail page surfaces a review call-to-action distilled from the artifact's action items, coverage gaps, and open questions raised by roles; any open question can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), which itself gets a full task page (and can recursively decompose its own open questions) plus an inline chat box on the parent for quick follow-up without leaving the page.
 
 ![Interactive live view — SSE role/tool stream, current state, steering, and coverage map](docs/public/screenshots/interactive-live-view.png)
@@ -86,12 +96,13 @@ The **`/models`** page manages named model configs — reusable endpoint + model
 
 ### Strategic LLM routing advisors (experimental)
 
-Beyond the deterministic router, `server/src/router.ts` provides four **optional, narrowly-scoped advisory LLM calls** at decision points where heuristics are weakest. Each call point is independently toggleable, off by default, has a hard timeout, and falls back to the heuristic default on failure or when disabled — the orchestrator always owns the final decision:
+Beyond the deterministic router, `server/src/router.ts` provides five **optional, narrowly-scoped advisory LLM calls** at decision points where heuristics are weakest. Each call point is independently toggleable, off by default, has a hard timeout, and falls back to the heuristic default on failure or when disabled — the orchestrator always owns the final decision:
 
 1. **Question distillation** — after a role produces open questions, distill and de-duplicate them.
 2. **Escalation assessment** — before escalating to human REVIEW, decide whether to actually `escalate`, `reroute`, `rerun`, or `close`.
 3. **Borderline gate assessment** — for partial-criteria or near-loopback-exhaustion gate decisions, choose `loopback`, `proceed`, `proceed_with_note`, `escalate`, or `narrow_loopback`.
 4. **Second review** — after every critiqued step, authoritatively synthesize the primary run and the critic's critique into `accept`, `accept_with_note`, `escalate`, or `loopback` — this is what lets a real critic false-positive get overturned instead of always forcing a loop-back.
+5. **Answer match assessment** — when a human answers an open question on a task already at REVIEW, compare the answer against the role's recorded guess: `confirms` or `contradicts`. A `contradicts` result restores the task to that role's checkpoint and re-runs downstream steps with the corrected answer.
 
 ---
 
@@ -144,6 +155,7 @@ Resolution order (lowest → highest precedence): built-in defaults → `config.
 | `dbPath` | `ORCHESTRA_DB_PATH` | `./orchestra.db` | SQLite file (WAL). |
 | `schedulerIdleMs` | `ORCHESTRA_SCHEDULER_IDLE_MS` | `3000` | Idle poll interval when there's no work. |
 | `roleToolBudget` | — | `40` | Max tool-calling turns per role run. |
+| `maxConcurrentTasks` | `ORCHESTRA_MAX_CONCURRENT_TASKS` | `3` | Max tasks the scheduler runs role-steps for concurrently, each in its own git worktree. |
 | `clientDir` | — | `<server>/public` | Built SPA directory served in production. |
 
 ### Runtime-editable connection profiles
@@ -170,7 +182,7 @@ Beyond the bootstrap config, connection settings are stored in SQLite and editab
 
 ## Architecture
 
-One Node process is the whole app — **the server *is* the daemon**. `server/main.ts` boots the DB, seeds the role catalog and connection profile, serves the REST + SSE API and the built client, and starts the orchestrator loop, all in-process. No external broker, queue, or cron: **SQLite is the durable work queue**, and the scheduler is a single re-entrant, mutex-serialized async loop (strict single-worker sequential). It's crash-safe — restart and it resumes in-flight tasks from the DB.
+One Node process is the whole app — **the server *is* the daemon**. `server/main.ts` boots the DB, seeds the role catalog and connection profile, serves the REST + SSE API and the built client, and starts the orchestrator loop, all in-process. No external broker, queue, or cron: **SQLite is the durable work queue**. Each scheduler round dispatches up to `maxConcurrentTasks` tasks' next role-step concurrently, each in its own git worktree/branch — a single task is still strictly serialized against itself, but distinct tasks now run in parallel rather than taking turns. It's crash-safe — restart and it resumes in-flight tasks from the DB (worktrees are recreated on demand if missing).
 
 - **Backend:** Fastify (REST + SSE), better-sqlite3 (WAL), pi (`@earendil-works/pi-*`) for provider-agnostic, repo-aware agents.
 - **Frontend:** Vite + React SPA, TanStack Router + TanStack Query, native `EventSource` for the live stream.
@@ -188,7 +200,7 @@ server/                one Node daemon (we own main())
   src/roles.ts         role catalog (24 roles), flow templates, acceptance criteria, seed data
   src/orchestrator.ts  ingest → plan → run → critique → gate + scheduler + loop-back
   src/router.ts        strategic LLM routing advisors (question distillation, escalation, borderline gate, second review)
-  src/git.ts           PLANNING scaffold + sandboxed artifact writes + commits
+  src/git.ts           PLANNING scaffold + sandboxed artifact writes/commits + per-task worktrees + branch reconciliation
   src/bus.ts           in-process pub/sub for the SSE stream
   src/routes/          Fastify REST (api.ts) + SSE (sse.ts) + safety controls (safety.ts)
   test/                Vitest test suite (agent, db, git, orchestrator, roles, router)
@@ -290,7 +302,10 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | POST | `/api/model-configs/:id/set-default` | Set a model config as the global default. |
 | POST | `/api/model-configs/reorder` | Reorder model configs (drag-and-drop priority). |
 | POST | `/api/model-stats` | Radar/stats-table data per model config (params, quant score, cost, historical usage). |
+| GET | `/api/ping-model/:id` | Live connectivity check against a single model config. |
 | GET | `/api/ping-network/stream` | SSE: live connectivity check against every configured model endpoint. |
+| GET | `/api/roles` | List all roles, global + merged with a project's overrides. |
+| GET | `/api/roles/stats` | Per-role-key usage stats (calls, pass count, counter-reviewer passes, network count, total tokens) aggregated across all projects. |
 | GET | `/api/scheduler` · POST `/api/scheduler/{start,stop}` · POST `/api/tick` | Loop control / manual single step. |
 | GET · POST | `/api/projects` · GET · PATCH · DELETE `/api/projects/:id` | Projects. |
 | GET | `/api/projects/:id/roles` · PUT `/api/projects/:id/roles/:key` | Per-project role config (prompt, tools, model, enabled). |
@@ -309,10 +324,11 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 | GET | `/api/tasks` · GET · DELETE `/api/tasks/:id` | Tasks + full detail (runs, coverage, plan, children, flow). |
 | PATCH | `/api/tasks/:id` | Edit a task's name/content while in intake stage. |
 | POST | `/api/tasks/:id/reset` | Reset a task to intake state (clears history). |
+| POST | `/api/tasks/:id/restore` | Roll a task back to the git checkpoint left by one of its own role runs (`{ role_run_id }`). |
 | POST | `/api/tasks/:id/subtasks` | Create a child task under a parent. |
 | POST | `/api/tasks/:id/questions/decompose` | Spin an open review question off into its own child Question Flow subtask (idempotent per question). |
 | POST | `/api/tasks/:id/chat` | Send a follow-up chat message against a task (used by the inline decomposed-child preview). |
-| POST | `/api/tasks/:id/interventions` | Steering: `pause`/`resume`/`rerun_role`/`deepen`/`inject_role`/`steer_note`/`pin_question`/`promote_role`/`run_now`/`wont_do`. |
+| POST | `/api/tasks/:id/interventions` | Steering: `pause`/`resume`/`deepen`/`inject_role`/`steer_note`/`pin_question`/`promote_role`/`run_now`/`wont_do`/`question_answer`. |
 | GET | `/api/tasks/:id/stream` | SSE: live role/tool/text events. |
 | GET · PATCH | `/api/safety` | Safety/pi dev controls (read agent boundaries, limits, gates, role summary; edit `role_tool_budget`). |
 
@@ -320,10 +336,10 @@ REST is served under `/api`; the live stream is SSE. Safety/dev controls are und
 
 ## Deployment (headless / tailnet)
 
-The single process is designed to run on a headless box under **systemd** (or pm2/Docker with a restart policy), bound to the tailnet interface; other clients reach the UI/API/SSE over Tailscale. There is **no auth** — the tailnet is the trust boundary. Multiple clients can watch and steer the same task concurrently; steering actions are POSTs, execution is serialized by the single worker, and SSE fans live progress to every viewer.
+The single process is designed to run on a headless box under **systemd** (or pm2/Docker with a restart policy), bound to the tailnet interface; other clients reach the UI/API/SSE over Tailscale. There is **no auth** — the tailnet is the trust boundary. Multiple clients can watch and steer the same task concurrently; steering actions are POSTs, up to `maxConcurrentTasks` tasks execute their role-steps in parallel (each in its own worktree), a given task's own steps/restores are still serialized against each other, and SSE fans live progress to every viewer.
 
 ---
 
 ## Status
 
-The full pipeline — ingest, planning, role execution (including two-phase and text mode for unreliable tool-calling models), per-step adversarial critique, gating with counter-reviewers and loop-back, optional LLM routing advisors, coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs with usage stats and network ping, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions, critique), router (advisory call points, fallback behavior), database, git operations, and roles.
+The full pipeline — ingest, planning, concurrent role execution across per-task git worktrees (including two-phase and text mode for unreliable tool-calling models), per-step adversarial critique, gating with counter-reviewers and loop-back, checkpoint restore, branch reconciliation, optional LLM routing advisors (including answer reincorporation), coverage rollup, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs with usage stats and network ping, and the React UI — is implemented and typechecks/builds. Successful *LLM* refinement depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest test suite covers the agent (think splitting, stall detection, text-mode extraction), orchestrator (plan mutation, gating, loop-back, interventions, critique, concurrent scheduling), router (advisory call points, fallback behavior), database, git operations (worktrees, reconciliation), and roles.

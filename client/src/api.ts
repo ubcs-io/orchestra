@@ -29,6 +29,20 @@ export interface Task {
   network_id: string | null;
   origin_role_key: string | null;
   origin_question: string | null;
+  parent_task_id: string | null;
+  task_type: string | null;
+  /** Set when a later answer invalidated an assumption the parent task made
+   *  while spawning this decomposition child — flagged for human triage. */
+  stale_reason: string | null;
+  git_branch: string | null;
+  git_base_branch: string | null;
+  /** Outcome of merging this task's branch back into base on completion.
+   *  "pending_human_merge" means a role wrote real source (not just PLANNING
+   *  artifacts this run) — the branch was deliberately left unmerged for
+   *  manual review instead of auto-merging into base. */
+  reconcile_status: string | null;
+  reconcile_detail: string | null;
+  created_at: string | null;
 }
 
 export interface RoleRun {
@@ -46,10 +60,14 @@ export interface RoleRun {
   depth: number;
   model: string | null;
   open_questions_json: string | null;
+  coverage_json: string | null;
   /** The primary run this critiques/second-reviews, if this is not itself a primary run. */
   target_run_id: number | null;
   /** "primary" | "critique" | "second_review". */
   run_kind: string;
+  /** Checkpoint commit created right after this run's artifact commit — null if
+   *  the commit was a no-op/failed, or the run predates the checkpointing feature. */
+  git_commit_sha: string | null;
   created_at: string;
 }
 
@@ -284,6 +302,12 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Per-project write-access policy — see server/src/harness-policy.ts. */
+export interface HarnessPolicy {
+  allowWrite: boolean;
+  denyGlobs?: string[];
+}
+
 /** GET /api/safety response shape. */
 export interface SafetyResponse {
   agent_tools: {
@@ -293,6 +317,11 @@ export interface SafetyResponse {
     cross_repo_access: boolean;
     source_code_writes: boolean;
     git_history_available: boolean;
+    worktree_jail: boolean;
+  };
+  harness_policy: {
+    global_default: HarnessPolicy;
+    projects: Array<{ id: number; name: string; allow_write: boolean; roles_with_write: string[] }>;
   };
   limits: {
     role_tool_budget: number;
@@ -352,6 +381,8 @@ export interface PingResult {
   available: boolean;
   error?: string;
   status: "checking" | "done";
+  /** Server-provided location label: "local" | "api" | null */
+  location?: string | null;
 }
 
 export interface PingResultInit {
@@ -359,7 +390,17 @@ export interface PingResultInit {
     config_id: number;
     name: string;
     base_url: string;
+    location?: string | null;
   }>;
+}
+
+export interface RoleStats {
+  role_key: string;
+  total_calls: number;
+  pass_count: number;
+  counter_reviewer_passes: number;
+  network_count: number;
+  total_tokens: number;
 }
 
 export const api = {
@@ -383,11 +424,21 @@ export const api = {
   project: (id: number) => req<{ project: Project; roles: Role[] }>(`/api/projects/${id}`),
   createProject: (body: { name: string; repo_path: string; default_model?: string }) =>
     req<{ project: Project }>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
+  updateProject: (id: number, body: { default_model?: string | null }) =>
+    req<{ project: Project }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   roles: (projectId: number) => req<{ roles: Role[] }>(`/api/projects/${projectId}/roles`),
   saveRole: (projectId: number, key: string, body: Partial<Role>) =>
     req<{ role: Role }>(`/api/projects/${projectId}/roles/${key}`, {
       method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  harnessPolicy: (projectId: number) =>
+    req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`),
+  saveHarnessPolicy: (projectId: number, body: { allowWrite: boolean }) =>
+    req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`, {
+      method: "PATCH",
       body: JSON.stringify(body),
     }),
 
@@ -398,6 +449,12 @@ export const api = {
     req<{ ok: boolean }>(`/api/tasks/${taskId}${removePlan ? "?removePlan=true" : ""}`, { method: "DELETE" }),
 
   resetTask: (taskId: string) => req<{ task: Task }>(`/api/tasks/${taskId}/reset`, { method: "POST" }),
+
+  restoreTask: (taskId: string, roleRunId: number) =>
+    req<TaskDetail>(`/api/tasks/${taskId}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ role_run_id: roleRunId }),
+    }),
 
   updateTask: (taskId: string, body: { name?: string; content?: string }) =>
     req<TaskDetail>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -481,6 +538,7 @@ export const api = {
     req<{ export: NetworkExport }>(`/api/networks/${networkId}/export`),
   allRoles: (projectId?: number) =>
     req<{ roles: Role[] }>(`/api/roles${projectId ? `?project_id=${projectId}` : ""}`),
+  roleStats: () => req<{ stats: RoleStats[] }>("/api/roles/stats"),
 
   // Folder picker dialog
   pickFolder: () =>
@@ -529,6 +587,10 @@ export const api = {
     req<{ ok: boolean }>("/api/model-configs/reorder", { method: "POST", body: JSON.stringify({ ids }) }),
   setDefaultModelConfig: (id: number) =>
     req<{ config: ModelConfig }>(`/api/model-configs/${id}/set-default`, { method: "POST" }),
+
+  /** Ping a single model config to check health. */
+  pingModel: (configId: number) =>
+    req<{ config_id: number; available: boolean; error?: string }>(`/api/ping-model/${configId}`),
 
   // Summary dashboard
   summary: () => req<SummaryStats>("/api/summary"),

@@ -65,20 +65,51 @@ function extractActionItems(
   return items.slice(0, 8);
 }
 
+/** A role's open question together with its own best-effort guess — mirrors
+ *  server/src/agent.ts's OpenQuestion. Tolerates the legacy plain-string form
+ *  stored before questions carried a guess/confidence/resolution. */
+export interface ClientOpenQuestion {
+  question: string;
+  assumed_answer: string;
+  confidence: "low" | "medium" | "high";
+  resolved: "assumed" | "confirmed" | "invalidated";
+}
+
+export function normalizeQuestion(raw: unknown): ClientOpenQuestion | null {
+  if (typeof raw === "string") {
+    return raw.trim()
+      ? { question: raw, assumed_answer: "", confidence: "low", resolved: "assumed" }
+      : null;
+  }
+  if (raw && typeof raw === "object" && typeof (raw as { question?: unknown }).question === "string") {
+    const o = raw as Partial<ClientOpenQuestion>;
+    return {
+      question: o.question!,
+      assumed_answer: o.assumed_answer ?? "",
+      confidence: o.confidence ?? "low",
+      resolved: o.resolved ?? "assumed",
+    };
+  }
+  return null;
+}
+
 /** Collect all open questions grouped by role, skipping runs with no questions. */
-function collectQuestions(
+export function collectQuestions(
   runs: RoleRun[],
-): Array<{ runId: number; roleKey: string; questions: string[] }> {
+): Array<{ runId: number; roleKey: string; questions: ClientOpenQuestion[] }> {
   const groups: Array<{
     runId: number;
     roleKey: string;
-    questions: string[];
+    questions: ClientOpenQuestion[];
   }> = [];
   for (const r of runs) {
     try {
-      const parsed = JSON.parse(r.open_questions_json ?? "[]") as string[];
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        groups.push({ runId: r.id, roleKey: r.role_key, questions: parsed });
+      const parsed = JSON.parse(r.open_questions_json ?? "[]") as unknown[];
+      const questions = Array.isArray(parsed)
+        ? parsed.map(normalizeQuestion).filter((q): q is ClientOpenQuestion => q !== null)
+        : [];
+      if (questions.length > 0) {
+        groups.push({ runId: r.id, roleKey: r.role_key, questions });
       }
     } catch {
       /* skip malformed */
@@ -221,37 +252,35 @@ export function ReviewCTA({
                     {group.roleKey}
                   </span>
                   {group.questions.map((rawQ, qi) => {
-                    const answerKey = `${group.roleKey}:${rawQ}`;
+                    const answerKey = `${group.roleKey}:${rawQ.question}`;
                     const val = questionAnswers[answerKey] ?? "";
                     const decomposedChild = childTasks.find(
                       (c) =>
                         c.origin_role_key === group.roleKey &&
-                        c.origin_question === rawQ,
+                        c.origin_question === rawQ.question,
                     );
                     return (
-                      <div key={qi} style={{ marginBottom: 6 }}>
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: 6,
-                            alignItems: "center",
-                          }}
-                        >
-                          <span
-                            style={{
-                              flex: 1,
-                              fontSize: 12,
-                              color: "var(--ink)",
-                            }}
-                          >
-                            {rawQ}
-                          </span>
+                      <div key={qi} className="question-item">
+                        <p className="question-text">{rawQ.question}</p>
+                        {rawQ.assumed_answer && (
+                          <p className="question-default">
+                            best-effort guess ({rawQ.confidence}):{" "}
+                            <strong>{rawQ.assumed_answer}</strong>
+                            {rawQ.resolved === "confirmed" && (
+                              <span className="pill dim" style={{ marginLeft: 6 }}>
+                                confirmed
+                              </span>
+                            )}
+                            {rawQ.resolved === "invalidated" && (
+                              <span className="pill bad" style={{ marginLeft: 6 }}>
+                                corrected
+                              </span>
+                            )}
+                          </p>
+                        )}
+                        <div className="question-answer-row">
                           <input
-                            style={{
-                              width: 180,
-                              fontSize: 12,
-                              padding: "3px 6px",
-                            }}
+                            className="question-answer-input"
                             value={val}
                             onChange={(e) =>
                               setQuestionAnswers((prev) => ({
@@ -261,7 +290,7 @@ export function ReviewCTA({
                             }
                             onKeyDown={(e) => {
                               if (e.key === "Enter" && val.trim()) {
-                                submitAnswer(group.roleKey, rawQ, val);
+                                submitAnswer(group.roleKey, rawQ.question, val);
                               }
                             }}
                             placeholder="answer…"
@@ -271,7 +300,7 @@ export function ReviewCTA({
                             disabled={!val.trim()}
                             style={{ padding: "2px 6px" }}
                             onClick={() =>
-                              submitAnswer(group.roleKey, rawQ, val)
+                              submitAnswer(group.roleKey, rawQ.question, val)
                             }
                           >
                             ✓
@@ -280,7 +309,7 @@ export function ReviewCTA({
                             <QuestionDecomposeButton
                               parentTaskId={taskId}
                               roleKey={group.roleKey}
-                              question={rawQ}
+                              question={rawQ.question}
                               onMutate={onMutate}
                             />
                           )}
@@ -416,37 +445,35 @@ export function ReviewCTA({
                     {group.roleKey}
                   </span>
                   {group.questions.map((rawQ, qi) => {
-                    const answerKey = `${group.roleKey}:${rawQ}`;
+                    const answerKey = `${group.roleKey}:${rawQ.question}`;
                     const val = questionAnswers[answerKey] ?? "";
                     const decomposedChild = childTasks.find(
                       (c) =>
                         c.origin_role_key === group.roleKey &&
-                        c.origin_question === rawQ,
+                        c.origin_question === rawQ.question,
                     );
                     return (
-                      <div key={qi} style={{ marginBottom: 6 }}>
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: 6,
-                            alignItems: "center",
-                          }}
-                        >
-                          <span
-                            style={{
-                              flex: 1,
-                              fontSize: 12,
-                              color: "var(--ink)",
-                            }}
-                          >
-                            {rawQ}
-                          </span>
+                      <div key={qi} className="question-item">
+                        <p className="question-text">{rawQ.question}</p>
+                        {rawQ.assumed_answer && (
+                          <p className="question-default">
+                            best-effort guess ({rawQ.confidence}):{" "}
+                            <strong>{rawQ.assumed_answer}</strong>
+                            {rawQ.resolved === "confirmed" && (
+                              <span className="pill dim" style={{ marginLeft: 6 }}>
+                                confirmed
+                              </span>
+                            )}
+                            {rawQ.resolved === "invalidated" && (
+                              <span className="pill bad" style={{ marginLeft: 6 }}>
+                                corrected
+                              </span>
+                            )}
+                          </p>
+                        )}
+                        <div className="question-answer-row">
                           <input
-                            style={{
-                              width: 180,
-                              fontSize: 12,
-                              padding: "3px 6px",
-                            }}
+                            className="question-answer-input"
                             value={val}
                             onChange={(e) =>
                               setQuestionAnswers((prev) => ({
@@ -456,7 +483,7 @@ export function ReviewCTA({
                             }
                             onKeyDown={(e) => {
                               if (e.key === "Enter" && val.trim()) {
-                                submitAnswer(group.roleKey, rawQ, val);
+                                submitAnswer(group.roleKey, rawQ.question, val);
                               }
                             }}
                             placeholder="answer…"
@@ -466,7 +493,7 @@ export function ReviewCTA({
                             disabled={!val.trim()}
                             style={{ padding: "2px 6px" }}
                             onClick={() =>
-                              submitAnswer(group.roleKey, rawQ, val)
+                              submitAnswer(group.roleKey, rawQ.question, val)
                             }
                           >
                             ✓
@@ -475,7 +502,7 @@ export function ReviewCTA({
                             <QuestionDecomposeButton
                               parentTaskId={taskId}
                               roleKey={group.roleKey}
-                              question={rawQ}
+                              question={rawQ.question}
                               onMutate={onMutate}
                             />
                           )}

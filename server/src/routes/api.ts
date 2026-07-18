@@ -29,6 +29,7 @@ import {
   getNetwork,
   getNetworkByIntakeKind,
   getProject,
+  getRoleStats,
   getTask,
   listChatMessages,
   listInterventions,
@@ -49,10 +50,12 @@ import {
   upsertConfig,
   upsertRole,
 } from "../db.js";
+import { resolveHarnessPolicy, validateToolsJson } from "../harness-policy.js";
 import {
   commitArtifacts,
   isGitRepo,
   removeFile,
+  removeWorktree,
   sanitizePath,
   scaffoldPlanning,
   writeArtifact,
@@ -68,10 +71,14 @@ import {
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   artifactName,
+  ensureTaskWorkspace,
   isSchedulerRunning,
   isSchedulerStopping,
+  reincorporateAnswer,
+  restoreCheckpoint,
   startScheduler,
   stopScheduler,
+  taskRepoPath,
   tick,
 } from "../orchestrator.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
@@ -643,6 +650,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     return { ok: true };
   });
 
+  // ---- Role stats (aggregated across all projects) ----
+  app.get("/api/roles/stats", async () => {
+    return { stats: getRoleStats() };
+  });
+
   // ---- Roles (per project, merged with globals) ----
   app.get("/api/projects/:id/roles", async (req: FastifyRequest) => {
     const id = Number((req.params as { id: string }).id);
@@ -652,8 +664,15 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   app.put("/api/projects/:id/roles/:key", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string; key: string }).id);
     const key = (req.params as { key: string }).key;
-    if (!getProject(id)) return bad(reply, 404, "project not found");
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
     const body = (req.body ?? {}) as Record<string, unknown>;
+
+    if (typeof body.tools_json === "string") {
+      const validation = validateToolsJson(body.tools_json, resolveHarnessPolicy(project.config_json));
+      if (!validation.ok) return bad(reply, 400, validation.error);
+    }
+
     const role = upsertRole({
       project_id: id,
       key,
@@ -666,6 +685,41 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       can_create_subtasks: body.can_create_subtasks as boolean | undefined,
     });
     return { role };
+  });
+
+  // ---- Harness policy (per project): gates write/edit tool grants ----
+  app.get("/api/projects/:id/harness-policy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { policy: resolveHarnessPolicy(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/harness-policy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { allowWrite?: boolean };
+    if (typeof body.allowWrite !== "boolean") return bad(reply, 400, "allowWrite (boolean) is required");
+
+    // Merge into the existing config_json.harness sub-key, preserving any other
+    // top-level keys (e.g. router) already present — same merge-not-clobber
+    // approach the roles PUT above uses for tools_json. Deliberately not the
+    // generic PATCH /api/projects/:id (which accepts arbitrary config_json with
+    // no shape validation) — a policy gating real filesystem writes must not be
+    // silently disabled by a malformed/blank config_json PATCH.
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = {
+      ...existing,
+      harness: { ...(existing.harness as object | undefined), allowWrite: body.allowWrite },
+    };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    return { policy: resolveHarnessPolicy(updated?.config_json ?? null) };
   });
 
   // ---- Tasks ----
@@ -689,19 +743,22 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const taskId = (req.params as { id: string }).id;
     const q = req.query as { removePlan?: string };
 
-    // Resolve artifact path before deletion so we know what to delete on disk.
+    // Resolve artifact/worktree paths before deletion so we know what to
+    // clean up on disk.
     const task = getTask(taskId);
     const artifactRel = task?.artifact_path ?? null;
+    const project = task?.project_id != null ? getProject(task.project_id) : undefined;
 
     deleteTask(taskId);
 
     // Optionally remove the .md plan/output file from disk.
-    if (q.removePlan === "true" && artifactRel && task?.project_id) {
-      const project = getProject(task.project_id);
-      if (project) {
-        const absPath = path.join(project.repo_path, artifactRel);
-        removeFile(absPath);
-      }
+    if (q.removePlan === "true" && artifactRel && project) {
+      removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
+    }
+    // The worktree itself is a disk-consuming resource, unlike the cheap
+    // branch ref it sits on — clean it up whenever the task is deleted.
+    if (task?.git_worktree_path && project) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
     return { ok: true };
@@ -733,18 +790,40 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const taskId = (req.params as { id: string }).id;
     const task = getTask(taskId);
     if (!task) return bad(reply, 404, "task not found");
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
 
     // Remove the output .md file from disk if one exists.
-    if (task.artifact_path && task.project_id) {
-      const project = getProject(task.project_id);
-      if (project) {
-        removeFile(path.join(project.repo_path, task.artifact_path));
-      }
+    if (task.artifact_path && project) {
+      removeFile(path.join(task.git_worktree_path ?? project.repo_path, task.artifact_path));
+    }
+    // Same disk-cost reasoning as delete: drop the worktree now, but leave
+    // the branch ref alone — ensureTaskWorkspace recreates the worktree onto
+    // it next time this task does any work.
+    if (task.git_worktree_path && project) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
     const updated = resetTask(taskId);
     if (!updated) return bad(reply, 500, "reset failed");
     return { task: updated };
+  });
+
+  // Restore a task to the checkpoint left by one of its role runs — discards
+  // every run after it and resets the branch/plan/task state to that point.
+  app.post("/api/tasks/:id/restore", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "task not found");
+
+    const body = (req.body ?? {}) as { role_run_id?: number };
+    if (typeof body.role_run_id !== "number") return bad(reply, 400, "role_run_id is required");
+
+    try {
+      await restoreCheckpoint(taskId, body.role_run_id);
+    } catch (err) {
+      return bad(reply, 400, (err as Error).message);
+    }
+    return taskDetail(taskId);
   });
 
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.
@@ -881,7 +960,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       const shortTitle = words.slice(0, 6).join(" ");
       const name = `Q: ${shortTitle}${words.length > 6 ? "…" : ""}`;
 
-      const child = createTask({
+      let child = createTask({
         name,
         content: digest,
         project_id: project.id,
@@ -895,17 +974,21 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         origin_role_key: body.role_key,
         origin_question: question,
       });
+      // Give this child its own worktree before writing anything, so the
+      // intake commit lands in isolated history from the start (mirrors
+      // ingestProject/createDecompositionChildren, not the shared checkout).
+      child = ensureTaskWorkspace(child, project);
+      const childRepo = taskRepoPath(child, project);
 
       const planningDir = project.planning_dir || "PLANNING";
       const relArtifact = path.join(planningDir, "REFINING", artifactName(child));
-      const absArtifact = path.join(project.repo_path, relArtifact);
       writeArtifact(
-        absArtifact,
+        path.join(childRepo, relArtifact),
         `# ${name}\n\n> Follow-up question from **${parent.name ?? parent.task_id.slice(0, 8)}** ` +
           `(role: \`${body.role_key}\`)\n\n${digest}\n`,
       );
       updateTask(child.task_id, { artifact_path: relArtifact });
-      commitArtifacts(project.repo_path, [relArtifact], `intake(question): ${name}`);
+      commitArtifacts(childRepo, [relArtifact], `intake(question): ${name}`);
       publish(child.task_id, "task_update", { stage: "intake" });
 
       return reply.code(201).send({ task: getTask(child.task_id), created: true });
@@ -953,10 +1036,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const modelRef = task.model || project.default_model || null;
     const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
 
+    const chatRepoPath = taskRepoPath(task, project);
     const result = await runRole({
-      repoPath: project.repo_path,
+      repoPath: chatRepoPath,
       planningDir: project.planning_dir || "PLANNING",
-      artifactAbsPath: path.join(project.repo_path, task.artifact_path ?? ""),
+      artifactAbsPath: path.join(chatRepoPath, task.artifact_path ?? ""),
       modelId,
       systemPrompt: CHAT_SYSTEM_PROMPT,
       tools: [],
@@ -990,7 +1074,23 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       kind: body.kind,
       payload_json: body.payload ? JSON.stringify(body.payload) : null,
     });
-    return { intervention: iv };
+    // A question_answer on a task already in review has no scheduler pass
+    // coming to consume it (pickNextTask only selects intake/refining tasks) —
+    // trigger reincorporation directly so answering a question there isn't a
+    // silent no-op. No-ops itself if the router's answerReincorporation call
+    // point is disabled, the task isn't at stage:review, or the question
+    // doesn't match a recorded guess.
+    if (body.kind === "question_answer" && task.stage === "review") {
+      const p = (body.payload ?? {}) as { question?: string; answer?: string };
+      if (p.question && p.answer) {
+        try {
+          await reincorporateAnswer(task.task_id, p.question, p.answer);
+        } catch (err) {
+          console.warn(`[api] reincorporateAnswer failed: ${(err as Error).message}`);
+        }
+      }
+    }
+    return { intervention: iv, task: getTask(task.task_id) };
   });
 
   // ---- Agent Networks (visual flow templates) ----
@@ -1662,6 +1762,36 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     return { stats };
   });
 
+  // ---- Ping single model config — returns health status for one config ----
+  app.get("/api/ping-model/:id", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as Record<string, string>).id);
+    if (!id || isNaN(id)) return bad(reply, 400, "Missing or invalid :id");
+    const cfg = getConfigById(id);
+    if (!cfg) return bad(reply, 404, "Config not found");
+
+    const baseUrl = (cfg.base_url ?? "").trim();
+    if (!baseUrl) {
+      return { config_id: id, available: false, error: "No base URL configured" };
+    }
+
+    try {
+      const url = baseUrl.replace(/\/+$/, "") + "/models";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8_000);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const apiKey = cfg.api_key?.trim();
+      const envKey = envTokenForModel(cfg.name);
+      const authKey = apiKey || envKey;
+      if (authKey) headers.Authorization = `Bearer ${authKey}`;
+      const res = await fetch(url, { headers, signal: controller.signal });
+      clearTimeout(timer);
+      return { config_id: id, available: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+    } catch (err) {
+      const msg = (err as Error).message;
+      return { config_id: id, available: false, error: msg === "This operation was aborted" ? "aborted" : msg };
+    }
+  });
+
   // ---- Ping network: SSE stream — sends full list immediately, then updates as each ping returns ----
   app.get("/api/ping-network/stream", async (req: FastifyRequest, reply: FastifyReply) => {
     const configs = listModelConfigs();
@@ -1684,6 +1814,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         config_id: cfg.id,
         name: cfg.name ?? cfg.key,
         base_url: (cfg.base_url ?? "").trim(),
+        location: locationLabel(cfg.base_url),
       })),
     });
 
@@ -1715,10 +1846,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
           error: res.ok ? undefined : `HTTP ${res.status}`,
         });
       } catch (err) {
+        const msg = (err as Error).message;
         send("result", {
           config_id: cfg.id,
           available: false,
-          error: (err as Error).message,
+          error: msg === "This operation was aborted" ? "aborted" : msg,
         });
       }
     });

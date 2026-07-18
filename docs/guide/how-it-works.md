@@ -36,14 +36,17 @@ A **flow template** for the intake kind becomes the task's ordered list of roles
 
 ## Stage 4: Run
 
-One role at a time runs as a pi agent session. Each role:
+One role at a time runs as a pi agent session, against that task's own [dedicated git worktree](#git-isolation-concurrency). Each role:
 
 1. Reads/greps the real repository using its assigned tools
 2. Records a structured **verdict** (`pass`, `needs_more`, `blocker`, `needs_human`)
 3. Declares a **coverage map** — which concerns it examined, skipped, or ignored
-4. Appends a markdown section to the artifact, then commits (`refine(<role>): <task> — <purpose>`)
+4. Records any **open questions** it couldn't fully resolve, each with its own best-effort guess (`assumed_answer`) and a `confidence` (`low`/`medium`/`high`) — so an ordinary open question doesn't need to stall the pipeline with `blocker`/`needs_human`; those verdicts are reserved for questions with no reasonable guess at all
+5. Appends a markdown section to the artifact, then commits (`refine(<role>): <task> — <purpose>`) — the resulting commit SHA is recorded on the run as its **checkpoint**, so the task can later be [restored](/guide/steering#task-lifecycle) back to right after this step
 
 Roles that struggle with native tool calling can run in **two-phase mode** (exploration → JSON formalization) or **text mode** (JSON output via markdown).
+
+If a human later answers one of these open questions (once the task is at `stage: "review"`), the optional [Answer Match Assessment](/reference/config#strategic-llm-routing-advisors) call point compares the answer against the recorded guess. A confirmed guess is left alone; a contradicted one restores the task to that role's checkpoint and re-runs downstream steps with the corrected answer.
 
 Each completed run is recorded with its verdict, disposition, token usage, and full reasoning trace:
 
@@ -66,7 +69,21 @@ After each role (and any critique), the orchestrator evaluates the state:
 
 Two optional LLM routing advisors can refine borderline gate calls: **escalation assessment** (is escalation truly needed, or should the task reroute/rerun/close instead?) and **borderline gate assessment** (for partial-criteria or near-loopback-exhaustion cases). Both are off by default and fall back to the heuristic decision above — see [Strategic LLM Routing Advisors](/reference/config#strategic-llm-routing-advisors).
 
-For **spec** tasks, the decomposition role spawns an epic → story → task child tree. Any open question a role raises along the way can also be spun off — via the Task Detail page's review call-to-action, or `POST /api/tasks/:id/questions/decompose` — into its own child **Question Flow** subtask, which gets a full task page of its own (and can recursively spin off its own open questions the same way).
+For **spec** tasks, the decomposition role spawns an epic → story → task child tree. Any open question a role raises along the way can also be spun off — via the Task Detail page's review call-to-action, or `POST /api/tasks/:id/questions/decompose` — into its own child **Question Flow** subtask, which gets a full task page of its own (and can recursively spin off its own open questions the same way). If a later Answer Match contradiction rolls a parent task back past the point where it decomposed, its already-spawned children aren't touched or deleted — they're just flagged `stale_reason` for a human to triage, since the guess they were built on turned out wrong.
+
+On **Exit to READY**, the orchestrator reconciles the task's dedicated branch back into its base branch: base is merged into the task branch first (so any conflict resolution happens on the disposable task branch, never on shared history), then the task branch is merged into base. This is best-effort — a conflict or error is recorded on the task (`reconcile_status`, `reconcile_detail`) rather than blocking the "ready" transition, since the artifact itself is unaffected; only its git history needs manual attention. The task branch itself is always left in place afterward, merged or not.
+
+## Git Isolation & Concurrency
+
+Every task runs against its **own git worktree and branch** (`<repo>/.orchestra-worktrees/<taskId>`, checked out onto `orchestra/<taskId>` off the project's base branch), created the first time the task needs to touch the repo. This means:
+
+- **Tasks run concurrently.** The scheduler dispatches up to `maxConcurrentTasks` (default `3`, see [Configuration](/reference/config)) tasks' role-steps in the same round, each in its own worktree — one task's commits can never collide with another's, or with your own work on the checkout you're actively looking at.
+- **Each task still runs single-threaded against itself.** A restore or an answer-reincorporation for a given task is serialized against that task's own in-flight step, so a task's own history can never be mutated concurrently — only *different* tasks overlap.
+- **Checkpoints are per-role-run.** Every primary run's post-commit SHA is recorded (`git_commit_sha`), so a task can be [restored](/guide/steering#task-lifecycle) back to right after any of its own completed roles via `POST /api/tasks/:id/restore` or the Task Detail page's role-run history.
+- **Worktrees are cleaned up, branches aren't.** Deleting or resetting a task removes its worktree directory (a real disk cost) but leaves the branch ref in place; the worktree is silently recreated onto that branch the next time the task does any work (including a later restore).
+- **Merges happen once, on completion.** Nothing is merged into your base branch mid-refinement — only the final [reconciliation](#stage-6-gate) on Exit to READY touches it, and only after the task branch has already absorbed base cleanly.
+
+Tasks created before this feature (or whose worktree was removed by a crash) fall back to the project's shared checkout until they next need `ensureTaskWorkspace` to (re)create their worktree — this is transparent and requires no manual migration.
 
 ## The PLANNING/ Tree
 

@@ -72,20 +72,21 @@ header.topbar .spacer { flex: 1; }
 .kanban .col { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-height: 120px; }
 .kanban .col h3 { margin: 0; padding: 8px 10px; font-size: 12px; letter-spacing: 1px; color: var(--ink-dim); border-bottom: 1px solid var(--line); text-transform: uppercase; }
 .kanban .col .cards { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-.card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; cursor: pointer; }
+.card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; cursor: pointer; transition: background-color .15s ease, border-color .15s ease; }
 .card:hover { border-color: var(--brass); }
 .card .title { font-size: 13px; margin-bottom: 4px; }
 .card .meta { font-size: 11px; color: var(--ink-dim); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .card--wont-do { opacity: 0.45; }
 .card--wont-do:hover { opacity: 0.65; }
+.card--related-highlight { background: rgba(201, 162, 75, 0.08); border-color: var(--brass-dim); }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .dot.warn { background: var(--warn); }
 
 /* Task detail */
 .detail-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; align-items: start; }
 .detail-grid > * { min-width: 0; overflow: hidden; }
-.live { background: #0d1014; border: 1px solid var(--line); border-radius: 6px; height: 300px; overflow: auto; padding: 10px; font-size: 12px; position: relative; overflow-wrap: anywhere; word-break: break-word; }
-.live .live-jump { position: sticky; bottom: 0; left: 0; right: 0; display: block; margin: 6px -10px -10px; padding: 6px; text-align: center; background: rgba(90, 163, 201, 0.15); border: none; border-top: 1px solid var(--accent); border-radius: 0 0 6px 6px; color: var(--accent); font-size: 12px; cursor: pointer; width: calc(100% + 20px); }
+.live { background: #0d1014; border: 1px solid var(--line); border-radius: 6px; height: 300px; overflow: auto; padding: 10px 10px 0 10px; font-size: 12px; position: relative; overflow-wrap: anywhere; word-break: break-word; }
+.live .live-jump { position: sticky; bottom: 0; left: 0; right: 0; display: block; margin: 6px -10px 0 -10px; padding: 6px; text-align: center; background: rgba(90, 163, 201, 0.15); border: none; border-top: 1px solid var(--accent); border-radius: 0 0 5px 5px; color: var(--accent); font-size: 12px; cursor: pointer; width: calc(100% + 20px); }
 .live .live-jump:hover { background: rgba(90, 163, 201, 0.25); }
 .live .tool { color: var(--accent); }
 .live .role { color: var(--brass); font-weight: bold; }
@@ -319,6 +320,120 @@ header.topbar .spacer { flex: 1; }
 .json-punct {
   color: var(--ink-dim);
 }
+/* ---- Coverage grid (role × concern heatmap) ---- */
+.coverage-grid {
+  display: grid;
+  gap: 2px;
+  align-items: center;
+  font-size: 11px;
+}
+.coverage-grid-corner {
+  /* empty top-left cell */
+}
+.coverage-grid-concern {
+  font-size: 11px;
+  color: var(--ink);
+  padding: 4px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.coverage-dot-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  cursor: default;
+}
+.coverage-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.coverage-dot--considered {
+  background: var(--ok);
+}
+.coverage-dot--skipped {
+  background: var(--warn);
+}
+.coverage-dot--out_of_scope {
+  background: var(--ink-dim);
+}
+.coverage-dot--never {
+  background: transparent;
+  border: 1px dashed var(--bad);
+  opacity: 0.5;
+}
+/* Dynamic x-axis label row — shows which role column is being hovered */
+.coverage-x-label-label {
+  color: var(--ink-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.coverage-x-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+  min-height: 24px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
+}
+.coverage-x-label-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--brass);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  line-height: 1.2;
+}
+.coverage-x-label-placeholder {
+  font-size: 11px;
+  color: var(--ink-dim);
+  font-style: italic;
+  letter-spacing: 0.5px;
+  line-height: 1.2;
+}
+/* Info panel below the coverage map */
+.coverage-info-panel {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+}
+.coverage-info-content {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.coverage-info-role {
+  font-weight: 600;
+  color: var(--brass);
+}
+.coverage-info-sep {
+  color: var(--ink-dim);
+}
+.coverage-info-concern {
+  color: var(--ink);
+}
+.coverage-info-note {
+  margin-left: 4px;
+  font-size: 11px;
+}
+.coverage-info-placeholder {
+  font-size: 11px;
+}
+/* Keep old coverage styles as fallback for when there are no per-role data */
 .coverage { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 12px; }
 .coverage .never { color: var(--bad); }
 .coverage .considered { color: var(--ok); }
@@ -457,7 +572,7 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .info-tip-popup {
   display: none;
   position: absolute;
-  bottom: calc(100% + 6px);
+  top: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
   background: var(--panel-2);
@@ -484,6 +599,33 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 }
 .info-tip:hover .info-tip-popup {
   display: block;
+}
+.model-bubble {
+  position: relative;
+  display: inline-flex;
+}
+.model-bubble-trigger {
+  cursor: pointer;
+}
+.model-bubble-trigger:hover {
+  border-color: var(--brass);
+  color: var(--brass);
+}
+.model-bubble-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px;
+  z-index: 101;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 160px;
 }
 .model-list { max-height: 220px; overflow: auto; margin-top: 8px; padding: 6px; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; display: flex; flex-direction: column; gap: 2px; }
 .model-list .model { display: flex; justify-content: space-between; align-items: center; padding: 3px 6px; border-radius: 3px; font-size: 12px; }
@@ -1273,6 +1415,11 @@ a.clickable-role:hover {
   color: var(--brass);
   line-height: 1.4;
 }
+.tag-chip-disabled {
+  background: rgba(120, 120, 120, 0.1);
+  border-color: var(--line);
+  color: var(--ink-dim);
+}
 .tag-remove {
   background: none;
   border: none;
@@ -1325,6 +1472,40 @@ a.clickable-role:hover {
 .tag-dropdown-item.active {
   background: rgba(201, 162, 75, 0.1);
   color: var(--brass);
+}
+
+/* ---- Role card header (distinguish type vs. software equivalent) ---- */
+.role-card-title {
+  color: var(--accent);
+  font-size: 14px;
+}
+.role-card-key {
+  color: var(--brass-dim);
+  font-size: 11px;
+  border-color: var(--brass-dim);
+}
+
+/* ---- Role card clickable header ---- */
+.role-card-header {
+  cursor: pointer;
+  user-select: none;
+}
+.role-card-header:hover {
+  background: rgba(201, 162, 75, 0.06);
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+/* ---- Role stat pills in card header ---- */
+.role-stat {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--ink-dim);
+  white-space: nowrap;
 }
 
 /* ---- Role editor panel (two-column on wide screens) ---- */
@@ -1563,4 +1744,153 @@ button.review-cta-escape.danger:hover {
   font-weight: 600;
   letter-spacing: 0.5px;
   margin-bottom: 4px;
+}
+
+/* ---- API Calls panel (task sidebar) ---- */
+
+.calls-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.calls-total {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.calls-total-num {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.calls-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.calls-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+
+.calls-model-name {
+  flex: 1;
+  color: var(--brass);
+  font-weight: 600;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calls-model-tokens {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- Expanded API Calls layout ---- */
+
+.api-calls-bar-container {
+  margin: 8px 0;
+}
+
+.api-calls-label {
+  font-size: 10px;
+  color: var(--ink-dim);
+  text-align: center;
+  margin-top: 4px;
+}
+
+.calls-avg-tps {
+  margin-bottom: 10px;
+}
+
+.calls-section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.calls-loc-pill {
+  font-size: 10px;
+  padding: 1px 5px;
+  margin-left: auto;
+}
+
+.calls-loc-pill.ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.calls-loc-pill.accent {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---- Miniature radar chart (task sidebar) ---- */
+
+.mini-radar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.mini-radar svg {
+  display: block;
+}
+
+.mini-radar-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  font-size: 11px;
+}
+
+.mini-radar-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.mini-radar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.mini-radar-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+.mini-radar-calls {
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-size: 10px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
 }

@@ -11,9 +11,11 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
+import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
-import { ReviewCTA } from "../components/ReviewCTA";
+import { ModelBubble } from "../components/ModelBubble";
+import { ReviewCTA, collectQuestions, type ClientOpenQuestion } from "../components/ReviewCTA";
+import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -22,7 +24,19 @@ interface ParsedQuestion {
   options: string[];
 }
 
-function parseQuestion(raw: string): ParsedQuestion {
+function parseQuestion(rawQ: ClientOpenQuestion): ParsedQuestion {
+  const heuristic = parseQuestionText(rawQ.question);
+  // A structured guess takes priority over anything the legacy heuristic below
+  // scraped out of the question's own free text (e.g. old model output that
+  // still ends with "(default: X)").
+  return rawQ.assumed_answer
+    ? { ...heuristic, defaultAnswer: rawQ.assumed_answer }
+    : heuristic;
+}
+
+/** Legacy heuristic: scrape a suggested default / options out of a plain-text
+ *  question string (pre-dates the structured assumed_answer/confidence fields). */
+function parseQuestionText(raw: string): ParsedQuestion {
   let q = raw.trim();
 
   // Extract trailing default suggestions: ... (default: X)  or  ... (likely X)  or  ... → X
@@ -78,20 +92,6 @@ function parseQuestion(raw: string): ParsedQuestion {
   return { text: q || raw.trim(), defaultAnswer: dflt, options: opts };
 }
 
-/** Collect all open questions grouped by role, skipping runs with no questions. */
-function collectQuestions(runs: RoleRun[]): Array<{ runId: number; roleKey: string; questions: string[] }> {
-  const groups: Array<{ runId: number; roleKey: string; questions: string[] }> = [];
-  for (const r of runs) {
-    try {
-      const parsed = JSON.parse(r.open_questions_json ?? "[]") as string[];
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        groups.push({ runId: r.id, roleKey: r.role_key, questions: parsed });
-      }
-    } catch { /* skip malformed */ }
-  }
-  return groups;
-}
-
 function ElapsedTime({ startTime }: { startTime: number }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -110,7 +110,9 @@ export interface ActivityState {
   roleStartTime: number | null;
   roleEndTime: number | null;
   /** Completed role stats — persist across role_start so the TPS / timing stay visible. */
-  lastRole: { role: string; tokens: number; elapsedSec: number } | null;
+  lastRole: { role: string; tokens: number; elapsedSec: number; model: string | null } | null;
+  /** Model for the currently running role, from the role_start event. */
+  currentModel: string | null;
   /** TPS values per role from all completed runs, for per-role min/max display. */
   tpsHistory: Record<string, number[]>;
   /** Whether the final recap LLM call is still in progress. */
@@ -143,6 +145,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
     roleStartTime: null,
     roleEndTime: null,
     lastRole: null,
+    currentModel: null,
     tpsHistory: {},
     recapGenerating: false,
   });
@@ -152,7 +155,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
   const repeatRef = useRef(0);
   useEffect(() => {
     setLines([]);
-    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, tpsHistory: {}, recapGenerating: false });
+    setActivity({ currentRole: null, disposition: null, roleStartTime: null, roleEndTime: null, lastRole: null, currentModel: null, tpsHistory: {}, recapGenerating: false });
     const role = nextRoleRef.current;
     if (role) {
       setActivity((a) => a.currentRole ? a : { ...a, currentRole: role, disposition: "reading", roleStartTime: Date.now() });
@@ -175,7 +178,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
       bufRef.current = "";
       thinkRef.current = "";
       flushRepeat();
-      setActivity((a) => ({ ...a, currentRole: d.role, disposition: "reading", roleStartTime: Date.now(), roleEndTime: null, lastRole: a.lastRole }));
+      setActivity((a) => ({ ...a, currentRole: d.role, disposition: "reading", roleStartTime: Date.now(), roleEndTime: null, lastRole: a.lastRole, currentModel: d.model ?? null }));
     });
     es.addEventListener("text", (e) => {
       const d = JSON.parse((e as MessageEvent).data).data;
@@ -240,7 +243,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
         const endTime = Date.now();
         const elapsed = a.roleStartTime ? (endTime - a.roleStartTime) / 1000 : 0;
         const lastRole = d.tokens != null && elapsed > 0
-          ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed }
+          ? { role: d.role, tokens: d.tokens, elapsedSec: elapsed, model: d.model ?? null }
           : a.lastRole;
         const tps = lastRole ? lastRole.tokens / lastRole.elapsedSec : null;
         const tpsHistory = tps != null
@@ -253,6 +256,7 @@ function useTaskStream(taskId: string, onActivity: () => void, nextRoleRef: { cu
           roleStartTime: a.roleStartTime,
           roleEndTime: endTime,
           lastRole,
+          currentModel: null,
           tpsHistory,
         };
       });
@@ -559,17 +563,20 @@ function TaskNetworkGraph({
   runs,
   plan,
   currentRole,
+  projectId,
 }: {
   networkId: string;
   runs: RoleRun[];
   plan: { steps: { role: string; status: string; depth: number }[] } | null;
   currentRole: string | null;
+  projectId: number | null;
 }) {
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
   const networkQ = useQuery({
     queryKey: ["network", networkId],
     queryFn: () => api.network(networkId),
   });
+  const navigate = useNavigate();
 
   const parsedGraph = useMemo<AgentNetworkGraph | null>(() => {
     if (!networkQ.data?.network?.graph_json) return null;
@@ -626,12 +633,14 @@ function TaskNetworkGraph({
   const handleNodeClick = (_event: React.MouseEvent, node: Node) => {
     const roleKey = (node.data as { roleKey?: string }).roleKey;
     if (!roleKey) return;
-    const run = runs.find((r) => r.role_key === roleKey);
-    if (run) {
-      const el = document.getElementById(`run-${roleKey}`);
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
+    if (projectId != null) {
+      navigate({
+        to: "/projects/$projectId/roles",
+        params: { projectId: String(projectId) },
+        search: { role: roleKey },
+      });
+    } else {
+      navigate({ to: "/settings" });
     }
   };
 
@@ -735,7 +744,6 @@ export function TaskDetail() {
   const [afterInput, setAfterInput] = useState("");
   const [noteInput, setNoteInput] = useState("");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
-  const [showIntake, setShowIntake] = useState(false);
   const [showAdvancedSteering, setShowAdvancedSteering] = useState(false);
 
   // Question answer state: per-question-editing keyed by "${runId}:${qIndex}"
@@ -746,6 +754,7 @@ export function TaskDetail() {
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
+  const [hoveredCoverage, setHoveredCoverage] = useState<{ role: string; concern: string } | null>(null);
 
   // Scheduler state for banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -770,10 +779,22 @@ export function TaskDetail() {
   const [deleteModal, setDeleteModal] = useState(false);
   const [resetModal, setResetModal] = useState(false);
   const [removePlan, setRemovePlan] = useState(false);
+  const [restoreTarget, setRestoreTarget] = useState<RoleRun | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const intervene = useMutation({
     mutationFn: ({ kind, payload }: { kind: string; payload?: unknown }) => api.intervene(taskId, kind, payload),
     onSuccess: refresh,
+  });
+
+  const restore = useMutation({
+    mutationFn: (roleRunId: number) => api.restoreTask(taskId, roleRunId),
+    onSuccess: () => {
+      setRestoreTarget(null);
+      setRestoreError(null);
+      refresh();
+    },
+    onError: (e: unknown) => setRestoreError(e instanceof Error ? e.message : "restore failed"),
   });
 
   const doDelete = async () => {
@@ -799,6 +820,100 @@ export function TaskDetail() {
       // error will show via query refetch
     }
   };
+
+  /** Per-role coverage items parsed from individual run coverage_json (not the roll-up). */
+  interface CoverageItem {
+    concern: string;
+    status: string;
+    note?: string;
+  }
+  const coverageGrid = useMemo(() => {
+    const runs = q.data?.runs ?? [];
+    const primaryRuns = runs.filter((r) => !r.run_kind || r.run_kind === "primary");
+    // Build a map: concern → roleKey → { status, note }
+    const map: Record<string, Record<string, { status: string; note?: string }>> = {};
+    const roleKeys: string[] = [];
+    const seen = new Set<string>();
+    for (const run of primaryRuns) {
+      if (!run.coverage_json) continue;
+      try {
+        const items = JSON.parse(run.coverage_json) as CoverageItem[];
+        if (!seen.has(run.role_key)) {
+          seen.add(run.role_key);
+          roleKeys.push(run.role_key);
+        }
+        for (const item of items) {
+          if (!map[item.concern]) map[item.concern] = {};
+          map[item.concern][run.role_key] = { status: item.status, note: item.note };
+        }
+      } catch {
+        /* skip malformed */
+      }
+    }
+    return { map, roleKeys };
+  }, [q.data]);
+
+  /** Per-model API call counts and tokens derived from persisted role runs. */
+  const modelConfigsQ = useQuery({ queryKey: ["modelConfigs"], queryFn: () => api.modelConfigs() });
+
+  /** Project + roles for the model bubble; shares cache with ProjectBoard's ["project", pid] query. */
+  const taskProjectId = q.data?.task.project_id ?? null;
+  const projectQ = useQuery({
+    queryKey: ["project", taskProjectId],
+    queryFn: () => api.project(taskProjectId as number),
+    enabled: taskProjectId != null,
+  });
+
+  const { modelCallCounts, modelTokens } = useMemo(() => {
+    const counts: Record<string, number> = {};
+    const tokens: Record<string, number> = {};
+    for (const run of q.data?.runs ?? []) {
+      if (!run.model) continue;
+      const key = String(run.model);
+      counts[key] = (counts[key] ?? 0) + 1;
+      if (run.tokens != null) {
+        tokens[key] = (tokens[key] ?? 0) + run.tokens;
+      }
+    }
+    return { modelCallCounts: counts, modelTokens: tokens };
+  }, [q.data]);
+
+  /** Map model display name → location ("local" | "api") from model configs. */
+  const modelLocationMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const cfg of modelConfigsQ.data?.configs ?? []) {
+      if (cfg.default_model && cfg.location) {
+        map[cfg.default_model] = cfg.location;
+      }
+    }
+    return map;
+  }, [modelConfigsQ.data]);
+
+  /** Local / API call & token aggregates. */
+  const localApiAgg = useMemo(() => {
+    let local = 0;
+    let api = 0;
+    let localTok = 0;
+    let apiTok = 0;
+    for (const [model, count] of Object.entries(modelCallCounts)) {
+      const loc = modelLocationMap[model] ?? "api";
+      if (loc === "local") {
+        local += count;
+        localTok += modelTokens[model] ?? 0;
+      } else {
+        api += count;
+        apiTok += modelTokens[model] ?? 0;
+      }
+    }
+    return { local, api, localTok, apiTok };
+  }, [modelCallCounts, modelTokens, modelLocationMap]);
+
+  /** Average TPS across all completed roles in this session. */
+  const avgTps = useMemo(() => {
+    const all = Object.values(activity.tpsHistory).flat();
+    if (all.length === 0) return null;
+    return all.reduce((a, b) => a + b, 0) / all.length;
+  }, [activity.tpsHistory]);
 
   if (q.isLoading) return <p className="muted">Loading…</p>;
   if (q.isError || !q.data) return <p className="pill bad">Task not found.</p>;
@@ -865,16 +980,57 @@ export function TaskDetail() {
         </div>
       )}
 
+      {/* Restore checkpoint confirmation modal */}
+      {restoreTarget && (
+        <div className="modal-overlay" onClick={() => { setRestoreTarget(null); setRestoreError(null); }}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Restore to "{restoreTarget.role_key}"</h3>
+            <p className="muted" style={{ margin: "12px 0" }}>
+              {(() => {
+                const discarded = d.runs.filter(
+                  (x) => x.id > restoreTarget.id && (!x.run_kind || x.run_kind === "primary"),
+                ).length;
+                return discarded
+                  ? `This discards ${discarded} later role run${discarded === 1 ? "" : "s"} and resets the ` +
+                    `task's checkpoint branch back to right after ${restoreTarget.role_key} finished. The task ` +
+                    `will resume from there. This cannot be undone.`
+                  : `This resets the task's checkpoint branch back to right after ${restoreTarget.role_key} ` +
+                    `finished. This cannot be undone.`;
+              })()}
+            </p>
+            {restoreError && <p className="pill bad" style={{ marginBottom: 12 }}>{restoreError}</p>}
+            <div className="modal-actions">
+              <button className="small" onClick={() => { setRestoreTarget(null); setRestoreError(null); }}>Cancel</button>
+              <button className="small warn" disabled={restore.isPending} onClick={() => restore.mutate(restoreTarget.id)}>
+                {restore.isPending ? "Restoring…" : "Restore"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="row" style={{ marginBottom: 12 }}>
         {t.project_id != null && (
           <Link to="/projects/$projectId" params={{ projectId: String(t.project_id) }}>← board</Link>
         )}
         <h2 style={{ margin: 0, color: "var(--brass)" }}>{t.name ?? t.task_id.slice(0, 8)}</h2>
+        {projectQ.data && (
+          <ModelBubble
+            projectId={taskProjectId as number}
+            defaultModel={projectQ.data.project.default_model}
+            roles={projectQ.data.roles}
+          />
+        )}
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
         {t.exit_state === "wont_do" && <span className="pill dim">won't do</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
+        {t.reconcile_status === "pending_human_merge" && (
+          <span className="pill warn" title={t.reconcile_detail ?? undefined}>
+            pending human merge{t.git_branch ? ` — review branch "${t.git_branch}"` : ""}
+          </span>
+        )}
         {t.stage === "intake" && t.project_id != null && (
           <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}
@@ -894,6 +1050,7 @@ export function TaskDetail() {
               runs={d.runs}
               plan={d.plan}
               currentRole={activity.currentRole}
+              projectId={t.project_id}
             />
           )}
         </div>
@@ -922,23 +1079,6 @@ export function TaskDetail() {
                   />
                 </div>
               )}
-              {d.runs.some((r) => r.output_md) && (
-                <details style={{ marginTop: 16 }}>
-                  <summary className="muted" style={{ cursor: "pointer" }}>Per-role findings</summary>
-                  <div style={{ marginTop: 8 }}>
-                    {d.runs.map((r) =>
-                      r.output_md ? (
-                        <div
-                          key={r.id}
-                          className="section-md rendered-md"
-                          style={{ marginBottom: 12 }}
-                          dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }}
-                        />
-                      ) : null,
-                    )}
-                  </div>
-                </details>
-              )}
             </>
           ) : (
             <div className="panel">
@@ -957,122 +1097,34 @@ export function TaskDetail() {
           <div className="panel">
             <div className="plan-header">
               <h2>Refinement plan</h2>
-              <button
-                className="small"
-                onClick={() => setShowIntake((p) => !p)}
-                title={showIntake ? "Back to plan" : "View original intake contents"}
-              >
-                {showIntake ? "📋 Plan" : "📄 Intake"}
-              </button>
             </div>
-            {showIntake ? (
-              <div className="intake-content">
-                <div className="row" style={{ marginBottom: 6 }}>
-                  <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
-                  <span className="pill dim">name: {t.name ?? t.task_id.slice(0, 8)}</span>
-                </div>
-                {t.stage === "intake" ? (
-                  <>
-                    <label className="muted" style={{ display: "block", marginBottom: 4 }}>Name</label>
-                    <input
-                      className="intake-textarea"
-                      style={{ minHeight: "auto", height: "auto", marginBottom: 8 }}
-                      value={editName}
-                      onChange={(e) => setEditName(e.target.value)}
-                      placeholder="Task name"
-                    />
-                    <label className="muted" style={{ display: "block", marginBottom: 4 }}>Content</label>
-                    <textarea
-                      className="intake-textarea"
-                      value={editContent}
-                      onChange={(e) => setEditContent(e.target.value)}
-                      placeholder="No intake content recorded."
-                    />
-                    {!schedulerRunning && (
-                      <div className="banner stopped" style={{ marginTop: 8 }}>
-                        ⏸ Scheduler is stopped — task will stay in intake until you restart it.
-                      </div>
-                    )}
-                    <div className="row" style={{ marginTop: 8, gap: 8 }}>
-                      <button
-                        className="small primary"
-                        disabled={saving}
-                        onClick={async () => {
-                          setSaving(true);
-                          try {
-                            await api.updateTask(taskId, { name: editName, content: editContent });
-                            refresh();
-                          } catch (e: unknown) {
-                            // error will show via query refetch
-                          } finally {
-                            setSaving(false);
-                          }
-                        }}
-                      >
-                        {saving ? "Saving…" : "Save"}
-                      </button>
-                      <button
-                        className="small"
-                        onClick={() => {
-                          setEditName(t.name ?? "");
-                          setEditContent(t.content ?? "");
-                        }}
-                      >
-                        Revert
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <textarea
-                      className="intake-textarea"
-                      value={t.content ?? ""}
-                      onChange={() => {}}
-                      placeholder="No intake content recorded."
-                    />
-                    <p className="intake-note muted">
-                      Not in intake —{" "}
-                      <button
-                        className="link"
-                        onClick={() => setResetModal(true)}
-                        style={{ color: "var(--brass)", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}
-                      >
-                        reset
-                      </button>{" "}
-                      to intake to edit name and content.
-                    </p>
-                  </>
-                )}
-              </div>
-            ) : (
-              <div className="row">
-                {d.plan?.steps.map((s, i) => (
-                  <a
-                    key={i}
-                    href={`#run-${s.role}`}
-                    className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      const el = document.getElementById(`run-${s.role}`);
-                      if (el) {
-                        el.scrollIntoView({ behavior: "smooth", block: "start" });
-                        setCollapsedRuns((prev) => {
-                          const run = d.runs.find((r) => r.role_key === s.role);
-                          if (run && prev.has(run.id)) {
-                            const next = new Set(prev);
-                            next.delete(run.id);
-                            return next;
-                          }
-                          return prev;
-                        });
-                      }
-                    }}
-                  >
-                    {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
-                  </a>
-                )) ?? <span className="muted">Not planned yet.</span>}
-              </div>
-            )}
+            <div className="row">
+              {d.plan?.steps.map((s, i) => (
+                <a
+                  key={i}
+                  href={`#run-${s.role}`}
+                  className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    const el = document.getElementById(`run-${s.role}`);
+                    if (el) {
+                      el.scrollIntoView({ behavior: "smooth", block: "start" });
+                      setCollapsedRuns((prev) => {
+                        const run = d.runs.find((r) => r.role_key === s.role);
+                        if (run && prev.has(run.id)) {
+                          const next = new Set(prev);
+                          next.delete(run.id);
+                          return next;
+                        }
+                        return prev;
+                      });
+                    }
+                  }}
+                >
+                  {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
+                </a>
+              )) ?? <span className="muted">Not planned yet.</span>}
+            </div>
           </div>
 
           {/* In-progress role slat — shows as soon as role_start fires, before run is persisted */}
@@ -1145,6 +1197,27 @@ export function TaskDetail() {
             </div>
           )}
 
+          {/* Per-role findings — collapsible caret below refinement plan and in-progress */}
+          {t.stage === "ready" || t.stage === "review" ? (
+            d.runs.some((r) => r.output_md) && (
+              <details style={{ marginTop: 16 }}>
+                <summary className="muted" style={{ cursor: "pointer" }}>Per-role findings</summary>
+                <div style={{ marginTop: 8 }}>
+                  {d.runs.map((r) =>
+                    r.output_md ? (
+                      <div
+                        key={r.id}
+                        className="section-md rendered-md"
+                        style={{ marginBottom: 12 }}
+                        dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }}
+                      />
+                    ) : null,
+                  )}
+                </div>
+              </details>
+            )
+          ) : null}
+
           {(() => {
             const primaryRuns = d.runs.filter((r) => !r.run_kind || r.run_kind === "primary");
             return primaryRuns.length > 0 && (
@@ -1189,19 +1262,22 @@ export function TaskDetail() {
                     className="small"
                     onClick={(e) => {
                       e.stopPropagation();
-                      intervene.mutate({ kind: "rerun_role", payload: { role: r.role_key } });
-                    }}
-                  >
-                    re-run
-                  </button>
-                  <button
-                    className="small"
-                    onClick={(e) => {
-                      e.stopPropagation();
                       intervene.mutate({ kind: "deepen", payload: { role: r.role_key } });
                     }}
                   >
                     deepen
+                  </button>
+                  <button
+                    className="small"
+                    disabled={!r.git_commit_sha}
+                    title={r.git_commit_sha ? "Roll the task back to right after this role finished" : "No checkpoint recorded for this run"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRestoreError(null);
+                      setRestoreTarget(r);
+                    }}
+                  >
+                    restore
                   </button>
                   {t.project_id != null && (
                     <Link
@@ -1259,7 +1335,20 @@ export function TaskDetail() {
                   {d.children.map((c) => (
                     <tr key={c.task_id}>
                       <td><span className="pill dim">{c.level}</span></td>
-                      <td>{c.name}</td>
+                      <td>
+                        <Link to="/tasks/$taskId" params={{ taskId: c.task_id }}>
+                          {c.name}
+                        </Link>
+                        {c.stale_reason && (
+                          <span
+                            className="pill bad"
+                            style={{ marginLeft: 6 }}
+                            title={c.stale_reason}
+                          >
+                            possibly stale
+                          </span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1327,26 +1416,87 @@ export function TaskDetail() {
                 )}
                 {activity.disposition === "done" && activity.lastRole && (
                   <div className="current-state-row">
-                    <span className="muted">Speed</span>
+                    <span className="muted">Model</span>
                     <span className="pill dim">
-                      {activity.lastRole.tokens} tok / {(activity.lastRole.elapsedSec).toFixed(1)}s → {(activity.lastRole.tokens / activity.lastRole.elapsedSec).toFixed(0)} tps
+                      {activity.lastRole.model ?? "—"} | {(activity.lastRole.tokens / activity.lastRole.elapsedSec).toFixed(0)} tps
                     </span>
                   </div>
                 )}
-                {activity.disposition !== "done" && activity.lastRole && (
+                {activity.disposition !== "done" && (activity.currentModel || activity.lastRole) && (
                   <div className="current-state-row">
-                    <span className="muted">Last role</span>
+                    <span className="muted">Model</span>
                     <span className="pill dim">
-                      {activity.lastRole.role}: {(activity.lastRole.tokens / activity.lastRole.elapsedSec).toFixed(0)} tps ({activity.lastRole.tokens} tok / {(activity.lastRole.elapsedSec).toFixed(1)}s)
+                      {activity.currentModel ?? activity.lastRole?.model ?? "—"}{activity.lastRole ? ` | ${(activity.lastRole.tokens / activity.lastRole.elapsedSec).toFixed(0)} tps (${activity.lastRole.tokens} tok / ${(activity.lastRole.elapsedSec).toFixed(1)}s)` : " | — tps"}
                     </span>
                   </div>
                 )}
-                {activity.currentRole && activity.disposition !== "done" && !activity.lastRole && (
-                  <div className="current-state-row">
-                    <span className="muted">Speed</span>
-                    <span className="pill dim">n/a</span>
+              </div>
+            </div>
+          )}
+
+          {/* API Calls panel — expanded with local/API split, avg TPS, and per-model breakdown */}
+          {Object.keys(modelCallCounts).length > 0 && (
+            <div className="panel">
+              <h2>API Calls</h2>
+              <div className="calls-summary">
+                <div className="calls-total">
+                  <span className="calls-total-num">
+                    {localApiAgg.local + localApiAgg.api}
+                  </span>
+                  <span className="muted" style={{ fontSize: 11 }}>total calls</span>
+                </div>
+                {/* Local / API progress bar */}
+                {localApiAgg.local + localApiAgg.api > 0 && (
+                  <div className="api-calls-bar-container">
+                    <div className="api-calls-bar" style={{ display: "flex", borderRadius: 5, overflow: "hidden", background: "var(--panel-2)" }}>
+                      {localApiAgg.local > 0 && (
+                        <span
+                          className="api-calls-bar__internal"
+                          style={{ width: `${(localApiAgg.local / (localApiAgg.local + localApiAgg.api)) * 100}%`, height: 10 }}
+                          title="local (internal)"
+                        />
+                      )}
+                      {localApiAgg.api > 0 && (
+                        <span
+                          className="api-calls-bar__external"
+                          style={{ width: `${(localApiAgg.api / (localApiAgg.local + localApiAgg.api)) * 100}%`, height: 10 }}
+                          title="api (external)"
+                        />
+                      )}
+                    </div>
+                    <div className="api-calls-label">
+                      {localApiAgg.local} local / {localApiAgg.api} api
+                    </div>
                   </div>
                 )}
+                {/* Average TPS */}
+                {avgTps != null && (
+                  <div className="calls-avg-tps">
+                    <span className="muted">avg </span>
+                    <span className="pill dim">{avgTps.toFixed(0)} tps</span>
+                  </div>
+                )}
+                {/* Per-model breakdown */}
+                <div className="calls-section-label muted">per model</div>
+                <div className="calls-breakdown">
+                  {Object.entries(modelCallCounts)
+                    .sort(([, a], [, b]) => b - a)
+                    .map(([model, count]) => {
+                      const loc = modelLocationMap[model] ?? "api";
+                      return (
+                        <div key={model} className="calls-model-row">
+                          <span className="calls-model-name">{displayModelName(model)}</span>
+                          <span className="pill dim">{count} call{count > 1 ? "s" : ""}</span>
+                          {modelTokens[model] != null && (
+                            <span className="calls-model-tokens muted">
+                              {(modelTokens[model]).toLocaleString()} tok
+                            </span>
+                          )}
+                          <span className={`pill calls-loc-pill ${loc === "local" ? "ok" : "accent"}`}>{loc}</span>
+                        </div>
+                      );
+                    })}
+                </div>
               </div>
             </div>
           )}
@@ -1413,7 +1563,6 @@ export function TaskDetail() {
                       pin_question: "PIN",
                       question_answer: "ANSWER",
                       inject_role: "INJECT",
-                      rerun_role: "RERUN",
                       deepen: "DEEPEN",
                       promote_role: "PROMOTE",
                       pause: "PAUSE",
@@ -1426,7 +1575,7 @@ export function TaskDetail() {
                         ? (payload.text as string ?? "")
                         : iv.kind === "inject_role"
                           ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
-                          : iv.kind === "rerun_role" || iv.kind === "deepen" || iv.kind === "promote_role"
+                          : iv.kind === "deepen" || iv.kind === "promote_role"
                             ? (payload.role as string ?? "?")
                             : "";
 
@@ -1447,7 +1596,82 @@ export function TaskDetail() {
 
           <div className="panel">
             <h2>Coverage map</h2>
-            {d.coverage ? (
+            {coverageGrid.roleKeys.length > 0 ? (
+              <>
+                <div className="coverage-grid" style={{ gridTemplateColumns: `120px repeat(${coverageGrid.roleKeys.length}, minmax(28px, 1fr))` }}>
+                  {/* Dynamic x-axis label row — shows which role column is being hovered */}
+                  <div className="coverage-grid-concern coverage-x-label-label">role</div>
+                  <div className="coverage-x-label" style={{ gridColumn: `span ${coverageGrid.roleKeys.length}` }}>
+                    {hoveredCoverage ? (
+                      <span className="coverage-x-label-text">{hoveredCoverage.role}</span>
+                    ) : (
+                      <span className="coverage-x-label-placeholder">hover a column…</span>
+                    )}
+                  </div>
+                  {/* Data rows — one per concern */}
+                  {d.taxonomy.map((concern) => (
+                    <div key={concern} className="coverage-row" style={{ display: "contents" }}>
+                      <span className="coverage-grid-concern">{concern}</span>
+                      {coverageGrid.roleKeys.map((roleKey) => {
+                        const entry = coverageGrid.map[concern]?.[roleKey];
+                        const status = entry?.status ?? "never";
+                        const hasRun = d.runs.some((r) => r.role_key === roleKey && (!r.run_kind || r.run_kind === "primary"));
+                        return (
+                          <span
+                            key={roleKey}
+                            className="coverage-dot-wrapper"
+                            onMouseEnter={() => setHoveredCoverage({ role: roleKey, concern })}
+                            onClick={() => {
+                              if (hasRun) {
+                                const el = document.getElementById(`run-${roleKey}`);
+                                if (el) {
+                                  el.scrollIntoView({ behavior: "smooth", block: "start" });
+                                  setCollapsedRuns((prev) => {
+                                    const run = d.runs.find((r) => r.role_key === roleKey && (!r.run_kind || r.run_kind === "primary"));
+                                    if (run && prev.has(run.id)) {
+                                      const next = new Set(prev);
+                                      next.delete(run.id);
+                                      return next;
+                                    }
+                                    return prev;
+                                  });
+                                }
+                              }
+                            }}
+                            title={hasRun ? `Click to jump to ${roleKey} findings` : undefined}
+                            style={{ cursor: hasRun ? "pointer" : "default" }}
+                          >
+                            <span className={`coverage-dot coverage-dot--${status}`} />
+                          </span>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+                {/* Info panel below the coverage map — shows details for hovered cell */}
+                <div className="coverage-info-panel">
+                  {hoveredCoverage ? (
+                    (() => {
+                      const entry = coverageGrid.map[hoveredCoverage.concern]?.[hoveredCoverage.role];
+                      const status = entry?.status ?? "never";
+                      const note = entry?.note;
+                      const vs = verdictStyle(status === "considered" ? "pass" : status === "skipped" ? "needs_more" : status === "out_of_scope" ? "needs_human" : "done");
+                      return (
+                        <div className="coverage-info-content">
+                          <span className="coverage-info-role">{hoveredCoverage.role}</span>
+                          <span className="coverage-info-sep">·</span>
+                          <span className="coverage-info-concern">{hoveredCoverage.concern}</span>
+                          <span className={`pill ${vs.cls.replace("pill ", "")}`} style={{ marginLeft: 8 }}>{status}</span>
+                          {note && <span className="muted coverage-info-note">{note}</span>}
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    <span className="muted coverage-info-placeholder">Hover over a dot to see role & disposition</span>
+                  )}
+                </div>
+              </>
+            ) : d.coverage ? (
               <div className="coverage">
                 {d.taxonomy.map((concern) => {
                   const c = d.coverage?.[concern] ?? { status: "never" };
@@ -1462,6 +1686,90 @@ export function TaskDetail() {
             ) : (
               <p className="muted">No coverage recorded yet.</p>
             )}
+          </div>
+
+          <div className="panel">
+            <div className="plan-header">
+              <h2>Intake — original request</h2>
+            </div>
+            <div className="intake-content">
+              <div className="row" style={{ marginBottom: 6 }}>
+                <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
+                <span className="pill dim">name: {t.name ?? t.task_id.slice(0, 8)}</span>
+              </div>
+              {t.stage === "intake" ? (
+                <>
+                  <label className="muted" style={{ display: "block", marginBottom: 4 }}>Name</label>
+                  <input
+                    className="intake-textarea"
+                    style={{ minHeight: "auto", height: "auto", marginBottom: 8 }}
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    placeholder="Task name"
+                  />
+                  <label className="muted" style={{ display: "block", marginBottom: 4 }}>Content</label>
+                  <textarea
+                    className="intake-textarea"
+                    value={editContent}
+                    onChange={(e) => setEditContent(e.target.value)}
+                    placeholder="No intake content recorded."
+                  />
+                  {!schedulerRunning && (
+                    <div className="banner stopped" style={{ marginTop: 8 }}>
+                      ⏸ Scheduler is stopped — task will stay in intake until you restart it.
+                    </div>
+                  )}
+                  <div className="row" style={{ marginTop: 8, gap: 8 }}>
+                    <button
+                      className="small primary"
+                      disabled={saving}
+                      onClick={async () => {
+                        setSaving(true);
+                        try {
+                          await api.updateTask(taskId, { name: editName, content: editContent });
+                          refresh();
+                        } catch (e: unknown) {
+                          // error will show via query refetch
+                        } finally {
+                          setSaving(false);
+                        }
+                      }}
+                    >
+                      {saving ? "Saving…" : "Save"}
+                    </button>
+                    <button
+                      className="small"
+                      onClick={() => {
+                        setEditName(t.name ?? "");
+                        setEditContent(t.content ?? "");
+                      }}
+                    >
+                      Revert
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <textarea
+                    className="intake-textarea"
+                    value={t.content ?? ""}
+                    onChange={() => {}}
+                    placeholder="No intake content recorded."
+                  />
+                  <p className="intake-note muted">
+                    Not in intake —{" "}
+                    <button
+                      className="link"
+                      onClick={() => setResetModal(true)}
+                      style={{ color: "var(--brass)", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}
+                    >
+                      reset
+                    </button>{" "}
+                    to intake to edit name and content.
+                  </p>
+                </>
+              )}
+            </div>
           </div>
 
           {questionGroups.length > 0 && t.stage !== "review" && t.stage !== "ready" && (
@@ -1537,7 +1845,23 @@ export function TaskDetail() {
                             >
                               ✓
                             </button>
+                            <QuestionDecomposeButton
+                              parentTaskId={taskId}
+                              roleKey={group.roleKey}
+                              question={rawQ.question}
+                              onMutate={refresh}
+                            />
                           </div>
+                          {(() => {
+                            const decomposedChild = d.children.find(
+                              (c) =>
+                                c.origin_role_key === group.roleKey &&
+                                c.origin_question === rawQ.question,
+                            );
+                            return decomposedChild ? (
+                              <DecomposedChildCard task={decomposedChild} />
+                            ) : null;
+                          })()}
                         </div>
                       );
                     })}

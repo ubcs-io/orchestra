@@ -1,8 +1,8 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, displayModelName } from "../api";
-import type { ModelConfig, ModelStat } from "../api";
+import type { ModelConfig, ModelStat, Project } from "../api";
 
 const THINKING_FORMAT_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "qwen-chat-template", label: "Qwen (vLLM / llama.cpp)" },
@@ -30,6 +30,17 @@ function familyLabel(cfg: ModelConfig): string {
   return cfg.api ?? "unknown";
 }
 
+function sizeBracketLabel(ctxWindow: number | null): string {
+  if (!ctxWindow) return "unknown";
+  const thresholds = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+  const idx = thresholds.findIndex((t) => t >= ctxWindow);
+  if (idx === -1) return ">1M";
+  const upper = thresholds[idx];
+  const lower = idx === 0 ? 0 : thresholds[idx - 1];
+  const fmt = (v: number) => (v >= 1024 ? `${(v / 1024).toFixed(0)}K` : String(v));
+  return lower === 0 ? `≤${fmt(upper)}` : `${fmt(lower)}–${fmt(upper)}`;
+}
+
 /** Parse temperature / top_p / reasoning_effort from extra_json. */
 function parseExtras(extra: string | null): Record<string, unknown> {
   if (!extra) return {};
@@ -37,8 +48,15 @@ function parseExtras(extra: string | null): Record<string, unknown> {
   catch { return {}; }
 }
 
-function isDefault(cfg: ModelConfig): boolean {
+function isGlobalDefault(cfg: ModelConfig): boolean {
   return cfg.project_id === null && cfg.key === "default";
+}
+
+/** Is `cfg` the default for the given scope — global (null) or a specific project? */
+function isDefaultForScope(cfg: ModelConfig, scopeProjectId: number | null, projects: Project[]): boolean {
+  if (scopeProjectId === null) return isGlobalDefault(cfg);
+  const project = projects.find((p) => p.id === scopeProjectId);
+  return !!cfg.name && project?.default_model === cfg.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +107,6 @@ const MODEL_COLORS = [
 ];
 
 function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
-  if (stats.length <= 2) return null;
-
   // Build radar data per stat
   const maxCtx = Math.max(1, ...stats.map((s) => s.context_window ?? 0));
   const maxMaxTok = Math.max(1, ...stats.map((s) => s.max_tokens ?? 0));
@@ -175,7 +191,7 @@ function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
   }, [legendHoveredConfigId, radar]);
 
   return (
-    <div className="panel" style={{ marginBottom: 16 }}>
+    <div className="panel" style={{ flex: 1 }}>
       <h3 style={{ margin: "0 0 8px", color: "var(--brass)", fontSize: 13, textTransform: "uppercase", letterSpacing: 1 }}>
         Coverage Radar
       </h3>
@@ -449,7 +465,7 @@ function StatsTable({ stats: rawStats }: { stats: ModelStat[]; configs: ModelCon
   );
 
   return (
-    <div className="panel" style={{ marginBottom: 16, overflowX: "auto" }}>
+    <div className="panel" style={{ marginBottom: 16, overflowX: "auto", minHeight: 200 }}>
       <h3 style={{ margin: "0 0 8px", color: "var(--brass)", fontSize: 13, textTransform: "uppercase", letterSpacing: 1 }}>
         Model Comparison
       </h3>
@@ -506,6 +522,17 @@ export function Models() {
   });
   const modelStats = statsData?.stats ?? [];
 
+  const { data: projectsData } = useQuery({
+    queryKey: ["projects"],
+    queryFn: api.projects,
+  });
+  const projects = projectsData?.projects ?? [];
+
+  // null = Global scope (today's behavior); otherwise a project id whose
+  // own default_model this page is currently managing.
+  const [scopeProjectId, setScopeProjectId] = useState<number | null>(null);
+  const scopeProject = scopeProjectId != null ? projects.find((p) => p.id === scopeProjectId) : undefined;
+
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
@@ -514,10 +541,127 @@ export function Models() {
   const [pendingSwitchId, setPendingSwitchId] = useState<number | null>(null);
   const [draggedId, setDraggedId] = useState<number | null>(null);
   const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const [pingStatus, setPingStatus] = useState<Record<number, { status: "idle" | "pinging" | "up" | "down"; error?: string }>>({});
+  const editorRef = useRef<HTMLDivElement>(null);
 
   const configs = data?.configs ?? [];
+
+  // ---- Filter state ----
+  type FilterCategory = "location" | "size" | "family" | "reasoning" | "token";
+  const [activeFilters, setActiveFilters] = useState<Record<FilterCategory, Set<string>>>({
+    location: new Set(),
+    size: new Set(),
+    family: new Set(),
+    reasoning: new Set(),
+    token: new Set(),
+  });
+
+  const toggleFilter = (cat: FilterCategory, val: string) => {
+    setActiveFilters((prev) => {
+      const next = new Set(prev[cat]);
+      if (next.has(val)) next.delete(val);
+      else next.add(val);
+      return { ...prev, [cat]: next };
+    });
+  };
+
+  const clearFilters = () => {
+    setActiveFilters({
+      location: new Set(),
+      size: new Set(),
+      family: new Set(),
+      reasoning: new Set(),
+      token: new Set(),
+    });
+  };
+
+  const hasAnyFilter = Object.values(activeFilters).some((s) => s.size > 0);
+
+  // ---- Derived filter options ----
+  const filterOptions = useMemo(() => {
+    const locs = new Set<string>();
+    const sizes = new Set<string>();
+    const families = new Set<string>();
+    const tokens = new Set<string>();
+    for (const cfg of configs) {
+      locs.add(cfg.location ?? "unknown");
+      sizes.add(sizeBracketLabel(cfg.context_window));
+      families.add(familyLabel(cfg));
+      if (cfg.has_env_token) tokens.add("env");
+      if (cfg.has_api_key) tokens.add("DB");
+      if (!cfg.has_api_key && !cfg.has_env_token) tokens.add("none");
+    }
+    const reasoningOpts = ["Yes", "No"];
+    return {
+      location: [...locs].sort(),
+      size: [...sizes].sort((a, b) => {
+        const parse = (s: string) => parseInt(s.replace(/[^\d]/g, ""), 10) || 0;
+        return parse(a) - parse(b);
+      }),
+      family: [...families].sort(),
+      reasoning: reasoningOpts,
+      token: [...tokens].sort(),
+    };
+  }, [configs]);
+
+  // ---- Filtered configs ----
+  const filteredConfigs = useMemo(() => {
+    if (!hasAnyFilter) return configs;
+    return configs.filter((cfg) => {
+      const match = (cat: FilterCategory) => {
+        const selected = activeFilters[cat];
+        if (selected.size === 0) return true;
+        switch (cat) {
+          case "location":
+            return selected.has(cfg.location ?? "unknown");
+          case "size":
+            return selected.has(sizeBracketLabel(cfg.context_window));
+          case "family":
+            return selected.has(familyLabel(cfg));
+          case "reasoning":
+            return selected.has(cfg.reasoning === 1 ? "Yes" : "No");
+          case "token":
+            if (selected.has("env") && cfg.has_env_token) return true;
+            if (selected.has("DB") && cfg.has_api_key) return true;
+            if (selected.has("none") && !cfg.has_api_key && !cfg.has_env_token) return true;
+            return false;
+          default:
+            return true;
+        }
+      };
+      return (
+        match("location") &&
+        match("size") &&
+        match("family") &&
+        match("reasoning") &&
+        match("token")
+      );
+    });
+  }, [configs, activeFilters, hasAnyFilter]);
+
+  // ---- Filtered stats for radar + comparison ----
+  const filteredStats = useMemo(() => {
+    if (!hasAnyFilter) return modelStats;
+    const filteredIds = new Set(filteredConfigs.map((c) => c.id));
+    return modelStats.filter((s) => filteredIds.has(s.config_id));
+  }, [modelStats, filteredConfigs, hasAnyFilter]);
+
+  // ---- Globally default model config ----
+  const globalDefaultConfig = useMemo(
+    () => configs.find((c) => isGlobalDefault(c)),
+    [configs],
+  );
+
   const isEmpty = configs.length === 0 && !showNewForm;
   const effectiveShowNew = showNewForm || isEmpty;
+
+  // Scroll to editor when it opens
+  const editorShown = effectiveShowNew || editingId != null;
+  useEffect(() => {
+    if (editorShown && editorRef.current) {
+      editorRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [editorShown, editingId]);
 
   const selectedConfig = selectedId ? configs.find((c) => c.id === selectedId) : undefined;
 
@@ -527,8 +671,22 @@ export function Models() {
   });
 
   const setDefault = useMutation({
-    mutationFn: (id: number) => api.setDefaultModelConfig(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["model-configs"] }),
+    mutationFn: async (cfg: ModelConfig) => {
+      if (scopeProjectId === null) {
+        await api.setDefaultModelConfig(cfg.id);
+      } else {
+        await api.updateProject(scopeProjectId, { default_model: cfg.name });
+      }
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["model-configs"] });
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+
+  const useGlobalDefault = useMutation({
+    mutationFn: (projectId: number) => api.updateProject(projectId, { default_model: null }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
   });
 
   const reorder = useMutation({
@@ -564,6 +722,21 @@ export function Models() {
       setSelectedId(id);
       setShowNewForm(false);
       setDirty(false);
+      // Ping the model config to check health (rate-limited: skip if already in flight)
+      if (pingStatus[id]?.status !== "pinging") {
+        setPingStatus((prev) => ({ ...prev, [id]: { status: "pinging" } }));
+        api.pingModel(id).then((res) => {
+        setPingStatus((prev) => ({
+          ...prev,
+          [id]: { status: res.available ? "up" : "down", error: res.error },
+        }));
+        }).catch((err) => {
+          setPingStatus((prev) => ({
+            ...prev,
+            [id]: { status: "down", error: (err as Error).message },
+          }));
+        });
+      }
     }
   };
 
@@ -625,27 +798,135 @@ export function Models() {
         as the key.
       </p>
 
+      <div className="row" style={{ marginBottom: 12, flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+        <span className="muted" style={{ fontSize: 12 }}>Default for:</span>
+        <button
+          className={`small${scopeProjectId === null ? " primary" : ""}`}
+          onClick={() => setScopeProjectId(null)}
+        >
+          Global
+        </button>
+        {projects.map((p) => (
+          <button
+            key={p.id}
+            className={`small${scopeProjectId === p.id ? " primary" : ""}`}
+            onClick={() => setScopeProjectId(p.id)}
+          >
+            {p.name}
+          </button>
+        ))}
+        {scopeProject && scopeProject.default_model && (
+          <button
+            className="small"
+            style={{ fontSize: 10 }}
+            onClick={() => useGlobalDefault.mutate(scopeProject.id)}
+            disabled={useGlobalDefault.isPending}
+          >
+            {useGlobalDefault.isPending ? "…" : "Use global default"}
+          </button>
+        )}
+      </div>
+
       {isLoading ? (
         <p className="muted">Loading…</p>
       ) : (
         <>
-          {/* Radar + stats side-by-side when both are visible */}
-          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", marginBottom: 16 }}>
-            {modelStats.length > 2 && (
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <RadarChart stats={modelStats} configs={configs} />
+          {/* Radar + stats side-by-side — always visible */}
+          <div style={{ display: "flex", gap: 16, marginBottom: 16 }}>
+            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+              <RadarChart stats={filteredStats} configs={configs} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {/* Default model card + filter pills above the comparison table */}
+              <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+                {globalDefaultConfig && (
+                  <div className="panel" style={{ flex: 1, minWidth: 0 }}>
+                    <h3 style={{ margin: "0 0 6px", color: "var(--brass)", fontSize: 12, textTransform: "uppercase", letterSpacing: 1 }}>
+                      Global Default
+                    </h3>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Model</span>
+                        <span><strong>{globalDefaultConfig.name ?? (globalDefaultConfig.default_model ? displayModelName(globalDefaultConfig.default_model) : "Unnamed")}</strong></span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Context</span>
+                        <span>{ctxLabel(globalDefaultConfig.context_window, 0)}</span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Family</span>
+                        <span>{familyLabel(globalDefaultConfig)}</span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Type</span>
+                        <span className={`pill ${globalDefaultConfig.location === "local" ? "ok" : "bad"}`}>
+                          {globalDefaultConfig.location ?? "unknown"}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Reasoning</span>
+                        <span>{globalDefaultConfig.reasoning === 1 ? "Yes" : "No"}</span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span className="muted">Token</span>
+                        <span className={`pill ${globalDefaultConfig.has_env_token ? "ok" : globalDefaultConfig.has_api_key ? "warn" : "dim"}`}>
+                          {globalDefaultConfig.has_env_token ? "env" : globalDefaultConfig.has_api_key ? "DB" : "none"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className="panel" style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <h3 style={{ margin: 0, color: "var(--brass)", fontSize: 12, textTransform: "uppercase", letterSpacing: 1 }}>
+                      Filter Models
+                    </h3>
+                    {hasAnyFilter && (
+                      <button className="small" style={{ fontSize: 10 }} onClick={clearFilters}>
+                        Clear all
+                      </button>
+                    )}
+                  </div>
+                  {(["location", "size", "family", "reasoning", "token"] as FilterCategory[]).map((cat) => (
+                    <div key={cat} style={{ marginBottom: 4 }}>
+                      <span style={{ fontSize: 10, color: "var(--ink-dim)", textTransform: "capitalize", display: "inline-block", minWidth: 70, marginBottom: 2 }}>
+                        {cat}
+                      </span>
+                      <span style={{ display: "inline-flex", flexWrap: "wrap", gap: 3 }}>
+                        {filterOptions[cat].map((opt) => {
+                          const active = activeFilters[cat].has(opt);
+                          return (
+                            <button
+                              key={opt}
+                              className="small"
+                              onClick={() => toggleFilter(cat, opt)}
+                              style={{
+                                fontSize: 10,
+                                padding: "1px 6px",
+                                background: active ? "var(--brass)" : "var(--bg-hover)",
+                                color: active ? "var(--bg-base)" : "var(--ink-dim)",
+                                border: active ? "1px solid var(--brass)" : "1px solid var(--line)",
+                                borderRadius: 10,
+                                cursor: "pointer",
+                              }}
+                            >
+                              {opt}
+                            </button>
+                          );
+                        })}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
-            )}
-            {modelStats.length > 0 && (
-              <div style={{ flex: 1, minWidth: 0, maxHeight: 520, overflowY: "auto" }}>
-                <StatsTable stats={modelStats} configs={configs} />
-              </div>
-            )}
+              <StatsTable stats={filteredStats} configs={configs} />
+            </div>
           </div>
 
           <div className="model-card-grid">
-            {configs.map((cfg) => {
-              const def = isDefault(cfg);
+            {filteredConfigs.map((cfg) => {
+              const globalDef = isGlobalDefault(cfg);
+              const def = isDefaultForScope(cfg, scopeProjectId, projects);
               return (
                 <div
                   key={cfg.id}
@@ -667,11 +948,11 @@ export function Models() {
                       className="model-card-delete"
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (def) return;
+                        if (globalDef) return;
                         setDeletingId(cfg.id);
                       }}
-                      title={def ? "Cannot delete the default config" : "Delete"}
-                      style={def ? { opacity: 0.3, cursor: "not-allowed" } : undefined}
+                      title={globalDef ? "Cannot delete the global default config" : "Delete"}
+                      style={globalDef ? { opacity: 0.3, cursor: "not-allowed" } : undefined}
                     >
                       ×
                     </span>
@@ -679,7 +960,45 @@ export function Models() {
                   <div className="model-card-body">
                     <div className="model-card-field">
                       <span className="muted">Model</span>
-                      <span>{cfg.default_model ? displayModelName(cfg.default_model) : "—"}</span>
+                      <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        {cfg.default_model ? displayModelName(cfg.default_model) : "—"}
+                        {(() => {
+                          const ps = pingStatus[cfg.id];
+                          const idle = !ps || ps.status === "idle";
+                          const pinging = ps?.status === "pinging";
+                          const up = ps?.status === "up";
+                          const down = ps?.status === "down";
+                          return (
+                            <span
+                              title={
+                                idle
+                                  ? "Click to ping"
+                                  : pinging
+                                    ? "Pinging…"
+                                    : up
+                                      ? "Healthy"
+                                      : `Unreachable${ps?.error ? `: ${ps.error}` : ""}`
+                              }
+                              style={{
+                                display: "inline-block",
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background: idle
+                                  ? "var(--ink-dim)"
+                                  : up
+                                    ? "var(--ok)"
+                                    : down
+                                      ? "var(--bad)"
+                                      : "var(--brass)",
+                                opacity: pinging ? 0.6 : 1,
+                                flexShrink: 0,
+                                transition: "background 0.2s, opacity 0.2s",
+                              }}
+                            />
+                          );
+                        })()}
+                      </span>
                     </div>
                     <div className="model-card-field">
                       <span className="muted">Size</span>
@@ -701,20 +1020,30 @@ export function Models() {
                         {cfg.has_env_token ? "env" : cfg.has_api_key ? "DB" : "none"}
                       </span>
                     </div>
-                    {!def && (
-                      <button
-                        className="small"
-                        style={{ marginTop: 4, fontSize: 10 }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDefault.mutate(cfg.id);
-                        }}
-                        disabled={setDefault.isPending}
-                        title="Promote to default model config"
-                      >
-                        {setDefault.isPending && setDefault.variables === cfg.id ? "…" : "Set as default"}
-                      </button>
-                    )}
+                    {!def && (() => {
+                      const needsName = scopeProjectId !== null && !cfg.name;
+                      return (
+                        <button
+                          className="small"
+                          style={{ marginTop: 4, fontSize: 10 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (needsName) return;
+                            setDefault.mutate(cfg);
+                          }}
+                          disabled={setDefault.isPending || needsName}
+                          title={
+                            needsName
+                              ? "Name this config to use it as a project default"
+                              : scopeProjectId === null
+                                ? "Set as global default"
+                                : `Set as default for "${scopeProject?.name}"`
+                          }
+                        >
+                          {setDefault.isPending && setDefault.variables?.id === cfg.id ? "…" : "Set as default"}
+                        </button>
+                      );
+                    })()}
                   </div>
                 </div>
               );
@@ -754,19 +1083,21 @@ export function Models() {
             )}
           </div>
 
-          {(effectiveShowNew || editingId != null) && (
-            <ModelEditor
-              key={editingId}
-              configId={editingId}
-              initialData={editingId ? (configs.find((c) => c.id === editingId) ?? null) : null}
-              onDirtyChange={setDirty}
-              onDone={() => {
-                setEditingId(null);
-                setShowNewForm(false);
-                setDirty(false);
-              }}
-            />
-          )}
+          <div ref={editorRef}>
+            {(effectiveShowNew || editingId != null) && (
+              <ModelEditor
+                key={editingId}
+                configId={editingId}
+                initialData={editingId ? (configs.find((c) => c.id === editingId) ?? null) : null}
+                onDirtyChange={setDirty}
+                onDone={() => {
+                  setEditingId(null);
+                  setShowNewForm(false);
+                  setDirty(false);
+                }}
+              />
+            )}
+          </div>
         </>
       )}
 
@@ -1030,6 +1361,28 @@ function ModelEditor({
     },
   });
 
+  // ---- derive live preview values ----
+  const displayName = name.trim() || "Unnamed";
+  const displayModel = defaultModel ? displayModelName(defaultModel) : "—";
+  const displaySize = ctxLabel(contextWindow ? Number(contextWindow) : initialData?.context_window ?? null, 0);
+  const displayFamily = thinkingFormat || (initialData?.api === "openai-completions" ? "OpenAI compat" : initialData?.api ?? "unknown");
+  const locationType = (() => {
+    const u = baseUrl.trim().toLowerCase() || (initialData?.base_url ?? "").toLowerCase();
+    if (!u) return initialData?.location ?? "unknown";
+    const host = u.replace(/^https?:\/\//, "").split(/[/:]/)[0] ?? "";
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host.endsWith(".ts.net") ||
+      host.startsWith("192.168.") ||
+      host.startsWith("10.") ||
+      host.startsWith("172.16.")
+    ) return "local";
+    return "api";
+  })();
+  const hasEnvToken = !!initialData?.has_env_token;
+  const hasDbKey = !!initialData?.has_api_key || apiKeyTouched;
+
   return (
     <div className="panel" style={{ marginTop: 16 }}>
       <div className="row">
@@ -1037,81 +1390,128 @@ function ModelEditor({
         {isNew && <span className="pill dim">new</span>}
       </div>
 
-      <label>Name (unique)</label>
-      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. qwen-7b-local" />
+      <div style={{ display: "flex", gap: 24, alignItems: "flex-start", marginTop: 8 }}>
+        {/* ---- Form fields ---- */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <label>Name (unique)</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. qwen-7b-local" />
 
-      <label>Base URL (OpenAI-compatible, ending in /v1)</label>
-      <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://192.168.2.245:8080/v1" />
+          <label>Base URL (OpenAI-compatible, ending in /v1)</label>
+          <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://192.168.2.245:8080/v1" />
 
-      <div className="row" style={{ gap: 12, flexWrap: "nowrap", alignItems: "flex-start" }}>
-        <div style={{ flex: 2 }}>
-          <label>Default model</label>
-          <input value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} placeholder="llama-serve" />
+          <div className="row" style={{ gap: 12, flexWrap: "nowrap", alignItems: "flex-start" }}>
+            <div style={{ flex: 2 }}>
+              <label>Default model</label>
+              <input value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} placeholder="llama-serve" />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label>
+                API key{" "}
+                {initialData?.has_api_key && <span className="pill ok" style={{ marginLeft: 6 }}>set</span>}
+                {!initialData?.has_api_key && <span className="pill dim" style={{ marginLeft: 6 }}>none</span>}
+                {initialData?.has_env_token && <span className="pill ok" style={{ marginLeft: 6 }}>env</span>}
+              </label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => { setApiKey(e.target.value); setApiKeyTouched(true); }}
+                placeholder={initialData?.has_api_key ? "•••••••• (leave blank to keep)" : initialData?.has_env_token ? "overridden by ORCHESTRA_TOKENS env" : "(none)"}
+                disabled={!!initialData?.has_env_token}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              className="small"
+              onClick={handleDiscover}
+              disabled={isDiscovering || !baseUrl.trim()}
+            >
+              {isDiscovering ? "Fetching…" : "Get models"}
+            </button>
+            {discoverError && (
+              <span className="pill bad" style={{ fontSize: 11 }}>
+                {discoverError}
+              </span>
+            )}
+          </div>
+
+          {discoveredModels.length > 0 && (
+            <div
+              style={{
+                marginTop: 6,
+                padding: "6px 8px",
+                background: "var(--bg-depth)",
+                borderRadius: 6,
+                maxHeight: 160,
+                overflowY: "auto",
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 4,
+              }}
+            >
+              {discoveredModels.map((modelId) => (
+                <button
+                  key={modelId}
+                  className="small"
+                  style={{
+                    fontSize: 10,
+                    padding: "2px 8px",
+                    background: defaultModel === modelId ? "var(--brass)" : "var(--bg-hover)",
+                    color: defaultModel === modelId ? "var(--bg-base)" : "inherit",
+                  }}
+                  onClick={() => setDefaultModel(modelId)}
+                  title={`Click to use "${modelId}"`}
+                >
+                  {modelId}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
-        <div style={{ flex: 1 }}>
-          <label>
-            API key{" "}
-            {initialData?.has_api_key && <span className="pill ok" style={{ marginLeft: 6 }}>set</span>}
-            {!initialData?.has_api_key && <span className="pill dim" style={{ marginLeft: 6 }}>none</span>}
-            {initialData?.has_env_token && <span className="pill ok" style={{ marginLeft: 6 }}>env</span>}
-          </label>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => { setApiKey(e.target.value); setApiKeyTouched(true); }}
-            placeholder={initialData?.has_api_key ? "•••••••• (leave blank to keep)" : initialData?.has_env_token ? "overridden by ORCHESTRA_TOKENS env" : "(none)"}
-            disabled={!!initialData?.has_env_token}
-          />
-        </div>
-      </div>
 
-      <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
-        <button
-          className="small"
-          onClick={handleDiscover}
-          disabled={isDiscovering || !baseUrl.trim()}
-        >
-          {isDiscovering ? "Fetching…" : "Get models"}
-        </button>
-        {discoverError && (
-          <span className="pill bad" style={{ fontSize: 11 }}>
-            {discoverError}
-          </span>
-        )}
-      </div>
-
-      {discoveredModels.length > 0 && (
+        {/* ---- Live card preview ---- */}
         <div
+          className="model-card"
           style={{
-            marginTop: 6,
-            padding: "6px 8px",
-            background: "var(--bg-depth)",
-            borderRadius: 6,
-            maxHeight: 160,
-            overflowY: "auto",
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 4,
+            flexShrink: 0,
+            width: 220,
+            cursor: "default",
+            opacity: 0.88,
+            borderStyle: "dashed",
           }}
         >
-          {discoveredModels.map((modelId) => (
-            <button
-              key={modelId}
-              className="small"
-              style={{
-                fontSize: 10,
-                padding: "2px 8px",
-                background: defaultModel === modelId ? "var(--brass)" : "var(--bg-hover)",
-                color: defaultModel === modelId ? "var(--bg-base)" : "inherit",
-              }}
-              onClick={() => setDefaultModel(modelId)}
-              title={`Click to use "${modelId}"`}
-            >
-              {modelId}
-            </button>
-          ))}
+          <div className="model-card-header">
+            <span className="model-card-name">{displayName}</span>
+          </div>
+          <div className="model-card-body">
+            <div className="model-card-field">
+              <span className="muted">Model</span>
+              <span>{displayModel}</span>
+            </div>
+            <div className="model-card-field">
+              <span className="muted">Size</span>
+              <span>{displaySize}</span>
+            </div>
+            <div className="model-card-field">
+              <span className="muted">Family</span>
+              <span>{displayFamily}</span>
+            </div>
+            <div className="model-card-field">
+              <span className="muted">Type</span>
+              <span className={`pill ${locationType === "local" ? "ok" : "bad"}`}>
+                {locationType}
+              </span>
+            </div>
+            <div className="model-card-field">
+              <span className="muted">Token</span>
+              <span className={`pill ${hasEnvToken ? "ok" : hasDbKey ? "warn" : "dim"}`}>
+                {hasEnvToken ? "env" : hasDbKey ? "DB" : "none"}
+              </span>
+            </div>
+          </div>
         </div>
-      )}
+      </div>
 
       <label style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6 }}>
         <input type="checkbox" checked={reasoning} onChange={(e) => setReasoning(e.target.checked)} style={{ width: "auto", margin: 0 }} />

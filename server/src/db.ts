@@ -245,6 +245,32 @@ export function initDb(): void {
   // Links a "decompose question" child task back to the question that spawned it.
   addColumnIfMissing(d, "tasks", "origin_role_key", "origin_role_key TEXT");
   addColumnIfMissing(d, "tasks", "origin_question", "origin_question TEXT");
+  // Checkpointing: the task's dedicated git branch, and the branch to return to
+  // once the task is accepted.
+  addColumnIfMissing(d, "tasks", "git_branch", "git_branch TEXT");
+  addColumnIfMissing(d, "tasks", "git_base_branch", "git_base_branch TEXT");
+  // Lazily captured the first time a task in this project needs a branch —
+  // whatever branch was checked out at that moment.
+  addColumnIfMissing(d, "projects", "main_branch", "main_branch TEXT");
+  // The commit created immediately after this primary run's artifact commit —
+  // the checkpoint that "restore" resets the task's branch back to.
+  addColumnIfMissing(d, "role_runs", "git_commit_sha", "git_commit_sha TEXT");
+  // Set on a decomposition child when a later answer invalidates a guess its
+  // parent task made — flagged for human triage, never cleared automatically.
+  addColumnIfMissing(d, "tasks", "stale_reason", "stale_reason TEXT");
+  // The task's dedicated git worktree directory — lets each task's role steps
+  // run against their own working tree instead of sharing the project's.
+  addColumnIfMissing(d, "tasks", "git_worktree_path", "git_worktree_path TEXT");
+  // Outcome of merging the task's branch back into its base branch on
+  // completion. null = not yet attempted (task predates this feature, or
+  // hasn't reached a terminal role yet).
+  addColumnIfMissing(d, "tasks", "reconcile_status", "reconcile_status TEXT");
+  addColumnIfMissing(d, "tasks", "reconcile_detail", "reconcile_detail TEXT");
+  // Set when any role step wrote/edited a real file via the guarded write/edit
+  // tools (not just the PLANNING artifact). Gates auto-merge: a task that wrote
+  // source code goes to reconcile_status "pending_human_merge" instead of
+  // auto-merging its branch into base — see orchestrator.ts's ready-transition.
+  addColumnIfMissing(d, "tasks", "wrote_source", "wrote_source INTEGER DEFAULT 0");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -272,6 +298,7 @@ export interface ProjectRow {
   default_model: string | null;
   default_provider: string | null;
   config_json: string | null;
+  main_branch: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -322,6 +349,13 @@ export interface TaskRow {
   network_id: string | null;
   origin_role_key: string | null;
   origin_question: string | null;
+  git_branch: string | null;
+  git_base_branch: string | null;
+  stale_reason: string | null;
+  git_worktree_path: string | null;
+  reconcile_status: string | null;
+  reconcile_detail: string | null;
+  wrote_source: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -378,6 +412,7 @@ export interface RoleRunRow {
   depth: number;
   model: string | null;
   tokens: number | null;
+  git_commit_sha: string | null;
   created_at: string;
 }
 
@@ -411,6 +446,15 @@ export interface AgentNetworkRow {
   is_default: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface RoleStatRow {
+  role_key: string;
+  total_calls: number;
+  pass_count: number;
+  counter_reviewer_passes: number;
+  network_count: number;
+  total_tokens: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +503,7 @@ const PROJECT_UPDATABLE = new Set([
   "default_model",
   "default_provider",
   "config_json",
+  "main_branch",
 ]);
 
 export function updateProject(id: number, fields: Record<string, unknown>): ProjectRow | undefined {
@@ -577,6 +622,79 @@ export function countGlobalRoles(): number {
     n: number;
   };
   return row.n;
+}
+
+/** Per-role-key aggregated statistics across all projects. */
+export function getRoleStats(): RoleStatRow[] {
+  const d = getDb();
+
+  // Calls + passes + tokens (primary runs only)
+  const runStats = d.prepare(`
+    SELECT
+      role_key,
+      COUNT(*) AS total_calls,
+      SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS pass_count,
+      COALESCE(SUM(tokens), 0) AS total_tokens
+    FROM role_runs
+    WHERE run_kind = 'primary' OR run_kind IS NULL
+    GROUP BY role_key
+  `).all() as Array<{ role_key: string; total_calls: number; pass_count: number; total_tokens: number }>;
+
+  // Counter-reviewer passes: primary runs whose linked critique/second_review has verdict='pass'
+  const reviewerStats = d.prepare(`
+    SELECT
+      r1.role_key,
+      COUNT(*) AS counter_reviewer_passes
+    FROM role_runs r1
+    JOIN role_runs r2 ON r2.target_run_id = r1.id
+    WHERE (r1.run_kind = 'primary' OR r1.run_kind IS NULL)
+      AND r2.run_kind IN ('critique', 'second_review')
+      AND r2.verdict = 'pass'
+    GROUP BY r1.role_key
+  `).all() as Array<{ role_key: string; counter_reviewer_passes: number }>;
+
+  // Network count: count networks whose graph_json contains the role key
+  const networkRows = d.prepare(
+    `SELECT graph_json FROM agent_networks`,
+  ).all() as Array<{ graph_json: string }>;
+
+  const networkCounts = new Map<string, number>();
+  for (const row of networkRows) {
+    // Use regex to find unique role keys in the graph json
+    const matches = row.graph_json.matchAll(/"roleKey"\s*:\s*"([^"]+)"/g);
+    const seen = new Set<string>();
+    for (const m of matches) {
+      const rk = m[1]!;
+      if (!seen.has(rk)) {
+        seen.add(rk);
+        networkCounts.set(rk, (networkCounts.get(rk) ?? 0) + 1);
+      }
+    }
+  }
+
+  // Merge into a map by role_key
+  const byKey = new Map<string, RoleStatRow>();
+  for (const rs of runStats) {
+    byKey.set(rs.role_key, {
+      role_key: rs.role_key,
+      total_calls: rs.total_calls,
+      pass_count: rs.pass_count,
+      counter_reviewer_passes: 0,
+      network_count: 0,
+      total_tokens: rs.total_tokens,
+    });
+  }
+  for (const rev of reviewerStats) {
+    const existing = byKey.get(rev.role_key);
+    if (existing) {
+      existing.counter_reviewer_passes = rev.counter_reviewer_passes;
+    }
+  }
+  for (const e of byKey.values()) {
+    e.network_count = networkCounts.get(e.role_key) ?? 0;
+  }
+
+  return [...byKey.values()].sort((a, b) => a.role_key.localeCompare(b.role_key));
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +935,13 @@ const TASK_UPDATABLE = new Set([
   "recap_md",
   "paused",
   "network_id",
+  "git_branch",
+  "git_base_branch",
+  "stale_reason",
+  "git_worktree_path",
+  "reconcile_status",
+  "reconcile_detail",
+  "wrote_source",
 ]);
 
 export function updateTask(
@@ -891,6 +1016,9 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       coverage_json = NULL,
       artifact_path = NULL,
       workspace = NULL,
+      git_worktree_path = NULL,
+      reconcile_status = NULL,
+      reconcile_detail = NULL,
       parent_task_id = NULL,
       task_type = 'root',
       step_number = NULL,
@@ -985,11 +1113,35 @@ export function listRoleRuns(taskId: string): RoleRunRow[] {
     .all(taskId) as RoleRunRow[];
 }
 
+export function getRoleRun(id: number): RoleRunRow | undefined {
+  return getDb().prepare(`SELECT * FROM role_runs WHERE id = ?`).get(id) as RoleRunRow | undefined;
+}
+
 /** Critique/second-review runs recorded against a specific primary run. */
 export function listCritiquesForRun(runId: number): RoleRunRow[] {
   return getDb()
     .prepare(`SELECT * FROM role_runs WHERE target_run_id = ? ORDER BY id ASC`)
     .all(runId) as RoleRunRow[];
+}
+
+/** Record the checkpoint commit created right after a primary run's artifact commit. */
+export function setRoleRunCommitSha(id: number, sha: string): void {
+  getDb().prepare(`UPDATE role_runs SET git_commit_sha = ? WHERE id = ?`).run(sha, id);
+}
+
+/** Update a run's open_questions_json — used to mark a guess "confirmed"/"invalidated"
+ *  once a human's later answer has been compared against it. */
+export function setRoleRunOpenQuestions(id: number, openQuestionsJson: string): void {
+  getDb().prepare(`UPDATE role_runs SET open_questions_json = ? WHERE id = ?`).run(openQuestionsJson, id);
+}
+
+/**
+ * Checkpoint restore: drop every role_runs row (primary, critique, second_review)
+ * created after the checkpoint being restored to. Ids are creation-ordered, so
+ * `id > id` captures everything that happened after it regardless of run_kind.
+ */
+export function deleteRoleRunsAfter(taskId: string, id: number): void {
+  getDb().prepare(`DELETE FROM role_runs WHERE task_id = ? AND id > ?`).run(taskId, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1187,14 @@ export function listInterventions(taskId: string): InterventionRow[] {
 
 export function markInterventionConsumed(id: number): void {
   getDb().prepare(`UPDATE interventions SET consumed_at = ? WHERE id = ?`).run(now(), id);
+}
+
+/** Checkpoint restore: discard unconsumed interventions from after the checkpoint
+ *  so they can't fire against a plan/run history that no longer exists. */
+export function deleteUnconsumedInterventionsAfter(taskId: string, createdAt: string): void {
+  getDb()
+    .prepare(`DELETE FROM interventions WHERE task_id = ? AND consumed_at IS NULL AND created_at > ?`)
+    .run(taskId, createdAt);
 }
 
 // ---------------------------------------------------------------------------

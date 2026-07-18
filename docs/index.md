@@ -42,4 +42,4 @@ features:
 
 ## Status
 
-Orchestra is in **alpha**. The full pipeline — ingest, planning, role execution, per-step adversarial critique, gating with optional LLM routing advisors, coverage rollup, decomposition, and the React UI — is implemented and typechecks/builds. Successful LLM refinement depends on a reachable, tool-capable model.
+Orchestra is in **alpha**. The full pipeline — ingest, planning, concurrent role execution across per-task git worktrees, per-step adversarial critique, gating with optional LLM routing advisors (including checkpoint restore and answer reincorporation), coverage rollup, decomposition, and the React UI — is implemented and typechecks/builds. Successful LLM refinement depends on a reachable, tool-capable model.

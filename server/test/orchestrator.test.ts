@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Verdict } from "../src/agent";
-import { closeDb, createProject, getTask, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
+import { closeDb, createProject, getTask, listInterventions, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
@@ -13,12 +14,15 @@ import {
   nextPending,
   parseDecompositionTree,
   planFromTemplate,
+  reincorporateAnswer,
   resetRoleRunner,
+  restoreCheckpoint,
   setRoleRunner,
   tick,
+  tickOnce,
 } from "../src/orchestrator";
 import type { RoleRunner } from "../src/orchestrator";
-import { resetRouterFns, setSecondReviewFn } from "../src/router";
+import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn } from "../src/router";
 import { freshDb, tempGitRepo } from "./helpers";
 
 afterEach(() => {
@@ -104,13 +108,6 @@ describe("applyPlanMutation", () => {
     expect(roles[roles.indexOf("explorer") + 1]).toBe("privacy_review");
   });
 
-  it("rerun sets the matching step back to pending", () => {
-    const plan = planFromTemplate("error_file");
-    plan.steps[0]!.status = "done";
-    applyPlanMutation(plan, "rerun_role", { role: plan.steps[0]!.role }, isTerminal);
-    expect(plan.steps[0]!.status).toBe("pending");
-  });
-
   it("deepen bumps depth and re-pends", () => {
     const plan = planFromTemplate("error_file");
     plan.steps[1]!.status = "done";
@@ -150,6 +147,7 @@ function fakeRunner(
     fallback: false,
     stalled: false,
     thinkingText: "",
+    filesWritten: [],
   });
 }
 
@@ -202,6 +200,7 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
       fallback: false,
       stalled: false,
       thinkingText: "",
+      filesWritten: [],
     };
   };
 }
@@ -254,9 +253,21 @@ describe("orchestrator loop (integration)", () => {
     // critique run at the reviewer step (error_file's reviewDepth is "terminal_only").
     expect(listRoleRuns(t.task_id).length).toBe(ROUTING_TEMPLATES.error_file.length + 1);
     expect(listRoleRuns(t.task_id).filter((r) => r.role_key === "critic").length).toBe(1);
-    // Artifact moved into READY and exists on disk.
+    // Artifact moved into READY, committed on the task's own checkpoint branch.
     expect(t.artifact_path).toContain("READY");
+    expect(t.git_branch).toBeTruthy();
+    expect(t.git_base_branch).toBeTruthy();
+    expect(t.git_worktree_path).toBeTruthy();
+    // Reconciliation merges the task's branch back into base on completion...
+    expect(t.reconcile_status).toBe("merged");
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
+      .toString()
+      .trim();
+    expect(currentBranch).toBe(t.git_base_branch);
+    // ...so the artifact is present in the shared checkout too, not just the
+    // task's own worktree, once reconciliation has run.
     expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
+    expect(fs.existsSync(path.join(t.git_worktree_path!, t.artifact_path!))).toBe(true);
     // Decomposition produced child tasks.
     expect(listTasks({ parentTaskId: t.task_id }).length).toBeGreaterThan(0);
     // INTAKE original was consumed (moved out).
@@ -282,11 +293,58 @@ describe("orchestrator loop (integration)", () => {
     writeArtifact(path.join(repo, "PLANNING", "INTAKE", "one.log"), "boom");
     setRoleRunner(fakeRunner("pass"));
 
-    // Fire two ticks at once; the mutex must prevent double-ingest.
+    // Fire two ticks at once; per-task tracking must prevent double-ingest
+    // and double-dispatch even though different tasks CAN now run concurrently.
     await Promise.all([tick(), tick()]);
 
     const roots = listTasks({ projectId }).filter((t) => t.parent_task_id == null);
     expect(roots.length).toBe(1);
+  });
+
+  it("dispatches multiple tasks' role-steps concurrently, each in its own worktree", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "a.log"), "boom a");
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "b.log"), "boom b");
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    setRoleRunner(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight--;
+      return {
+        findings: {
+          verdict: "pass" as Verdict,
+          summary: "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\nok\n",
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    });
+
+    // One round with two free slots: ingest creates both tasks, then both
+    // get dispatched together — this is the actual point of worktrees, so
+    // it must be a genuine wall-clock overlap, not just two disjoint steps.
+    await tickOnce(2);
+
+    expect(maxInFlight).toBe(2);
+    const roots = listTasks({ projectId }).filter((t) => t.parent_task_id == null);
+    expect(roots.length).toBe(2);
+    // Each task got its own worktree directory.
+    const worktrees = new Set(roots.map((t) => t.git_worktree_path));
+    expect(worktrees.size).toBe(2);
+    for (const t of roots) expect(fs.existsSync(t.git_worktree_path!)).toBe(true);
   });
 
   it("loops back to the owner role when the counter-reviewer fails, then reaches READY", async () => {
@@ -360,6 +418,7 @@ describe("orchestrator loop (integration)", () => {
       stalled: false,
       stopReason: "length",
       thinkingText: "the model was thinking hard",
+      filesWritten: [],
     }));
 
     await drainTicks(projectId, () => listRoleRuns(rootTask(projectId)!.task_id).length > 0, 5);
@@ -421,6 +480,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
 
@@ -460,6 +520,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
     setSecondReviewFn(async () => ({ decision: "accept", reasoning: "false positive, proceed" }));
@@ -502,6 +563,7 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
         fallback: false,
         stalled: false,
         thinkingText: "",
+        filesWritten: [],
       };
     });
 
@@ -516,5 +578,252 @@ describe("counter-review overhaul: adversarial critique + second review", () => 
     // Only the reviewer step is critiqued under "terminal_only" — intake_triage
     // never went through the critic.
     expect(runs.filter((r) => r.role_key === "critic").length).toBe(1);
+  });
+});
+
+describe("checkpoint restore", () => {
+  it("gives the task its own branch and records a checkpoint commit per role run", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(fakeRunner("pass"));
+
+    await tick(); // ingest + plan + first role step (all in one tick)
+
+    const t = rootTask(projectId)!;
+    expect(t.git_branch).toMatch(/^orchestra\//);
+    expect(t.git_base_branch).toBeTruthy();
+    expect(t.git_worktree_path).toBeTruthy();
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: t.git_worktree_path! })
+      .toString()
+      .trim();
+    expect(currentBranch).toBe(t.git_branch);
+
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.length).toBe(1);
+    expect(runs[0]!.git_commit_sha).toBeTruthy();
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: t.git_worktree_path! }).toString().trim();
+    expect(runs[0]!.git_commit_sha).toBe(headSha);
+  });
+
+  it("rolls a task back to an earlier checkpoint, discarding later runs and resuming from there", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(fakeRunner("pass"));
+
+    await tick(); // ingest + plan + step 1
+    await tick(); // step 2
+    await tick(); // step 3
+
+    const before = rootTask(projectId)!;
+    const runsBefore = listRoleRuns(before.task_id);
+    expect(runsBefore.length).toBe(3);
+    const checkpoint = runsBefore[0]!;
+    const secondRun = runsBefore[1]!;
+
+    await restoreCheckpoint(before.task_id, checkpoint.id);
+
+    const after = getTask(before.task_id)!;
+    expect(after.stage).toBe("refining");
+    expect(after.exit_state).toBeNull();
+
+    // Only the restored-to run (and anything before it) survives.
+    const runsAfter = listRoleRuns(after.task_id);
+    expect(runsAfter.map((r) => r.id)).toEqual([checkpoint.id]);
+
+    // The plan reflects exactly what survived: step 0 done, the rest pending.
+    const plan = JSON.parse(after.refinement_plan_json!) as { steps: Array<{ role: string; status: string }> };
+    expect(plan.steps[0]!.status).toBe("done");
+    expect(plan.steps[0]!.role).toBe(checkpoint.role_key);
+    expect(plan.steps.slice(1).every((s) => s.status === "pending")).toBe(true);
+
+    // The branch's HEAD is back at the checkpoint commit.
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: after.git_worktree_path! }).toString().trim();
+    expect(headSha).toBe(checkpoint.git_commit_sha);
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: after.git_worktree_path!,
+    })
+      .toString()
+      .trim();
+    expect(currentBranch).toBe(after.git_branch);
+
+    // The restore is recorded in the steering log for audit.
+    expect(listInterventions(after.task_id).some((iv) => iv.kind === "restore_checkpoint")).toBe(true);
+
+    // The scheduler resumes and re-runs the step that followed the checkpoint.
+    await tick();
+    const runsResumed = listRoleRuns(after.task_id);
+    expect(runsResumed.length).toBe(2);
+    expect(runsResumed[1]!.role_key).toBe(secondRun.role_key);
+    expect(runsResumed[1]!.id).not.toBe(secondRun.id); // a fresh run, not the discarded one
+  });
+
+  it("rejects restoring to a run with no checkpoint commit or from another task", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Traceback: boom");
+    setRoleRunner(fakeRunner("pass"));
+    await tick();
+    await tick();
+    const t = rootTask(projectId)!;
+    const run = listRoleRuns(t.task_id)[0]!;
+
+    await expect(restoreCheckpoint("not-a-real-task", run.id)).rejects.toThrow(
+      "checkpoint not found for this task",
+    );
+  });
+});
+
+describe("best-effort guesses + auto-reincorporation", () => {
+  /** A runner that records a guessed open question on its first call only,
+   *  and passes cleanly (no questions) on every call after. */
+  function runnerWithGuess(question: string, assumedAnswer: string, confidence: "low" | "medium" | "high"): RoleRunner {
+    let calls = 0;
+    return async () => {
+      calls += 1;
+      return {
+        findings: {
+          verdict: "pass",
+          summary: "pass from fake",
+          open_questions:
+            calls === 1
+              ? [{ question, assumed_answer: assumedAnswer, confidence, resolved: "assumed" as const }]
+              : [],
+          coverage: [{ concern: "security", status: "considered" }],
+          section_md: "## role\n- [epic] Epic\n- [task] implement the fix\n",
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 3,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    };
+  }
+
+  const QUESTION = "What logging framework does this project use?";
+
+  it("a guessed open question does not escalate the task — pass/needs_more proceeds normally", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(runnerWithGuess(QUESTION, "probably the existing one", "low"));
+
+    await tick(); // ingest + first role step
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("refining"); // not escalated by the mere presence of a guess
+    const run = listRoleRuns(t.task_id)[0]!;
+    const questions = JSON.parse(run.open_questions_json!) as Array<{ resolved: string; confidence: string }>;
+    expect(questions[0]!.resolved).toBe("assumed");
+    expect(questions[0]!.confidence).toBe("low");
+  });
+
+  it("marks a guess confirmed and leaves the task untouched when the human's answer matches it", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ router: { enabled: true, answerReincorporation: true } }),
+    });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(runnerWithGuess(QUESTION, "the existing one", "medium"));
+    setAnswerMatchFn(async () => ({ decision: "confirms", reasoning: "matches" }));
+
+    await tick();
+    const before = rootTask(projectId)!;
+    updateTask(before.task_id, { stage: "review" }); // simulate escalation for an unrelated reason
+
+    await reincorporateAnswer(before.task_id, QUESTION, "yeah, the existing one");
+
+    const after = getTask(before.task_id)!;
+    expect(after.stage).toBe("review"); // untouched
+    const run = listRoleRuns(before.task_id)[0]!;
+    const questions = JSON.parse(run.open_questions_json!) as Array<{ resolved: string }>;
+    expect(questions[0]!.resolved).toBe("confirmed");
+    expect(listInterventions(before.task_id).some((iv) => iv.kind === "restore_checkpoint")).toBe(false);
+  });
+
+  it("rolls the task back to right after the guess when the human's answer contradicts it", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ router: { enabled: true, answerReincorporation: true } }),
+    });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(runnerWithGuess(QUESTION, "probably console.log", "low"));
+    setAnswerMatchFn(async () => ({ decision: "contradicts", reasoning: "mismatch" }));
+
+    await tick();
+    const before = rootTask(projectId)!;
+    const checkpoint = listRoleRuns(before.task_id)[0]!;
+    updateTask(before.task_id, { stage: "review" });
+
+    await reincorporateAnswer(before.task_id, QUESTION, "actually we use pino");
+
+    const after = getTask(before.task_id)!;
+    expect(after.stage).toBe("refining"); // rolled back and resumable, like a manual restore
+
+    const runsAfter = listRoleRuns(after.task_id);
+    expect(runsAfter.map((r) => r.id)).toEqual([checkpoint.id]); // nothing after it survives
+    const questions = JSON.parse(runsAfter[0]!.open_questions_json!) as Array<{ resolved: string }>;
+    expect(questions[0]!.resolved).toBe("invalidated");
+
+    const ivs = listInterventions(after.task_id);
+    expect(ivs.some((iv) => iv.kind === "restore_checkpoint")).toBe(true);
+    const steerNote = ivs.find(
+      (iv) => iv.kind === "steer_note" && (JSON.parse(iv.payload_json ?? "{}") as { text?: string }).text?.includes("actually we use pino"),
+    );
+    expect(steerNote).toBeTruthy();
+
+    // The pipeline actually resumes afterward, not just a state flip.
+    await tick();
+    expect(listRoleRuns(after.task_id).length).toBe(2);
+  });
+
+  it("does nothing while the task is still refining — the answer is left for ordinary context instead", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ router: { enabled: true, answerReincorporation: true } }),
+    });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(runnerWithGuess(QUESTION, "probably console.log", "low"));
+    setAnswerMatchFn(async () => ({ decision: "contradicts", reasoning: "mismatch" }));
+
+    await tick();
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("refining");
+
+    await reincorporateAnswer(t.task_id, QUESTION, "actually we use pino");
+
+    const after = getTask(t.task_id)!;
+    expect(after.stage).toBe("refining");
+    const run = listRoleRuns(t.task_id)[0]!;
+    const questions = JSON.parse(run.open_questions_json!) as Array<{ resolved: string }>;
+    expect(questions[0]!.resolved).toBe("assumed"); // never even compared
+  });
+
+  it("does nothing when the router's answerReincorporation call point is disabled (the default)", async () => {
+    const { repo, projectId } = setupProject();
+    // No router config set — resolveRouterConfig defaults every call point to off.
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(runnerWithGuess(QUESTION, "probably console.log", "low"));
+    setAnswerMatchFn(async () => ({ decision: "contradicts", reasoning: "mismatch" }));
+
+    await tick();
+    const t = rootTask(projectId)!;
+    updateTask(t.task_id, { stage: "review" });
+
+    await reincorporateAnswer(t.task_id, QUESTION, "actually we use pino");
+
+    const after = getTask(t.task_id)!;
+    expect(after.stage).toBe("review"); // untouched — call point never ran
+    const run = listRoleRuns(t.task_id)[0]!;
+    const questions = JSON.parse(run.open_questions_json!) as Array<{ resolved: string }>;
+    expect(questions[0]!.resolved).toBe("assumed");
   });
 });

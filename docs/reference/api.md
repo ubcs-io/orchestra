@@ -29,7 +29,15 @@ Named model configs are reusable endpoint + model profiles, separate from (and a
 | POST | `/api/model-configs/:id/set-default` | Set a config as the global default. |
 | POST | `/api/model-configs/reorder` | Reorder configs — body `{ "ids": [3, 1, 2] }` in the desired order. |
 | POST | `/api/model-stats` | Radar/stats-table data per config: context window, max tokens, reasoning, quantization score, parameter counts (dense and MoE-aware active/total), estimated cost per 1M tokens, and historical usage (runs, total tokens, avg tokens/run) aggregated from actual role-run history. |
-| GET | `/api/ping-network/stream` | SSE: checks connectivity to every configured model endpoint's `/models` route and streams per-node `checking → ok/down` results as they resolve. |
+| GET | `/api/ping-model/:id` | Check connectivity for a single model config's `/models` route. Returns `{ config_id, available, error? }`. |
+| GET | `/api/ping-network/stream` | SSE: checks connectivity to every configured model endpoint's `/models` route and streams per-node `checking → ok/down` results as they resolve. Each config in the initial listing carries a `location` label (derived from its `base_url`, e.g. local/tailnet/cloud) alongside its name and base URL. |
+
+## Roles
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/roles` | List all roles, global + merged with a project's overrides if `?project_id=` is given. Used by the network editor's role palette. |
+| GET | `/api/roles/stats` | Per-role-key usage stats aggregated across all projects: `total_calls`, `pass_count`, `counter_reviewer_passes` (times a run's linked critique/second-review passed), `network_count` (how many agent networks include the role), `total_tokens`. Powers the call/pass/review/nets/tokens pills on the Roles Editor. |
 
 ## Scheduler
 
@@ -60,33 +68,34 @@ Named model configs are reusable endpoint + model profiles, separate from (and a
 | PATCH | `/api/tasks/:id` | Edit a task's name/content while in intake stage. |
 | POST | `/api/tasks` | Create a manual task (without a repo file). |
 | POST | `/api/tasks/:id/reset` | Reset a task to intake state (clears history). |
+| POST | `/api/tasks/:id/restore` | Roll a task back to the git checkpoint left by one of its own role runs. Body: `{ "role_run_id": <id> }`. Discards every `role_runs` row (and any unconsumed interventions) created after that run, resets the task's plan/stage back to right after it, and hard-resets its checkpoint branch to that run's recorded commit. Only valid for a `primary` run that has a recorded `git_commit_sha`. |
 | POST | `/api/tasks/:id/subtasks` | Create a child task under a parent. |
 | POST | `/api/tasks/:id/questions/decompose` | Spin an open review question off into its own child **Question Flow** subtask. Body: `{ "role_key": "...", "question": "..." }`. Idempotent — re-submitting the same `role_key` + `question` for a task returns the existing child instead of creating a duplicate. Response: `{ task, created }`. |
 | POST | `/api/tasks/:id/chat` | Send a free-text follow-up chat message against a task, persisted to `task_chat_messages`. Used by the inline decomposed-child preview so you can ask a quick question without navigating away. |
 
 ## Interventions
 
-All interventions use `POST /api/tasks/:id/interventions` with a JSON body:
+All interventions use `POST /api/tasks/:id/interventions` with a JSON body of `{ "kind": "...", "payload": { ... } }`:
 
 ```json
 {
-  "action": "inject_role",
-  "roleKey": "privacy_review"
+  "kind": "inject_role",
+  "payload": { "role": "privacy_review" }
 }
 ```
 
-| Action | Body Fields | Purpose |
+| Kind | Payload | Purpose |
 |---|---|---|
 | `pause` | — | Pause at next role boundary. |
 | `resume` | — | Resume a paused task. |
-| `rerun_role` | — | Re-run the most recent role. |
-| `deepen` | — | Re-run with extended tool budget. |
-| `inject_role` | `roleKey` | Insert a one-off role into the plan. |
-| `steer_note` | `note` | Add a note to upcoming role context. |
-| `pin_question` | `question` | Pin a question for roles to address. |
-| `promote_role` | `roleKey` | Promote an injected role to standing policy. |
+| `deepen` | `{ role }` | Re-queue `role` to run again with an extra depth level. |
+| `inject_role` | `{ role, after? }` | Insert a one-off role into the plan, immediately after step `after` (or before the terminal role if omitted). |
+| `steer_note` | `{ text }` | Add a note to upcoming role context. |
+| `pin_question` | `{ text }` | Pin a question for upcoming roles to address. |
+| `promote_role` | `{ role }` | Promote an injected role to standing project policy. |
 | `run_now` | — | Trigger immediate processing. |
 | `wont_do` | — | Close the task as won't-do: sets `stage: "ready"`, `exit_state: "wont_do"`, and pauses it. |
+| `question_answer` | `{ role_key, question, answer }` | Answer an open question a role raised. If the task is already at `stage: "review"` (no scheduler pass left to consume it), this triggers [answer reincorporation](/reference/config#strategic-llm-routing-advisors) directly instead of waiting: the `answerReincorporation` router call point compares the human answer against the role's recorded guess and, on a genuine mismatch, restores the task to right after that role and re-runs downstream steps with the corrected answer. No-op if that call point is disabled, the task isn't in `review`, or the question doesn't match a recorded guess. |
 
 ## Networks
 

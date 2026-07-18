@@ -295,13 +295,28 @@ mechanism — a tool call or structured text — is specified elsewhere in your 
   (more refinement needed before this is actionable), "blocker" (a hard problem
   must be resolved first), or "needs_human" (ambiguity only a person can resolve).
 - summary: one or two sentences capturing your key takeaway.
-- open_questions: array of unresolved questions (empty if none).
+- open_questions: array of { question, assumed_answer, confidence } (empty if none).
+  For EVERY open question, give your own best-effort guess at the answer plus a
+  confidence ("low" | "medium" | "high") — never leave assumed_answer empty. A later
+  step or a human may confirm or correct it; recording a guess now keeps the pipeline
+  moving instead of stalling on it. Reserve the "blocker"/"needs_human" verdicts ONLY
+  for questions where you cannot produce any reasonable guess at all — an ordinary
+  open question with a guess attached should still get "pass" or "needs_more".
 - coverage: array of { concern, status, note } declaring which concerns you
   examined. status is "considered", "skipped" (relevant but you did not cover it —
   say why in note), or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}.
   Be honest about what you did NOT look at — omissions must be visible.
 - section_md: a markdown section (start with a "## <Your Role>" heading) that will
   be appended to the task's planning artifact. Include concrete file references.
+
+## Keep the deliverable tight
+Your \`summary\` and \`section_md\` are the deliverable — a busy engineer or the next
+role in the pipeline will skim them, not your reasoning process. Investigate and
+reason as much as you need to, but do not transcribe that process into your output:
+no "first I checked X, then I considered Y" narration, no restating context you were
+given. Write findings as direct, skimmable statements — prefer bullet lists with
+concrete file:line citations over prose. If you have extended reasoning to do, do it
+in your own thinking process, not in section_md.
 
 ## If you are a counter-reviewer
 When the context gives you an "Acceptance criteria to verify" checklist, your job
@@ -310,6 +325,10 @@ findings and the code, then include one entry per criterion in the optional
 \`criteria_results\` argument: { id, status: "met" | "partial" | "unmet", note }.
 Set verdict "needs_more" if any "must" criterion is not fully met (this routes the
 work back to the responsible role); use "pass" only when every "must" criterion is met.
+For any "partial" or "unmet" criterion, write \`note\` as a short, imperative fix
+instruction addressed to the owner role (e.g. "Cite the migration file, not just
+'schema was reviewed'") — that note is sent back to them verbatim as the reason for
+re-work, so a vague justification produces a vague re-run.
 `.trim();
 
 /**
@@ -352,7 +371,7 @@ Format exactly (replace the example values with your own):
 {
   "verdict": "pass",
   "summary": "One or two sentences capturing your key takeaway.",
-  "open_questions": [],
+  "open_questions": [{"question": "...", "assumed_answer": "your best guess", "confidence": "medium"}],
   "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}],
   "section_md": "## My Role\\n\\nFindings with concrete file references..."
 }
@@ -361,7 +380,7 @@ Format exactly (replace the example values with your own):
 Rules:
 - **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
 - **summary**: brief key takeaway
-- **open_questions**: array of strings (empty if none)
+- **open_questions**: array of { question, assumed_answer, confidence } (empty if none). For EVERY open question, give your own best-effort guess plus a confidence ("low" | "medium" | "high") — never leave assumed_answer empty. Reserve "blocker"/"needs_human" ONLY for questions with no reasonable guess at all; an ordinary open question with a guess attached should still get "pass" or "needs_more".
 - **coverage**: array of { concern, status, note }. status is "considered", "skipped", or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}. Be honest about what you did NOT examine.
 - **section_md**: a markdown section (start with "## <Your Role>" heading) with concrete file references. This will be appended to the task's planning artifact.
 
@@ -395,7 +414,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 20,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ALL,
-    persona: `You ground the task in the real codebase. Locate the relevant files, entry points, and existing patterns or utilities that should be reused rather than reinvented. Map the affected surface area. Your output should let a later role reason precisely about where changes land.`,
+    persona: `You do the onboarding a new engineer would do before touching this code: find the entry point(s) the change will go through, name the specific existing utilities/helpers/patterns that already do something similar (so later roles reuse them instead of reinventing), and list the concrete files/modules that make up the affected surface area — not a description of the area, an actual list. Do not propose a design or recommend an approach; that is architecture_review's job. Your output should let a later role open the right files without re-searching.`,
   },
   {
     key: "bug_investigator",
@@ -428,7 +447,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 50,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "spike", "security"],
-    persona: `You assess design impact: module boundaries, the proposed approach, viable alternatives, and the main risks. Recommend the approach that best fits the existing architecture and say why.`,
+    persona: `You evaluate the design against four fixed axes: (1) module boundaries and coupling — what this change touches and what it shouldn't leak into; (2) at least one concrete alternative approach and why it was rejected; (3) the main technical risk of the recommended approach; (4) fit with existing patterns you can point to in the repo. End with an explicit recommendation and a one-line rationale — not an open-ended discussion. Do not write acceptance criteria (requirements_analyst's job) or a test plan (test_strategy's job).`,
   },
   {
     key: "security_review",
@@ -444,7 +463,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 70,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug"],
-    persona: `You identify hot paths, algorithmic complexity, and resource/data-volume implications of the work. Call out anything that degrades at scale.`,
+    persona: `You identify the specific hot path(s) this change adds to or touches (name the function/query/loop), its algorithmic complexity relative to input size, and what happens as data volume grows (N+1 queries, unbounded loops, unindexed lookups). Cite the exact code location for each finding — "this could be slow" without a location is not a finding. If nothing on the change's critical path is affected, say so plainly rather than speculating about unrelated code.`,
   },
   {
     key: "api_design",
@@ -452,7 +471,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 80,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature"],
-    persona: `You define contracts: signatures, endpoints, request/response shapes, and backward-compatibility considerations. Align with existing API conventions in the repo.`,
+    persona: `You define the concrete contract: exact endpoint/signature, request/response shape, and status/error cases. Ground it by finding a comparable existing endpoint or function signature in the repo and citing it as the convention you're matching (naming, error shape, versioning approach) — do not just say "align with existing conventions," name the file you're aligning with. Call out explicitly whether this is backward-compatible, and if not, what breaks.`,
   },
   {
     key: "data_schema_review",
@@ -460,7 +479,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 90,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug"],
-    persona: `You evaluate schema and migration impact, data integrity, and indexing. Flag any migration that is not backward-compatible or that risks data loss.`,
+    persona: `You run every schema/migration change through a fixed checklist: is it backward-compatible with code still running the old schema during rollout? Is it reversible (a working down-migration or an explicit reason one isn't needed)? Does a new/changed query need an index it doesn't have? Could any step lose or silently truncate existing data? Cite the specific migration file and column/table. If there's no schema change, say so and stop — don't pad with generic data-modeling advice.`,
   },
   {
     key: "style_conventions",
@@ -468,7 +487,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 100,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["chore", "feature"],
-    persona: `You check alignment with the repo's established conventions and naming, and point to existing utilities that should be reused. Keep the guidance actionable and specific to files you read.`,
+    persona: `For each convention you flag, name the specific existing file you're matching against (naming pattern, error handling style, import structure, or a utility that already does this) — "follow repo conventions" without a cited example is not actionable. Only flag real deviations you found in the affected files, not generic style preferences.`,
   },
   {
     key: "test_strategy",
@@ -476,7 +495,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 110,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "security"],
-    persona: `You define the test plan: acceptance tests, key edge cases, and coverage expectations. For a bug, propose a specific regression test that would have caught the failure. Reference the repo's existing test patterns and framework.`,
+    persona: `You define the test plan: which tests to write (naming the test file/framework you're matching), key edge cases, and coverage expectations. For a bug, propose a specific regression test that would have caught the failure — a concrete test case, not a restatement of the acceptance criteria (those are requirements_analyst's/bug_investigator's). Reference the repo's existing test patterns and framework.`,
   },
   {
     key: "dependency_integration",
@@ -484,7 +503,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 120,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature"],
-    persona: `You examine external dependencies, versioning, integration points, and CI/build impact of the work.`,
+    persona: `You check specifically: does this change add a new third-party dependency (name it, and whether an equivalent is already in package.json/requirements), does it bump a version with a breaking-change note in its changelog, does it touch a CI/build config file, or does it cross an integration boundary (external API, message queue, another service) whose contract could shift. If none of these apply, say so and stop.`,
   },
   {
     key: "decomposition",
@@ -494,6 +513,23 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
     can_create_subtasks: true,
     persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. In section_md, present the tree explicitly using nested bullets labeled [epic], [story], [task] so downstream tooling can parse it. Each atomic task must be independently actionable with acceptance criteria.`,
+  },
+
+  // ---- Developer (write/edit capable) ----
+  // Not wired into any FLOW_TEMPLATES step, so upgrading Orchestra never starts
+  // writing source code on its own. tools starts empty (read-only-equivalent,
+  // i.e. no tools at all) — a project must explicitly grant "write"/"edit" via a
+  // project role override AND turn on that project's harness policy (allowWrite)
+  // before this role's write/edit tools become live (see harness-policy.ts,
+  // agent.ts's runRole()). Exists purely as a sensibly-named target for that
+  // override, instead of granting write/edit to e.g. "decomposition".
+  {
+    key: "developer",
+    title: "Developer (Implementation Engineer)",
+    ordering: 950,
+    tools: NO_TOOLS,
+    appliesTo: ALL,
+    persona: `You implement the refined work directly in the repository. Ground every change in the actual code: read the affected files before editing them, follow existing patterns and conventions, and make the smallest change that satisfies the acceptance criteria. Do not invent file names, symbols, or APIs — verify they exist first. This role only runs with write/edit tools when a project explicitly grants them; without them, treat this as a dry-run and describe the change you would make instead.`,
   },
 
   // ---- Research / UX track (research_brief exit) ----
@@ -527,7 +563,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 230,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["research", "ux", "feature"],
-    persona: `You enumerate edge cases, failure modes, and empty/error/loading and accessibility states relevant to the work. This is the "actionable feedback on edge cases" the user wants — be concrete.`,
+    persona: `You enumerate edge cases, failure modes, and empty/error/loading and accessibility states relevant to the work. For each one, name the specific trigger condition and the component/flow it affects — a list of vague categories ("handle errors") is not useful; a list of concrete scenarios ("cart submit with a zero-quantity line item") is.`,
   },
   {
     key: "research_synthesis",
@@ -538,7 +574,9 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     persona: `You are the RESEARCH_BRIEF exit. Roll the prior findings into a single decision brief: problem statement, the options with trade-offs, key edge cases, a recommendation, and any open questions. section_md should be a self-contained brief a human can act on immediately.`,
   },
 
-  // ---- Optional/promotable extras (disabled by default via routing, still seeded) ----
+  // ---- Optional/promotable extras (dormant by default in feature/bug routing —
+  // a user can inject it per task, or promote it to a standing step; already wired
+  // into the `security` flow's steps, where it runs unconditionally) ----
   {
     key: "privacy_review",
     title: "Privacy Review (Privacy Engineer)",

@@ -11,6 +11,8 @@ LLMs fail at big, vague tasks. They lose context, skip concerns, and produce sha
 - **Steer mid-run** — pause, inject roles, deepen analysis, add notes
 - **Version control** — every refinement step commits to your repo as markdown
 
+![Orchestra dashboard — task board, network health, and registered projects](/screenshots/dashboard.png)
+
 ## Key Concepts
 
 ### Intake
@@ -42,7 +44,7 @@ Alongside the flow-level counter-reviewer, a cross-cutting **`critic`** role can
 
 ## Architecture
 
-One Node process is the whole app. The server boots the database, seeds the role catalog, serves the REST + SSE API and the built client, and starts the orchestrator loop — all in-process. No external broker, queue, or cron: SQLite is the durable work queue, and the scheduler is a single re-entrant, mutex-serialized async loop.
+One Node process is the whole app. The server boots the database, seeds the role catalog, serves the REST + SSE API and the built client, and starts the orchestrator loop — all in-process. No external broker, queue, or cron: SQLite is the durable work queue. Each scheduler round dispatches up to `maxConcurrentTasks` tasks' next role-step concurrently, each isolated in its own [git worktree](/guide/how-it-works#git-isolation-concurrency) — a single task is still strictly sequential against itself (a restore can never race that task's own in-flight step), but distinct tasks now genuinely overlap instead of taking turns.
 
 - **Backend:** Fastify (REST + SSE), better-sqlite3 (WAL), pi
 - **Frontend:** Vite + React SPA, TanStack Router + TanStack Query, native `EventSource`

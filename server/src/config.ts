@@ -49,6 +49,10 @@ export interface Config {
   schedulerIdleMs: number;
   /** Max tool-calling turns pi may take within a single role run. */
   roleToolBudget: number;
+  /** Max number of tasks the scheduler will run role-steps for concurrently
+   *  (each in its own git worktree). Bounded by disk/IO cost of N full
+   *  working-tree checkouts, not just CPU. */
+  maxConcurrentTasks: number;
 
   /** Directory of the built React client to serve (server/public). */
   clientDir: string;
@@ -82,6 +86,7 @@ const DEFAULTS: Config = {
   dbPath: path.join(REPO_ROOT, "orchestra.db"),
   schedulerIdleMs: 3_000,
   roleToolBudget: 40,
+  maxConcurrentTasks: 3,
   clientDir: path.join(SERVER_DIR, "public"),
   tokenMap: {},
 };
@@ -108,6 +113,7 @@ function readEnv(): Partial<Config> {
   if (e.ORCHESTRA_DB_PATH) out.dbPath = e.ORCHESTRA_DB_PATH;
   if (e.ORCHESTRA_REQUEST_TIMEOUT_MS) out.requestTimeoutMs = Number(e.ORCHESTRA_REQUEST_TIMEOUT_MS);
   if (e.ORCHESTRA_SCHEDULER_IDLE_MS) out.schedulerIdleMs = Number(e.ORCHESTRA_SCHEDULER_IDLE_MS);
+  if (e.ORCHESTRA_MAX_CONCURRENT_TASKS) out.maxConcurrentTasks = Number(e.ORCHESTRA_MAX_CONCURRENT_TASKS);
   if (e.ORCHESTRA_MAX_TOKENS) out.maxTokens = Number(e.ORCHESTRA_MAX_TOKENS);
   if (e.ORCHESTRA_REASONING) out.reasoning = e.ORCHESTRA_REASONING !== "0" && e.ORCHESTRA_REASONING !== "false";
   if (e.ORCHESTRA_THINKING_LEVEL) out.thinkingLevel = e.ORCHESTRA_THINKING_LEVEL as Config["thinkingLevel"];
