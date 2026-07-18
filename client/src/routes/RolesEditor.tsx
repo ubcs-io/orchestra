@@ -1,10 +1,17 @@
 import { useState, useRef, useEffect } from "react";
 import { Link, useParams, useSearch } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Role, type ModelConfig } from "../api";
+import { api, type Role, type ModelConfig, type RoleStats } from "../api";
 
 /** Known pi built-in tools (also serves as the dropdown suggestion list). */
 const KNOWN_TOOLS = ["read", "grep", "find", "ls", "git_history"] as const;
+
+/** Format a number of tokens: 1234 → "1.2k", 1234567 → "1.2M" */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
 
 /** Tag-style input: shows selected items as chips and provides a dropdown to pick. */
 function TagInput({
@@ -272,12 +279,14 @@ function RoleCard({
   defaultOpen,
   modelConfigs,
   defaultModelConfigName,
+  stats,
 }: {
   projectId: number;
   role: Role;
   defaultOpen: boolean;
   modelConfigs: ModelConfig[];
   defaultModelConfigName: string;
+  stats?: RoleStats;
 }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(defaultOpen);
@@ -312,14 +321,27 @@ function RoleCard({
     onSuccess: () => qc.invalidateQueries({ queryKey: ["roles", projectId] }),
   });
 
+  function toggle() {
+    setOpen((o) => !o);
+  }
+
   return (
     <div className="panel" id={`role-${role.key}`}>
-      <div className="row">
-        <button className="small" onClick={() => setOpen((o) => !o)}>{open ? "▾" : "▸"}</button>
+      <div className="row role-card-header" onClick={toggle} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter") toggle(); }}>
+        <span className="collapse-caret">{open ? "▾" : "▸"}</span>
         <strong className="role-card-title">{displayTitle}</strong>
         <span className="pill dim role-card-key">{softwareEquivalent ?? role.key}</span>
         {role.project_id != null && <span className="pill ok">project override</span>}
         {!enabled && <span className="pill bad">disabled</span>}
+        {stats && (
+          <>
+            <span className="pill role-stat" title="Times this role has been called">calls {stats.total_calls}</span>
+            <span className="pill role-stat" title="Verdict = pass">pass {stats.pass_count}</span>
+            <span className="pill role-stat" title="Counter-reviewer passed">review {stats.counter_reviewer_passes}</span>
+            <span className="pill role-stat" title="Networks containing this role">nets {stats.network_count}</span>
+            <span className="pill role-stat" title="Tokens used">{fmtTokens(stats.total_tokens)} t</span>
+          </>
+        )}
       </div>
       {open && (
         <div className="role-editor" style={{ marginTop: 10 }}>
@@ -364,10 +386,21 @@ export function RolesEditor() {
     queryKey: ["model-configs"],
     queryFn: api.modelConfigs,
   });
+  const { data: statsData } = useQuery({
+    queryKey: ["role-stats"],
+    queryFn: api.roleStats,
+  });
 
   const configs = mcData?.configs ?? [];
   const defaultModelConfigName =
     configs.find((c) => c.project_id === null && c.key === "default")?.name ?? "(none)";
+
+  const statsByKey = new Map<string, RoleStats>();
+  if (statsData?.stats) {
+    for (const s of statsData.stats) {
+      statsByKey.set(s.role_key, s);
+    }
+  }
 
   // Scroll to the target role after data loads
   useEffect(() => {
@@ -397,6 +430,7 @@ export function RolesEditor() {
             defaultOpen={r.key === targetRole}
             modelConfigs={configs}
             defaultModelConfigName={defaultModelConfigName}
+            stats={statsByKey.get(r.key)}
           />
         ))
       )}

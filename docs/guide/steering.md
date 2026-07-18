@@ -15,25 +15,26 @@ Orchestra gives you full control over the refinement loop while it's running. Yo
 
 ## Interventions
 
-All interventions are submitted via `POST /api/tasks/:id/interventions` with a JSON body specifying the action type. Available actions:
+All interventions are submitted via `POST /api/tasks/:id/interventions` with a JSON body of `{ "kind": "...", "payload": { ... } }`. Available kinds:
 
-| Action | Description |
+| Kind | Description |
 |---|---|
 | `pause` | Pause the task at the next role boundary. The orchestrator waits until you resume. |
 | `resume` | Resume a paused task. |
-| `rerun_role` | Re-run the most recently completed role (useful after adjusting a role's prompt or model). |
-| `deepen` | Re-run a role with increased thoroughness (extends the role's tool budget and thinking level). |
+| `deepen` | Re-queue a role to run again with increased depth (useful after adjusting a role's prompt or model, or when its analysis feels thin). |
 | `inject_role` | Insert a one-off role into the plan at the current position. Provide the role key and it runs immediately. |
 | `steer_note` | Add a free-text note that will be included in the context of upcoming roles. |
 | `pin_question` | Pin a specific question for upcoming roles to address. |
 | `promote_role` | Promote an injected role into standing project policy — it will auto-run on future tasks of the same intake kind. |
 | `run_now` | Trigger the scheduler to process this specific task immediately, bypassing the idle poll interval. |
 | `wont_do` | Close the task as won't-do — sets it to `ready` with `exit_state: "wont_do"` and pauses it, without waiting for the flow to run to completion. |
+| `question_answer` | Answer an open question a role raised (surfaced via the review call-to-action). If the task is still refining, the answer is picked up on its next step; if it's already at `stage: "review"`, it's reincorporated immediately — see [Checkpoint Restore](#checkpoint-restore) below. |
 
 ## Task Lifecycle
 
 - **Reset** — reset a task back to intake state (clears all refinement history)
-- **Subtasks** — create child tasks under a parent (useful for decomposition of complex work)
+- **Checkpoint Restore** — every completed role run leaves a git checkpoint (the commit right after its artifact commit). From the Task Detail page's role-run history, or `POST /api/tasks/:id/restore` with `{ "role_run_id": <id> }`, you can roll the task back to right after any of its own prior roles — discarding every run and unconsumed intervention after that point and resetting the task's plan/stage to resume from there, as if everything after it never happened. This is also what powers automatic [answer reincorporation](/reference/config#strategic-llm-routing-advisors): when the optional `answerReincorporation` router call point detects that a human's answer contradicts a role's earlier best-effort guess, it restores the task to that role's checkpoint for you and re-runs downstream steps with the corrected answer.
+- **Subtasks** — create child tasks under a parent (useful for decomposition of complex work). Related tasks (a parent and its descendants) are color-grouped on the Project Board so a family stays visually identifiable as it grows.
 - **Question decomposition** — any open question a role raises (surfaced via the review call-to-action on Task Detail) can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), so a tangent gets its own focused refinement pass instead of derailing the parent. The child gets a full task page and can itself decompose its own open questions recursively; an inline chat box on the parent lets you ask it quick follow-ups without navigating away.
 - **Edit** — modify a task's name or content while it's still in the intake stage
 

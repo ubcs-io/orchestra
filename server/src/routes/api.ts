@@ -29,6 +29,7 @@ import {
   getNetwork,
   getNetworkByIntakeKind,
   getProject,
+  getRoleStats,
   getTask,
   listChatMessages,
   listInterventions,
@@ -646,6 +647,11 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   app.delete("/api/projects/:id", async (req: FastifyRequest) => {
     deleteProject(Number((req.params as { id: string }).id));
     return { ok: true };
+  });
+
+  // ---- Role stats (aggregated across all projects) ----
+  app.get("/api/roles/stats", async () => {
+    return { stats: getRoleStats() };
   });
 
   // ---- Roles (per project, merged with globals) ----

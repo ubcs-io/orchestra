@@ -375,6 +375,15 @@ export interface PingResultInit {
   }>;
 }
 
+export interface RoleStats {
+  role_key: string;
+  total_calls: number;
+  pass_count: number;
+  counter_reviewer_passes: number;
+  network_count: number;
+  total_tokens: number;
+}
+
 export const api = {
   health: () => req<{ ok: boolean }>("/api/health"),
   models: () => req<{ models: string[] }>("/api/models"),
@@ -502,6 +511,7 @@ export const api = {
     req<{ export: NetworkExport }>(`/api/networks/${networkId}/export`),
   allRoles: (projectId?: number) =>
     req<{ roles: Role[] }>(`/api/roles${projectId ? `?project_id=${projectId}` : ""}`),
+  roleStats: () => req<{ stats: RoleStats[] }>("/api/roles/stats"),
 
   // Folder picker dialog
   pickFolder: () =>

@@ -105,3 +105,11 @@ Via `GET /api/projects/:id/roles` and `PUT /api/projects/:id/roles/:key` you can
 - Disable a role entirely (it will be skipped in flows)
 
 Project overrides are stored in SQLite and persist across restarts.
+
+## Role Usage Stats
+
+The Roles Editor shows per-role-key pills — **calls**, **pass** (verdict = pass), **review** (counter-reviewer/critique passes), **nets** (agent networks containing the role), and total **tokens** — aggregated across every project via `GET /api/roles/stats`. Use it to spot roles that never pass, rarely get exercised, or burn disproportionate tokens.
+
+## Open Questions
+
+A role isn't required to fully resolve everything it encounters. Alongside `verdict`, `coverage`, and `section_md`, `record_findings` accepts `open_questions`: an array of `{ question, assumed_answer, confidence }`. Every open question must carry the role's own best-effort guess and a confidence (`low`/`medium`/`high`) — this keeps the pipeline moving instead of stalling, so `blocker`/`needs_human` verdicts are reserved for questions with no reasonable guess at all. These surface on the Task Detail review call-to-action, where a human can answer them directly, spin one off into its own [Question Flow subtask](/guide/steering#task-lifecycle), or — if the answer contradicts the guess — trigger the [Answer Match Assessment](/reference/config#strategic-llm-routing-advisors) router call point to roll the task back and redo the affected work.

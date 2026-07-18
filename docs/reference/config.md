@@ -40,6 +40,7 @@ The Settings UI's **Pi Dev Controls** panel is a live view onto these boundaries
 | `dbPath` | `ORCHESTRA_DB_PATH` | `./orchestra.db` | SQLite file path (WAL). |
 | `schedulerIdleMs` | `ORCHESTRA_SCHEDULER_IDLE_MS` | `3000` | Idle poll interval (ms). |
 | `roleToolBudget` | — | `40` | Max tool-calling turns per role run. |
+| `maxConcurrentTasks` | `ORCHESTRA_MAX_CONCURRENT_TASKS` | `3` | Max tasks the scheduler runs role-steps for concurrently, each in its own [git worktree](/guide/how-it-works#git-isolation-concurrency). Bounded by disk/IO cost of N full working-tree checkouts, not just CPU. |
 | `clientDir` | — | `<server>/public` | Built SPA directory served in production. |
 
 ---
@@ -85,7 +86,7 @@ Each config additionally stores:
 
 ## Strategic LLM Routing Advisors
 
-`server/src/router.ts` provides four **optional, narrowly-scoped advisory LLM calls** ("Call Points") layered on top of the deterministic orchestrator, for decision points where fixed heuristics are weakest. All four are **off by default**; each has its own boolean, a hard per-call timeout, and falls back to the existing heuristic default on failure, timeout, or when disabled — the orchestrator always makes and owns the final decision.
+`server/src/router.ts` provides five **optional, narrowly-scoped advisory LLM calls** ("Call Points") layered on top of the deterministic orchestrator, for decision points where fixed heuristics are weakest. All five are **off by default**; each has its own boolean, a hard per-call timeout, and falls back to the existing heuristic default on failure, timeout, or when disabled — the orchestrator always makes and owns the final decision.
 
 | `RouterConfig` field | Call Point | Decides |
 |---|---|---|
@@ -94,8 +95,13 @@ Each config additionally stores:
 | `escalationAssessment` | 2 — Escalation Assessment | Before escalating to human REVIEW: `escalate` \| `reroute` \| `rerun` \| `close`. |
 | `borderlineGateAssessment` | 3 — Borderline Gate Assessment | For partial-criteria / near-loopback-exhaustion gate decisions: `loopback` \| `proceed` \| `proceed_with_note` \| `escalate` \| `narrow_loopback`. |
 | `secondReview` | 4 — Second Review | After every step the [`critic`](/reference/roles#cross-cutting-critique) checks, authoritatively synthesize the primary run + critique into `accept` \| `accept_with_note` \| `escalate` \| `loopback`. |
+| `answerReincorporation` | 5 — Answer Match Assessment | When a human answers an open question on a task already at `stage: "review"`, compare the answer against the role's recorded best-effort guess: `confirms` \| `contradicts`. A `contradicts` result restores the task to right after the guessing role's checkpoint and re-runs downstream steps with a steer note carrying the corrected answer. |
 
 Additional fields: `model` (override model for router calls, falls back to the project's connection default), `maxTokens` (default `1024`), `timeoutMs` (default `15000`).
+
+### Open questions carry a guess
+
+Every open question a role records (`open_questions` in `record_findings`) now carries the role's own best-effort guess alongside it: `{ question, assumed_answer, confidence: "low" | "medium" | "high" }`. This lets the pipeline keep moving past an open question instead of stalling on it — `blocker`/`needs_human` verdicts are reserved for questions where no reasonable guess is possible at all. Once a human answers the question (via the `question_answer` intervention — see [API Reference](/reference/api#interventions)), the guess's `resolved` field becomes `confirmed` or `invalidated`, and Call Point 5 above decides whether the downstream work built on the guess needs to be redone.
 
 Router config is resolved from a project's `config_json`; omitted fields default to `false`/unset (`DEFAULT_ROUTER_CONFIG`).
 

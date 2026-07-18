@@ -442,6 +442,15 @@ export interface AgentNetworkRow {
   updated_at: string;
 }
 
+export interface RoleStatRow {
+  role_key: string;
+  total_calls: number;
+  pass_count: number;
+  counter_reviewer_passes: number;
+  network_count: number;
+  total_tokens: number;
+}
+
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
@@ -607,6 +616,79 @@ export function countGlobalRoles(): number {
     n: number;
   };
   return row.n;
+}
+
+/** Per-role-key aggregated statistics across all projects. */
+export function getRoleStats(): RoleStatRow[] {
+  const d = getDb();
+
+  // Calls + passes + tokens (primary runs only)
+  const runStats = d.prepare(`
+    SELECT
+      role_key,
+      COUNT(*) AS total_calls,
+      SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS pass_count,
+      COALESCE(SUM(tokens), 0) AS total_tokens
+    FROM role_runs
+    WHERE run_kind = 'primary' OR run_kind IS NULL
+    GROUP BY role_key
+  `).all() as Array<{ role_key: string; total_calls: number; pass_count: number; total_tokens: number }>;
+
+  // Counter-reviewer passes: primary runs whose linked critique/second_review has verdict='pass'
+  const reviewerStats = d.prepare(`
+    SELECT
+      r1.role_key,
+      COUNT(*) AS counter_reviewer_passes
+    FROM role_runs r1
+    JOIN role_runs r2 ON r2.target_run_id = r1.id
+    WHERE (r1.run_kind = 'primary' OR r1.run_kind IS NULL)
+      AND r2.run_kind IN ('critique', 'second_review')
+      AND r2.verdict = 'pass'
+    GROUP BY r1.role_key
+  `).all() as Array<{ role_key: string; counter_reviewer_passes: number }>;
+
+  // Network count: count networks whose graph_json contains the role key
+  const networkRows = d.prepare(
+    `SELECT graph_json FROM agent_networks`,
+  ).all() as Array<{ graph_json: string }>;
+
+  const networkCounts = new Map<string, number>();
+  for (const row of networkRows) {
+    // Use regex to find unique role keys in the graph json
+    const matches = row.graph_json.matchAll(/"roleKey"\s*:\s*"([^"]+)"/g);
+    const seen = new Set<string>();
+    for (const m of matches) {
+      const rk = m[1]!;
+      if (!seen.has(rk)) {
+        seen.add(rk);
+        networkCounts.set(rk, (networkCounts.get(rk) ?? 0) + 1);
+      }
+    }
+  }
+
+  // Merge into a map by role_key
+  const byKey = new Map<string, RoleStatRow>();
+  for (const rs of runStats) {
+    byKey.set(rs.role_key, {
+      role_key: rs.role_key,
+      total_calls: rs.total_calls,
+      pass_count: rs.pass_count,
+      counter_reviewer_passes: 0,
+      network_count: 0,
+      total_tokens: rs.total_tokens,
+    });
+  }
+  for (const rev of reviewerStats) {
+    const existing = byKey.get(rev.role_key);
+    if (existing) {
+      existing.counter_reviewer_passes = rev.counter_reviewer_passes;
+    }
+  }
+  for (const e of byKey.values()) {
+    e.network_count = networkCounts.get(e.role_key) ?? 0;
+  }
+
+  return [...byKey.values()].sort((a, b) => a.role_key.localeCompare(b.role_key));
 }
 
 // ---------------------------------------------------------------------------
