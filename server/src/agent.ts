@@ -464,6 +464,60 @@ export function createThinkSplitter() {
   };
 }
 
+const FENCE_MARKER = "```";
+
+/**
+ * Incremental tracker for Markdown code-fence boundaries (```) across streamed
+ * deltas. Used to keep stall detection from being fed the model's final structured
+ * JSON payload once it starts one — repeated short lines inside that payload (e.g.
+ * many `"status": "met",` entries in a criteria_results/coverage array) are normal
+ * and must not be mistaken for a narration stall. Mirrors createThinkSplitter's
+ * partial-marker handling for markers split across chunk boundaries, but simpler
+ * since the fence's open and close marker are the same string (a toggle rather than
+ * an asymmetric pair). Exported for unit testing.
+ */
+export function createFenceTracker() {
+  let buffer = "";
+  let insideFence = false;
+
+  const process = (final: boolean): { outside: string; inside: string } => {
+    let outside = "";
+    let inside = "";
+    for (;;) {
+      const idx = buffer.indexOf(FENCE_MARKER);
+      if (idx === -1) break;
+      const seg = buffer.slice(0, idx);
+      if (insideFence) inside += seg + FENCE_MARKER;
+      else outside += seg + FENCE_MARKER;
+      buffer = buffer.slice(idx + FENCE_MARKER.length);
+      insideFence = !insideFence;
+    }
+    const keep = final ? 0 : partialSuffix(buffer, FENCE_MARKER);
+    const flushable = buffer.slice(0, buffer.length - keep);
+    buffer = buffer.slice(buffer.length - keep);
+    if (insideFence) inside += flushable;
+    else outside += flushable;
+    return { outside, inside };
+  };
+
+  return {
+    /** Feed the next streamed chunk; returns the portion outside any fence (safe
+     *  to feed to the stall detector) and the portion inside a fence (must be
+     *  excluded from stall detection). */
+    push: (delta: string) => {
+      buffer += delta;
+      return process(false);
+    },
+    /** Clear state for a fresh model turn — call alongside stallDetector.reset()
+     *  so a fence left open by an aborted turn doesn't suppress stall detection
+     *  on the next turn's fresh narration. */
+    reset(): void {
+      buffer = "";
+      insideFence = false;
+    },
+  };
+}
+
 // ---- JSON extraction for text-mode and fallback recovery ----
 
 /**
@@ -636,6 +690,12 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
 
   // Stall detection: flags a turn that's narrating a tool call instead of making one.
   const stallDetector = createStallDetector();
+  // Guards against feeding the stall detector the model's final JSON payload, where
+  // repeated short lines (e.g. several coverage/criteria_results entries sharing a
+  // status value) are normal — not a narration loop. Answer and thinking channels
+  // are independent streams, so each gets its own tracker.
+  const answerFenceTracker = createFenceTracker();
+  const thinkingFenceTracker = createFenceTracker();
   let stalled = false;
   let stallEverDetected = false;
   let stallRetried = false;
@@ -858,8 +918,11 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           emitThinking(thinking);
           // In text_mode, only the answer text (not reasoning) feeds stall
           // detection — the model is supposed to "narrate" in <think> blocks.
-          checkStall(text);
-          if (!textMode) checkStall(thinking);
+          // Both channels are filtered through their fence tracker first: once the
+          // model opens a ```-fenced block it's writing its final JSON payload, not
+          // narrating, so that content must not reach the stall detector.
+          checkStall(answerFenceTracker.push(text).outside);
+          if (!textMode) checkStall(thinkingFenceTracker.push(thinking).outside);
 
           // Track answer text length since last tool call for pre-emptive nudge.
           if (text.length > 0) {
@@ -886,7 +949,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           // Native reasoning channel (endpoints that emit reasoning_content).
           const d = ame.delta ?? "";
           emitThinking(d);
-          if (!textMode) checkStall(d);
+          if (!textMode) checkStall(thinkingFenceTracker.push(d).outside);
         }
         break;
       }
@@ -946,6 +1009,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       stalled = false;
       preemptiveNudged = false;
       stallDetector.reset();
+      answerFenceTracker.reset();
+      thinkingFenceTracker.reset();
       answerTextLenSinceLastTool = 0;
       record({ type: "status", message: "retrying: call the tool directly instead of narrating it" });
       try {
@@ -965,6 +1030,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
       stalled = false;
       preemptiveNudged = false;
       stallDetector.reset();
+      answerFenceTracker.reset();
+      thinkingFenceTracker.reset();
       answerTextLenSinceLastTool = 0;
 
       record({ type: "status", message: "phase 2: formalizing findings as structured JSON" });

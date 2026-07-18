@@ -1007,7 +1007,7 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       exit_state = NULL,
       review_reason = NULL,
       recap_md = NULL,
-      paused = 0,
+      paused = 1,
       response = NULL,
       failure_reason = NULL,
       acceptance_criteria = NULL,
