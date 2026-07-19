@@ -690,7 +690,7 @@ function RefinementNetworkPanel({
   onSelectNodeRole,
   onJumpToRole,
 }: {
-  networkId: string;
+  networkId: string | null;
   runs: RoleRun[];
   plan: { steps: { role: string; status: string; depth: number }[] } | null;
   currentRole: string | null;
@@ -703,17 +703,39 @@ function RefinementNetworkPanel({
   const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
   const networkQ = useQuery({
     queryKey: ["network", networkId],
-    queryFn: () => api.network(networkId),
+    queryFn: () => api.network(networkId as string),
+    enabled: networkId != null,
   });
 
   const parsedGraph = useMemo<AgentNetworkGraph | null>(() => {
-    if (!networkQ.data?.network?.graph_json) return null;
-    try {
-      return JSON.parse(networkQ.data.network.graph_json) as AgentNetworkGraph;
-    } catch {
-      return null;
+    if (networkId && networkQ.data?.network?.graph_json) {
+      try {
+        return JSON.parse(networkQ.data.network.graph_json) as AgentNetworkGraph;
+      } catch {
+        return null;
+      }
     }
-  }, [networkQ.data]);
+    // No stored network — derive a simple top-down graph from the plan steps.
+    if (!plan?.steps || plan.steps.length === 0) return null;
+    const planNodes = plan.steps.map((s, i) => ({
+      id: `plan-${s.role}`,
+      roleKey: s.role,
+      position: { x: 0, y: i * 130 },
+      overrides: { depth: s.depth },
+    }));
+    const planEdges = plan.steps.slice(1).map((s, i) => ({
+      id: `plan-edge-${i}`,
+      sourceNodeId: `plan-${plan.steps[i].role}`,
+      targetNodeId: `plan-${s.role}`,
+    }));
+    return {
+      version: 1 as const,
+      nodes: planNodes,
+      edges: planEdges,
+      layout: { gridSize: 20, snapToGrid: false },
+      metadata: { rigor: "standard" as const, maxLoopbacks: 0, mandatoryConcerns: [] },
+    };
+  }, [networkId, networkQ.data, plan]);
 
   const nodeTypes = useMemo(() => ({ networkNode: NetworkNodeCard }), []);
 
@@ -1478,66 +1500,31 @@ export function TaskDetail() {
             </div>
           )}
 
-          {t.network_id ? (
-            <RefinementNetworkPanel
-              networkId={t.network_id}
-              runs={d.runs}
-              plan={d.plan}
-              currentRole={activity.currentRole}
-              lastRole={activity.lastRole}
-              projectId={t.project_id}
-              selectedNodeRole={selectedNodeRole}
-              onSelectNodeRole={setSelectedNodeRole}
-              onJumpToRole={(roleKey) => {
-                const el = document.getElementById(`run-${roleKey}`);
-                if (el) {
-                  el.scrollIntoView({ behavior: "smooth", block: "start" });
-                  setCollapsedRuns((prev) => {
-                    const run = d.runs.find((r) => r.role_key === roleKey);
-                    if (run && prev.has(run.id)) {
-                      const next = new Set(prev);
-                      next.delete(run.id);
-                      return next;
-                    }
-                    return prev;
-                  });
-                }
-              }}
-            />
-          ) : (
-            <div className="panel">
-              <div className="plan-header">
-                <h2>Refinement plan</h2>
-              </div>
-              <div className="row">
-                {d.plan?.steps.map((s, i) => (
-                  <a
-                    key={i}
-                    href={`#run-${s.role}`}
-                    className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      const el = document.getElementById(`run-${s.role}`);
-                      if (el) {
-                        el.scrollIntoView({ behavior: "smooth", block: "start" });
-                        setCollapsedRuns((prev) => {
-                          const run = d.runs.find((r) => r.role_key === s.role);
-                          if (run && prev.has(run.id)) {
-                            const next = new Set(prev);
-                            next.delete(run.id);
-                            return next;
-                          }
-                          return prev;
-                        });
-                      }
-                    }}
-                  >
-                    {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
-                  </a>
-                )) ?? <span className="muted">Not planned yet.</span>}
-              </div>
-            </div>
-          )}
+          <RefinementNetworkPanel
+            networkId={t.network_id ?? null}
+            runs={d.runs}
+            plan={d.plan}
+            currentRole={activity.currentRole}
+            lastRole={activity.lastRole}
+            projectId={t.project_id}
+            selectedNodeRole={selectedNodeRole}
+            onSelectNodeRole={setSelectedNodeRole}
+            onJumpToRole={(roleKey: string) => {
+              const el = document.getElementById(`run-${roleKey}`);
+              if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "start" });
+                setCollapsedRuns((prev) => {
+                  const run = d.runs.find((r) => r.role_key === roleKey);
+                  if (run && prev.has(run.id)) {
+                    const next = new Set(prev);
+                    next.delete(run.id);
+                    return next;
+                  }
+                  return prev;
+                });
+              }
+            }}
+          />
 
           {/* In-progress role slat — shows as soon as role_start fires, before run is persisted */}
           {activity.currentRole && activity.disposition !== "done" && (
