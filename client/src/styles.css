@@ -1386,6 +1386,114 @@ a.clickable-role:hover {
   margin-bottom: 0;
 }
 
+.task-network-panel h2 {
+  margin-bottom: 0;
+}
+
+/* ---- Refinement network split panel (TaskDetail) ---- */
+
+.refinement-split {
+  display: flex;
+  gap: 0;
+  min-height: 280px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.refinement-network-left {
+  flex: 1 1 50%;
+  min-width: 0;
+  background: var(--bg);
+  cursor: grab;
+}
+.refinement-network-left:active {
+  cursor: grabbing;
+}
+.refinement-network-left .react-flow__node {
+  cursor: pointer;
+}
+
+.refinement-role-right {
+  flex: 0 0 320px;
+  max-width: 50%;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.refinement-role-right:hover {
+  background: var(--panel-2);
+}
+
+.refinement-role-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.refinement-role-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--brass);
+}
+.refinement-role-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.refinement-role-section {
+  margin-bottom: 14px;
+}
+.refinement-role-section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ink-dim);
+  margin-bottom: 4px;
+}
+.refinement-role-override {
+  font-size: 12px;
+  color: var(--ink-dim);
+  padding: 2px 0;
+}
+.refinement-role-override code {
+  font-size: 11px;
+  background: var(--panel-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.refinement-role-config-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.refinement-role-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--ink-dim);
+  font-size: 12px;
+  text-align: center;
+}
+.refinement-role-click-hint {
+  font-size: 10px;
+  color: var(--ink-dim);
+  margin-top: auto;
+  padding-top: 12px;
+  text-align: center;
+}
+
 /* ---- Tag input (role editor tools) ---- */
 .tag-input {
   position: relative;

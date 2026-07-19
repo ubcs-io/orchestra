@@ -678,6 +678,281 @@ function TaskNetworkGraph({
   );
 }
 
+function RefinementNetworkPanel({
+  networkId,
+  runs,
+  plan,
+  currentRole,
+  lastRole,
+  projectId,
+  selectedNodeRole,
+  onSelectNodeRole,
+  onJumpToRole,
+}: {
+  networkId: string;
+  runs: RoleRun[];
+  plan: { steps: { role: string; status: string; depth: number }[] } | null;
+  currentRole: string | null;
+  lastRole: { role: string; tokens: number; elapsedSec: number; model: string | null } | null;
+  projectId: number | null;
+  selectedNodeRole: string | null;
+  onSelectNodeRole: (role: string | null) => void;
+  onJumpToRole: (roleKey: string) => void;
+}) {
+  const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
+  const networkQ = useQuery({
+    queryKey: ["network", networkId],
+    queryFn: () => api.network(networkId),
+  });
+
+  const parsedGraph = useMemo<AgentNetworkGraph | null>(() => {
+    if (!networkQ.data?.network?.graph_json) return null;
+    try {
+      return JSON.parse(networkQ.data.network.graph_json) as AgentNetworkGraph;
+    } catch {
+      return null;
+    }
+  }, [networkQ.data]);
+
+  const nodeTypes = useMemo(() => ({ networkNode: NetworkNodeCard }), []);
+
+  /** Resolve which role to show in the right panel: selected node, last completed, or current. */
+  const displayRoleKey = useMemo<string | null>(() => {
+    if (selectedNodeRole) return selectedNodeRole;
+    if (lastRole) return lastRole.role;
+    if (currentRole) return currentRole;
+    // Fallback: most recent completed run
+    const latest = runs.filter((r) => !r.run_kind || r.run_kind === "primary").pop();
+    return latest?.role_key ?? null;
+  }, [selectedNodeRole, lastRole, currentRole, runs]);
+
+  /** Find the network node for the displayed role. */
+  const displayNode = useMemo(() => {
+    if (!parsedGraph?.nodes || !displayRoleKey) return null;
+    return parsedGraph.nodes.find((n) => n.roleKey === displayRoleKey) ?? null;
+  }, [parsedGraph, displayRoleKey]);
+
+  /** Find the role config from project roles or allRoles. */
+  const roleConfig = useMemo(() => {
+    if (!displayRoleKey) return null;
+    return rolesQ.data?.roles.find((r) => r.key === displayRoleKey) ?? null;
+  }, [rolesQ.data, displayRoleKey]);
+
+  /** Find the persisted run for the displayed role. */
+  const displayRun = useMemo(() => {
+    if (!displayRoleKey) return null;
+    return runs.find((r) => r.role_key === displayRoleKey && (!r.run_kind || r.run_kind === "primary")) ?? null;
+  }, [runs, displayRoleKey]);
+
+  const planStep = plan?.steps.find((s) => s.role === displayRoleKey);
+  const isDisplayActive = currentRole === displayRoleKey;
+
+  const graphNodes: Node[] = useMemo(() => {
+    if (!parsedGraph?.nodes) return [];
+    return parsedGraph.nodes.map((n) => {
+      const roleTitle = rolesQ.data?.roles.find((r) => r.key === n.roleKey)?.title ?? n.roleKey;
+      const step = plan?.steps.find((s) => s.role === n.roleKey);
+      const isActive = currentRole === n.roleKey;
+      const status = isActive ? "active" : (step?.status ?? "pending");
+
+      return {
+        id: n.id,
+        type: "networkNode",
+        position: { x: n.position.x, y: n.position.y },
+        data: {
+          label: roleTitle,
+          roleKey: n.roleKey,
+          criteriaCount: n.criteria?.length ?? 0,
+          depth: n.overrides?.depth,
+        },
+        className: isActive
+          ? "task-network-node--active"
+          : status === "done"
+            ? "task-network-node--done"
+            : status === "skipped"
+              ? "task-network-node--skipped"
+              : "",
+      };
+    });
+  }, [parsedGraph, rolesQ.data, plan, currentRole]);
+
+  const graphEdges: Edge[] = useMemo(() => {
+    if (!parsedGraph?.edges) return [];
+    return parsedGraph.edges.map((e) => ({
+      id: e.id,
+      source: e.sourceNodeId,
+      target: e.targetNodeId,
+      label: e.label,
+      type: "smoothstep" as const,
+      animated: !!e.condition,
+    }));
+  }, [parsedGraph]);
+
+  const handleNetworkNodeClick = (_event: React.MouseEvent, node: Node) => {
+    const roleKey = (node.data as { roleKey?: string }).roleKey;
+    if (!roleKey) return;
+    onSelectNodeRole(roleKey);
+  };
+
+  if (networkQ.isLoading || rolesQ.isLoading || !parsedGraph) {
+    return null;
+  }
+
+  return (
+    <div className="panel">
+      <div className="plan-header">
+        <h2>Refinement plan</h2>
+      </div>
+      <div className="refinement-split">
+        <div className="refinement-network-left">
+          <ReactFlow
+            nodes={graphNodes}
+            edges={graphEdges}
+            nodeTypes={nodeTypes}
+            fitView
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={false}
+            panOnDrag={true}
+            zoomOnScroll={true}
+            onNodeClick={handleNetworkNodeClick}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+          </ReactFlow>
+        </div>
+        <div
+          className="refinement-role-right"
+          onClick={() => {
+            if (displayRoleKey) {
+              onJumpToRole(displayRoleKey);
+            }
+          }}
+          title={displayRoleKey ? `Click to jump to ${displayRoleKey} results` : undefined}
+        >
+          {displayRoleKey ? (
+            <>
+              <div className="refinement-role-header">
+                <span className="refinement-role-title">{displayRoleKey}</span>
+                {displayNode && (
+                  <Link
+                    to={projectId != null
+                      ? "/projects/$projectId/roles"
+                      : "/settings"}
+                    params={projectId != null ? { projectId: String(projectId) } : undefined}
+                    search={projectId != null ? { role: displayRoleKey } : undefined}
+                    className="small"
+                    title={`Edit ${displayRoleKey} configuration`}
+                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                    style={{ fontSize: 14, lineHeight: 1, textDecoration: "none" }}
+                  >
+                    👤
+                  </Link>
+                )}
+              </div>
+
+              <div className="refinement-role-status">
+                {isDisplayActive ? (
+                  <span className="pill warn">active</span>
+                ) : displayRun ? (
+                  <span className={`pill ${verdictClass(displayRun.verdict)}`}>
+                    {displayRun.verdict ?? "?"}
+                  </span>
+                ) : planStep ? (
+                  <span className={`pill ${planStep.status === "done" ? "ok" : planStep.status === "skipped" ? "dim" : "warn"}`}>
+                    {planStep.status}
+                  </span>
+                ) : null}
+                {displayRun?.tokens != null && (
+                  <span className="pill dim">{displayRun.tokens.toLocaleString()} tok</span>
+                )}
+                {displayRun?.depth && displayRun.depth > 1 && (
+                  <span className="pill dim">depth {displayRun.depth}</span>
+                )}
+              </div>
+
+              {roleConfig && (
+                <div className="refinement-role-section">
+                  <div className="refinement-role-section-label">Role Configuration</div>
+                  <div className="refinement-role-override">
+                    <strong>Title:</strong> {roleConfig.title ?? displayRoleKey}
+                  </div>
+                  {roleConfig.model && (
+                    <div className="refinement-role-override">
+                      <strong>Model:</strong> <code>{displayModelName(roleConfig.model)}</code>
+                    </div>
+                  )}
+                  {roleConfig.system_prompt && (
+                    <div className="refinement-role-override">
+                      <strong>Prompt:</strong> {roleConfig.system_prompt.length > 120
+                        ? roleConfig.system_prompt.slice(0, 120) + "…"
+                        : roleConfig.system_prompt}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {displayNode?.overrides && Object.keys(displayNode.overrides).length > 0 && (
+                <div className="refinement-role-section">
+                  <div className="refinement-role-section-label">Network Overrides</div>
+                  {displayNode.overrides.systemPrompt && (
+                    <div className="refinement-role-override">
+                      <strong>Prompt override:</strong> {displayNode.overrides.systemPrompt.length > 100
+                        ? displayNode.overrides.systemPrompt.slice(0, 100) + "…"
+                        : displayNode.overrides.systemPrompt}
+                    </div>
+                  )}
+                  {displayNode.overrides.model && (
+                    <div className="refinement-role-override">
+                      <strong>Model:</strong> <code>{displayModelName(displayNode.overrides.model)}</code>
+                    </div>
+                  )}
+                  {displayNode.overrides.tools && displayNode.overrides.tools.length > 0 && (
+                    <div className="refinement-role-override">
+                      <strong>Tools:</strong> {displayNode.overrides.tools.join(", ")}
+                    </div>
+                  )}
+                  {displayNode.overrides.depth != null && (
+                    <div className="refinement-role-override">
+                      <strong>Depth:</strong> {displayNode.overrides.depth}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {projectId != null && (
+                <Link
+                  to="/projects/$projectId/roles"
+                  params={{ projectId: String(projectId) }}
+                  search={{ role: displayRoleKey }}
+                  className="refinement-role-config-link"
+                  onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                >
+                  ⚙ Configure {displayRoleKey} →
+                </Link>
+              )}
+            </>
+          ) : (
+            <div className="refinement-role-empty">
+              {parsedGraph.nodes.length > 0
+                ? "Click a node to see role details"
+                : "No roles configured in this network"}
+            </div>
+          )}
+
+          <div className="refinement-role-click-hint">
+            {displayRoleKey && displayRun
+              ? "Click card to jump to results ↓"
+              : displayRoleKey
+                ? "Click card to jump to plan ↓"
+                : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NetworkSelector({ taskId, projectId, intakeKind, onChanged }: { taskId: string; projectId: number; intakeKind: string | null; onChanged: () => void }) {
   const networksQ = useQuery({ queryKey: ["networks", projectId], queryFn: () => api.networks(projectId) });
   const setNetwork = useMutation({
@@ -761,6 +1036,7 @@ export function TaskDetail() {
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
   const [hoveredCoverage, setHoveredCoverage] = useState<{ role: string; concern: string } | null>(null);
+  const [selectedNodeRole, setSelectedNodeRole] = useState<string | null>(null);
 
   // Scheduler state for banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -1117,38 +1393,66 @@ export function TaskDetail() {
             </div>
           )}
 
-          <div className="panel">
-            <div className="plan-header">
-              <h2>Refinement plan</h2>
-            </div>
-            <div className="row">
-              {d.plan?.steps.map((s, i) => (
-                <a
-                  key={i}
-                  href={`#run-${s.role}`}
-                  className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    const el = document.getElementById(`run-${s.role}`);
-                    if (el) {
-                      el.scrollIntoView({ behavior: "smooth", block: "start" });
-                      setCollapsedRuns((prev) => {
-                        const run = d.runs.find((r) => r.role_key === s.role);
-                        if (run && prev.has(run.id)) {
-                          const next = new Set(prev);
-                          next.delete(run.id);
-                          return next;
-                        }
-                        return prev;
-                      });
+          {t.network_id && t.stage !== "intake" ? (
+            <RefinementNetworkPanel
+              networkId={t.network_id}
+              runs={d.runs}
+              plan={d.plan}
+              currentRole={activity.currentRole}
+              lastRole={activity.lastRole}
+              projectId={t.project_id}
+              selectedNodeRole={selectedNodeRole}
+              onSelectNodeRole={setSelectedNodeRole}
+              onJumpToRole={(roleKey) => {
+                const el = document.getElementById(`run-${roleKey}`);
+                if (el) {
+                  el.scrollIntoView({ behavior: "smooth", block: "start" });
+                  setCollapsedRuns((prev) => {
+                    const run = d.runs.find((r) => r.role_key === roleKey);
+                    if (run && prev.has(run.id)) {
+                      const next = new Set(prev);
+                      next.delete(run.id);
+                      return next;
                     }
-                  }}
-                >
-                  {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
-                </a>
-              )) ?? <span className="muted">Not planned yet.</span>}
+                    return prev;
+                  });
+                }
+              }}
+            />
+          ) : (
+            <div className="panel">
+              <div className="plan-header">
+                <h2>Refinement plan</h2>
+              </div>
+              <div className="row">
+                {d.plan?.steps.map((s, i) => (
+                  <a
+                    key={i}
+                    href={`#run-${s.role}`}
+                    className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      const el = document.getElementById(`run-${s.role}`);
+                      if (el) {
+                        el.scrollIntoView({ behavior: "smooth", block: "start" });
+                        setCollapsedRuns((prev) => {
+                          const run = d.runs.find((r) => r.role_key === s.role);
+                          if (run && prev.has(run.id)) {
+                            const next = new Set(prev);
+                            next.delete(run.id);
+                            return next;
+                          }
+                          return prev;
+                        });
+                      }
+                    }}
+                  >
+                    {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
+                  </a>
+                )) ?? <span className="muted">Not planned yet.</span>}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* In-progress role slat — shows as soon as role_start fires, before run is persisted */}
           {activity.currentRole && activity.disposition !== "done" && (
