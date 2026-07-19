@@ -77,6 +77,7 @@ import {
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
 import {
   artifactName,
+  buildParentDigest,
   ensureTaskWorkspace,
   isSchedulerRunning,
   isSchedulerStopping,
@@ -998,45 +999,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     question: string,
   ): string {
     const parentName = parent.name ?? parent.task_id.slice(0, 8);
-    const excerpt = parent.content?.trim() ?? "";
-    const truncatedExcerpt =
-      excerpt.length > 600 ? `${excerpt.slice(0, 600)}…` : excerpt || "(no original intake text)";
-
-    const runs = listRoleRuns(parent.task_id).slice(-6);
-    const findingsLines = runs.length
-      ? runs
-          .map((r) => {
-            const summary = (r.summary ?? "").trim();
-            const truncated = summary.length > 200 ? `${summary.slice(0, 200)}…` : summary;
-            return `- **${r.role_key}** (${r.verdict ?? "unknown"}): ${truncated || "(no summary)"}`;
-          })
-          .join("\n")
-      : "(no prior findings yet)";
-
-    return [
-      `## The question to resolve`,
-      question,
-      ``,
-      `(Raised by the \`${roleKey}\` role while refining "${parentName}".)`,
-      ``,
-      `## Original problem (excerpt)`,
-      truncatedExcerpt,
-      ``,
-      `## Findings so far (condensed)`,
-      findingsLines,
-      ``,
-      `## Where to find more`,
-      `The above is a condensed summary. The full upstream context — the original intake, every prior ` +
-        `role's complete write-up, and any human answers — lives in \`${parent.artifact_path ?? "(no artifact yet)"}\` ` +
-        `at the root of this repository. Read that file with your \`read\` tool if the condensed summary above ` +
-        `isn't enough to answer the question confidently. Don't ask the user something you could answer yourself ` +
-        `by reading that file.`,
-      ``,
-      `## Output format requested`,
-      `When the research_synthesis step produces the final brief, structure it as an explicit options table: ` +
+    return buildParentDigest(parent, {
+      focusLabel: "The question to resolve",
+      focusText: question,
+      contextLine: `(Raised by the \`${roleKey}\` role while refining "${parentName}".)`,
+      instructionFooter:
+        `## Output format requested\n` +
+        `When the research_synthesis step produces the final brief, structure it as an explicit options table: ` +
         `one row per option with columns "Option", "What it means for this question", "Trade-offs", "When to ` +
         `pick it" — followed by a clear "Recommendation" section. Use a real markdown table, not just prose.`,
-    ].join("\n");
+    });
   }
 
   app.post(

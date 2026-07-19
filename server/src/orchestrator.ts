@@ -75,6 +75,7 @@ import {
   type RoleFindings,
   type RoleRunResult,
   type RunRoleParams,
+  type Subtask,
   type Verdict,
 } from "./agent.js";
 import { getConfig } from "./config.js";
@@ -1066,6 +1067,8 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     depth: step.depth,
     model: result.model,
     tokens: result.tokens,
+    subtasks_json: JSON.stringify(findings.subtasks ?? []),
+    no_decomposition_reason: findings.no_decomposition_reason ?? null,
   });
 
   // ---- Call Point 1: Question Distillation (fire-and-forget) ----
@@ -1970,6 +1973,41 @@ async function applyGate(
 
   // Terminal role finished cleanly → ready.
   if (isTerminalRole(task, step.role) || !nextPending(plan)) {
+    // A can_create_subtasks role (decomposition) is expected to produce either a
+    // subtask tree or an explicit reason it's already atomic. Zero subtasks with
+    // no stated reason is a failed/incomplete breakdown, not an intentional
+    // no-op — escalate to a human instead of silently finalizing as "ready" with
+    // nothing to show for it. This MUST run before the artifact is moved below:
+    // escalate() also moves the artifact (to REVIEW) and assumes it's still in
+    // REFINING. Independent of `level` — a root task that should have decomposed
+    // but produced nothing never gets auto-promoted off "task", so gating this
+    // check on level would silently miss the common case.
+    const isSpecTerminal = isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec";
+    const roleCfg = isSpecTerminal ? getRole(project.id, step.role) : undefined;
+    let level = task.level ?? "task";
+    let resolvedSubtasks: Subtask[] = [];
+    if (isSpecTerminal && roleCfg?.can_create_subtasks) {
+      const runs = listRoleRuns(task.task_id);
+      const decomp = [...runs].reverse().find((r) => r.role_key === step.role);
+      resolvedSubtasks = resolveDecompositionSubtasks(decomp).subtasks;
+      if (resolvedSubtasks.length === 0 && !decomp?.no_decomposition_reason?.trim()) {
+        escalate(
+          `Decomposition (verdict: ${verdict}) produced zero subtasks with no stated reason — this is ` +
+            `treated as a failed/incomplete breakdown, not an intentional atomic leaf. Approve to accept ` +
+            `as atomic, or reset to re-run decomposition.`,
+        );
+        triggerRecap(coverage, criteriaResults);
+        return;
+      }
+      // Auto-promote a "task" level to "story" when the decomposition role
+      // produced a subtask tree — the model clearly intends this to be
+      // decomposable; the default "task" level was just never overridden.
+      if (level === "task" && resolvedSubtasks.length > 0) {
+        level = "story";
+        updateTask(task.task_id, { level });
+      }
+    }
+
     const dest = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}READY${path.sep}`);
     moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, dest));
     updateTask(task.task_id, {
@@ -1982,28 +2020,11 @@ async function applyGate(
     });
     commitArtifacts(repoPath, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
     triggerRecap(coverage, criteriaResults);
-    if (isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec") {
-      // Only [epic] and [story] nodes decompose further; [task] is the atomic leaf.
-      // The role must also have can_create_subtasks enabled (default: only decomposition).
-      let level = task.level ?? "task";
-      const roleCfg = getRole(project.id, step.role);
-      // Auto-promote a "task" level to "story" when the decomposition role produced
-      // a parseable [epic]/[story]/[task] tree. The model clearly intends this to be
-      // decomposable — the default "task" level was just never overridden.
-      if (level === "task" && roleCfg?.can_create_subtasks) {
-        const runs = listRoleRuns(task.task_id);
-        const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
-        if (decomp?.output_md && parseDecompositionTree(decomp.output_md).length > 0) {
-          level = "story";
-          updateTask(task.task_id, { level });
-        }
-      }
-      if ((level === "epic" || level === "story") && roleCfg?.can_create_subtasks) {
-        // Runs before the base-branch checkout below: each child gets its own
-        // branch created off base, which would otherwise leave the repo on the
-        // last child's branch instead of back where the parent task started.
-        createDecompositionChildren(task, project);
-      }
+    if (isSpecTerminal && roleCfg?.can_create_subtasks && (level === "epic" || level === "story")) {
+      // Runs before the base-branch checkout below: each child gets its own
+      // branch created off base, which would otherwise leave the repo on the
+      // last child's branch instead of back where the parent task started.
+      createDecompositionChildren(task, project, resolvedSubtasks);
     }
     // Accepted — reconcile the task's branch back into base before returning
     // the shared checkout there. Best-effort: a conflict/error is recorded as
@@ -2059,7 +2080,10 @@ async function applyGate(
   publish(task.task_id, "task_update", { stage: "refining" });
 }
 
-/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets. */
+/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets. Legacy
+ *  fallback — superseded by the structured `subtasks_json` field on role_runs
+ *  (see resolveDecompositionSubtasks), kept for rows written before that field
+ *  existed and for models that ignore the structured-output instructions. */
 export function parseDecompositionTree(md: string): Array<{ level: string; name: string }> {
   const re = /\[(epic|story|task)\]\s*(.+)/gi;
   const out: Array<{ level: string; name: string }> = [];
@@ -2070,22 +2094,125 @@ export function parseDecompositionTree(md: string): Array<{ level: string; name:
   return out;
 }
 
-/** Parse the decomposition role's section and create child tasks as intake
- *  so the scheduler discovers and refines them through the normal pipeline. */
-function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
-  const runs = listRoleRuns(task.task_id);
-  const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
-  if (!decomp?.output_md) return;
+/** Resolve a decomposition role_run into its subtask list: prefers the
+ *  structured `subtasks_json` field, falling back to regex-parsing `output_md`
+ *  for pre-existing rows or models that only produced the old bracket-tag
+ *  format. Never throws — malformed JSON falls through to the next source. */
+export function resolveDecompositionSubtasks(
+  decomp: RoleRunRow | undefined,
+): { subtasks: Subtask[]; legacy: boolean } {
+  if (decomp?.subtasks_json) {
+    try {
+      const parsed = JSON.parse(decomp.subtasks_json) as Subtask[];
+      if (Array.isArray(parsed) && parsed.length) return { subtasks: parsed, legacy: false };
+    } catch {
+      // Malformed JSON — fall through to the legacy regex path below.
+    }
+  }
+  if (decomp?.output_md) {
+    const legacy = parseDecompositionTree(decomp.output_md);
+    if (legacy.length) {
+      return {
+        subtasks: legacy.map((n, i) => ({
+          local_id: String(i + 1),
+          level: n.level as "epic" | "story" | "task",
+          name: n.name,
+          brief: "",
+          acceptance_criteria: [],
+          context_to_carry_forward: "",
+          depends_on: undefined,
+        })),
+        legacy: true,
+      };
+    }
+  }
+  return { subtasks: [], legacy: false };
+}
+
+/**
+ * Build a right-sized digest of a parent task for a child that needs grounding
+ * but not the parent's full history: a capped excerpt of the original intake,
+ * capped recent role-run summaries, and an explicit pointer to the parent's
+ * full artifact for on-demand `read` — the same anti-flood shape regardless of
+ * which caller (question-decompose, tree-decompose) is asking for it.
+ */
+export function buildParentDigest(
+  parent: TaskRow,
+  opts: { focusLabel: string; focusText: string; contextLine?: string; instructionFooter?: string },
+): string {
+  const excerpt = parent.content?.trim() ?? "";
+  const truncatedExcerpt =
+    excerpt.length > 600 ? `${excerpt.slice(0, 600)}…` : excerpt || "(no original intake text)";
+
+  const runs = listRoleRuns(parent.task_id).slice(-6);
+  const findingsLines = runs.length
+    ? runs
+        .map((r) => {
+          const summary = (r.summary ?? "").trim();
+          const truncated = summary.length > 200 ? `${summary.slice(0, 200)}…` : summary;
+          return `- **${r.role_key}** (${r.verdict ?? "unknown"}): ${truncated || "(no summary)"}`;
+        })
+        .join("\n")
+    : "(no prior findings yet)";
+
+  const parts = [`## ${opts.focusLabel}`, opts.focusText];
+  if (opts.contextLine) parts.push("", opts.contextLine);
+  parts.push(
+    "",
+    "## Original problem (excerpt)",
+    truncatedExcerpt,
+    "",
+    "## Findings so far (condensed)",
+    findingsLines,
+    "",
+    "## Where to find more",
+    `The above is a condensed summary. The full upstream context — the original intake, every prior ` +
+      `role's complete write-up, and any human answers — lives in \`${parent.artifact_path ?? "(no artifact yet)"}\` ` +
+      `at the root of this repository. Read that file with your \`read\` tool if the condensed summary above ` +
+      `isn't enough. Don't ask something you could answer yourself by reading that file.`,
+  );
+  if (opts.instructionFooter) parts.push("", opts.instructionFooter);
+  return parts.join("\n");
+}
+
+/** Create child tasks from a resolved decomposition subtask list, so the
+ *  scheduler discovers and refines them through the normal pipeline. Each
+ *  child is seeded with its own brief/acceptance criteria/carried-forward
+ *  context plus a capped digest of the parent (buildParentDigest) — not just
+ *  its bare name — so it doesn't have to re-derive what the parent's earlier
+ *  role steps already established. Runs in two passes because a subtask's
+ *  `depends_on` can reference a sibling created later in iteration order:
+ *  pass 1 creates every child (collecting local_id → task_id), pass 2 resolves
+ *  each child's depends_on through that map and persists depends_on_json. */
+function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtasks: Subtask[]): void {
+  if (!subtasks.length) return;
 
   const planningDir = project.planning_dir || "PLANNING";
   const parentName = task.name ?? task.task_id.slice(0, 8);
+  const localIdToTaskId = new Map<string, string>();
+  const created: Array<{ node: Subtask; child: TaskRow }> = [];
   let step = 0;
 
-  for (const node of parseDecompositionTree(decomp.output_md)) {
-    // Seed content from the bullet text so the triage role has grounding.
+  for (const node of subtasks) {
+    const sections: string[] = [`## Task: ${node.name}`];
+    if (node.brief?.trim()) sections.push(node.brief.trim());
+    if (node.acceptance_criteria?.length) {
+      sections.push(`## Acceptance criteria\n${node.acceptance_criteria.map((c) => `- ${c}`).join("\n")}`);
+    }
+    if (node.context_to_carry_forward?.trim()) {
+      sections.push(`## Context carried forward\n${node.context_to_carry_forward.trim()}`);
+    }
+    sections.push(
+      buildParentDigest(task, {
+        focusLabel: "Decomposed from",
+        focusText: `This task was split out of **${parentName}** (level: \`${node.level}\`).`,
+      }),
+    );
+    const content = sections.join("\n\n");
+
     let child = createTask({
       name: node.name,
-      content: node.name,
+      content,
       project_id: task.project_id,
       stage: "intake",
       level: node.level,
@@ -2095,22 +2222,39 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow): void {
       task_type: "child",
       step_number: step++,
       status: "active",
+      acceptance_criteria: node.acceptance_criteria?.length
+        ? JSON.stringify(node.acceptance_criteria)
+        : null,
     });
     // Same isolated-worktree treatment as top-level intake — a decomposition
     // child is its own checkpointable task, not a continuation of the parent's.
     child = ensureTaskWorkspace(child, project);
     const childRepo = taskRepoPath(child, project);
 
-    // Write a minimal intake artifact so the child follows the normal pipeline.
     const artName = artifactName(child);
     const relArtifact = path.join(planningDir, "REFINING", artName);
     writeArtifact(
       path.join(childRepo, relArtifact),
-      `# ${node.name}\n\n> Child of: **${parentName}** · level: \`${node.level}\`\n\n## Problem\n\n${node.name}\n`,
+      `# ${node.name}\n\n> Child of: **${parentName}** · level: \`${node.level}\`\n\n${content}\n`,
     );
     updateTask(child.task_id, { artifact_path: relArtifact });
     commitArtifacts(childRepo, [relArtifact], `intake(child): ${node.name}`);
     publish(child.task_id, "task_update", { stage: "intake" });
+
+    localIdToTaskId.set(node.local_id, child.task_id);
+    created.push({ node, child });
+  }
+
+  // Second pass: a hallucinated/unresolvable local_id is silently dropped
+  // rather than left dangling or blocking the child forever.
+  for (const { node, child } of created) {
+    if (!node.depends_on?.length) continue;
+    const resolved = node.depends_on
+      .map((id) => localIdToTaskId.get(id))
+      .filter((id): id is string => Boolean(id));
+    if (resolved.length) {
+      updateTask(child.task_id, { depends_on_json: JSON.stringify(resolved) });
+    }
   }
 }
 
@@ -2148,6 +2292,23 @@ function serializeTask<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
  *  excluding any already in flight. Same per-project-first ordering as the
  *  original single-task picker (drains one project's candidates before
  *  moving to the next), just returning a batch instead of one. */
+/** A task with a `depends_on_json` list (set by createDecompositionChildren
+ *  when a decomposition subtask stated `depends_on`) is only schedulable once
+ *  every dependency has reached a terminal `stage: "ready"` — which includes
+ *  `wont_do` finalizations, not just normal completion, so an operator marking
+ *  a blocking dependency "won't do" unblocks its dependents instead of
+ *  deadlocking the tree forever with no scheduler-level escape hatch. */
+export function dependenciesSatisfied(task: TaskRow): boolean {
+  if (!task.depends_on_json) return true;
+  let deps: string[];
+  try {
+    deps = JSON.parse(task.depends_on_json) as string[];
+  } catch {
+    return true;
+  }
+  return deps.every((id) => getTask(id)?.stage === "ready");
+}
+
 function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRow }> {
   const picked: Array<{ task: TaskRow; project: ProjectRow }> = [];
   for (const project of listProjects()) {
@@ -2156,7 +2317,8 @@ function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRo
         (t) =>
           (t.stage === "intake" || t.stage === "refining") &&
           (t.paused ?? 0) === 0 &&
-          !inFlightTasks.has(t.task_id),
+          !inFlightTasks.has(t.task_id) &&
+          dependenciesSatisfied(t),
       )
       .sort((a, b) => a.updated_at.localeCompare(b.updated_at));
     for (const task of candidates) {

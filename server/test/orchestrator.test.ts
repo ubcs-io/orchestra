@@ -2,13 +2,15 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CoverageItem, CriteriaResult, RoleRunResult, Verdict } from "../src/agent";
-import { closeDb, createProject, getTask, listInterventions, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
+import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
+import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
+import type { RoleRunRow } from "../src/db";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
 import {
   applyPlanMutation,
+  dependenciesSatisfied,
   inferIntakeKind,
   mergeCoverageItems,
   nextPending,
@@ -16,6 +18,7 @@ import {
   planFromTemplate,
   reincorporateAnswer,
   resetRoleRunner,
+  resolveDecompositionSubtasks,
   restoreCheckpoint,
   setRoleRunner,
   tick,
@@ -125,6 +128,87 @@ describe("parseDecompositionTree", () => {
   });
 });
 
+function createProjectTask(projectId: number, overrides: Record<string, unknown> = {}): TaskRow {
+  const t = createTask({ name: "t", project_id: projectId });
+  return Object.keys(overrides).length ? updateTask(t.task_id, overrides)! : t;
+}
+
+function makeSubtask(overrides: Partial<Subtask> = {}): Subtask {
+  return {
+    local_id: "1",
+    level: "task",
+    name: "Do the thing",
+    brief: "",
+    acceptance_criteria: [],
+    context_to_carry_forward: "",
+    ...overrides,
+  };
+}
+
+describe("resolveDecompositionSubtasks", () => {
+  it("prefers subtasks_json when present and non-empty", () => {
+    const subtasks = [makeSubtask({ name: "From structured output" })];
+    const decomp = { subtasks_json: JSON.stringify(subtasks), output_md: "- [task] From regex" } as RoleRunRow;
+    const result = resolveDecompositionSubtasks(decomp);
+    expect(result.legacy).toBe(false);
+    expect(result.subtasks.map((s) => s.name)).toEqual(["From structured output"]);
+  });
+
+  it("falls back to parseDecompositionTree(output_md) when subtasks_json is absent or empty", () => {
+    const decomp = {
+      subtasks_json: null,
+      output_md: "- [epic] Big\n  - [task] do x",
+    } as unknown as RoleRunRow;
+    const result = resolveDecompositionSubtasks(decomp);
+    expect(result.legacy).toBe(true);
+    expect(result.subtasks.map((s) => s.name)).toEqual(["Big", "do x"]);
+    expect(result.subtasks.every((s) => s.brief === "" && s.acceptance_criteria.length === 0)).toBe(true);
+  });
+
+  it("falls back to output_md when subtasks_json is malformed JSON", () => {
+    const decomp = { subtasks_json: "not json", output_md: "- [task] recovered" } as RoleRunRow;
+    const result = resolveDecompositionSubtasks(decomp);
+    expect(result.legacy).toBe(true);
+    expect(result.subtasks.map((s) => s.name)).toEqual(["recovered"]);
+  });
+
+  it("returns empty when both sources are absent/empty", () => {
+    expect(resolveDecompositionSubtasks(undefined)).toEqual({ subtasks: [], legacy: false });
+    const decomp = { subtasks_json: "[]", output_md: "no bracket tags here" } as RoleRunRow;
+    expect(resolveDecompositionSubtasks(decomp)).toEqual({ subtasks: [], legacy: false });
+  });
+});
+
+describe("dependenciesSatisfied", () => {
+  it("treats a task with no depends_on_json as immediately schedulable", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const t = createProjectTask(project.id, { depends_on_json: null });
+    expect(dependenciesSatisfied(t)).toBe(true);
+  });
+
+  it("blocks until every dependency reaches stage ready, including a wont_do finalization", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const dep = createProjectTask(project.id, { stage: "refining" });
+    const t = createProjectTask(project.id, { depends_on_json: JSON.stringify([dep.task_id]) });
+    expect(dependenciesSatisfied(t)).toBe(false);
+
+    updateTask(dep.task_id, { stage: "ready", exit_state: "wont_do" });
+    expect(dependenciesSatisfied(t)).toBe(true);
+  });
+
+  it("fails open (schedulable) on malformed depends_on_json", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const t = createProjectTask(project.id, { depends_on_json: "not json" });
+    expect(dependenciesSatisfied(t)).toBe(true);
+  });
+});
+
 // ---- Integration: the full loop with an injected fake runner ------------
 
 function fakeRunner(
@@ -205,6 +289,51 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
   };
 }
 
+/**
+ * A runner that distinguishes the counter-reviewer (same detection as
+ * scriptedRunner, auto-passing every criterion) from the decomposition role
+ * (detected via buildRoleContext's "You are the **decomposition** role" line),
+ * letting a test control exactly what decomposition reports — a subtask list,
+ * an explicit no_decomposition_reason, or neither (the anomaly case) — while
+ * every other producer role just passes cleanly with no bracket-tag markup
+ * (so legacy regex fallback never accidentally fires for a role that isn't
+ * actually decomposition).
+ */
+function decompositionRunner(
+  opts: { decompSubtasks?: Subtask[]; noDecompositionReason?: string } = {},
+): RoleRunner {
+  return async (params) => {
+    const isReviewer = params.context.includes("Acceptance criteria to verify");
+    const isDecomp = params.context.includes("**decomposition** role");
+    const criteria: CriteriaResult[] = isReviewer
+      ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => ({
+          id: m[1]!,
+          status: "met" as const,
+        }))
+      : [];
+    return {
+      findings: {
+        verdict: "pass",
+        summary: isDecomp ? "decomposition done" : "pass from fake",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: isDecomp ? "## Decomposition\n(see structured subtasks)" : "## role\ndone",
+        criteria_results: criteria,
+        subtasks: isDecomp ? (opts.decompSubtasks ?? []) : undefined,
+        no_decomposition_reason: isDecomp ? opts.noDecompositionReason : undefined,
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+    };
+  };
+}
+
 function rootTask(projectId: number): TaskRow | undefined {
   return listTasks({ projectId }).find((t) => t.parent_task_id == null);
 }
@@ -272,6 +401,137 @@ describe("orchestrator loop (integration)", () => {
     expect(listTasks({ parentTaskId: t.task_id }).length).toBeGreaterThan(0);
     // INTAKE original was consumed (moved out).
     expect(fs.existsSync(path.join(repo, "PLANNING", "INTAKE", "crash.log"))).toBe(false);
+  });
+
+  it("escalates to REVIEW when decomposition reports zero subtasks with no stated reason", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(decompositionRunner());
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_review");
+    expect(t.review_reason).toContain("zero subtasks");
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+  });
+
+  it("finalizes normally (no escalation, no children) when decomposition states an intentional no_decomposition_reason", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(decompositionRunner({ noDecompositionReason: "Already one atomic, independently-actionable unit." }));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    expect(t.exit_state).toBe("ready_for_work");
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+  });
+
+  it("seeds decomposition children with brief/acceptance-criteria/carried-forward context and resolved dependencies, and the scheduler holds a dependent child until its dependency is ready", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(
+      decompositionRunner({
+        decompSubtasks: [
+          makeSubtask({
+            local_id: "1",
+            name: "First task",
+            brief: "Do the first thing.",
+            acceptance_criteria: ["the first thing is done"],
+            context_to_carry_forward: "The parent already ruled out approach B.",
+          }),
+          makeSubtask({ local_id: "2", name: "Second task", depends_on: ["1"] }),
+        ],
+      }),
+    );
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBe(2);
+    const first = children.find((c) => c.name === "First task")!;
+    const second = children.find((c) => c.name === "Second task")!;
+
+    // Real seed context, not just the bare name.
+    expect(first.content).toContain("Do the first thing.");
+    expect(first.content).toContain("Acceptance criteria");
+    expect(first.content).toContain("the first thing is done");
+    expect(first.content).toContain("The parent already ruled out approach B.");
+    expect(first.content).toContain("Decomposed from");
+    expect(first.acceptance_criteria).toBe(JSON.stringify(["the first thing is done"]));
+
+    // depends_on's local_id resolved to the real sibling task_id.
+    expect(JSON.parse(second.depends_on_json!)).toEqual([first.task_id]);
+    expect(second.stage).toBe("intake");
+    expect(listRoleRuns(second.task_id).length).toBe(0);
+
+    // Switch to a runner that would happily advance ANY picked task — if the
+    // dependency gate weren't in place, "Second task" would very plausibly be
+    // picked next (it sorts before "First task" on a created_at tie-break).
+    // It must stay untouched until its dependency reaches stage "ready".
+    setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: [] }));
+    for (let i = 0; i < 3; i++) await tick();
+    const secondStillBlocked = getTask(second.task_id)!;
+    expect(secondStillBlocked.stage).toBe("intake");
+    expect(listRoleRuns(second.task_id).length).toBe(0);
+
+    // Once the dependency is (forcibly) marked ready, Second becomes schedulable.
+    updateTask(first.task_id, { stage: "ready" });
+    await tick();
+    const secondUnblocked = getTask(second.task_id)!;
+    expect(secondUnblocked.stage).not.toBe("intake");
+  });
+
+  it("silently drops a depends_on reference to a nonexistent local_id instead of blocking the child", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(
+      decompositionRunner({
+        decompSubtasks: [makeSubtask({ local_id: "1", name: "Only task", depends_on: ["nonexistent"] })],
+      }),
+    );
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBe(1);
+    expect(children[0]!.depends_on_json).toBeNull();
+    expect(dependenciesSatisfied(children[0]!)).toBe(true);
   });
 
   it("escalates to REVIEW when a role returns needs_human", async () => {

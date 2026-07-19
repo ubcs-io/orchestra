@@ -387,14 +387,17 @@ Rules:
 If you are a counter-reviewer with acceptance criteria to verify, also include:
 - **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
 
-IMPORTANT for decomposition: in section_md, present the task tree using nested
-bullets labeled **[epic]**, **[story]**, and **[task]** (case-insensitive) so
-downstream tooling can parse them. Each label must appear at the START of the
-bullet line. Example:
-- **[epic] Big Goal**
-  - **[story] User-facing Story**
-    - **[task] Atomic Action**
-    - **[task] Another Atomic Action**
+IMPORTANT for decomposition: also include a **subtasks** array — one entry per
+epic/story/task node — each { local_id, level, name, brief, acceptance_criteria,
+context_to_carry_forward, depends_on }. local_id is a short id you assign (e.g.
+"1", "1.2") that other nodes' depends_on (array of local_ids, optional) can
+reference; level is "epic", "story", or "task"; context_to_carry_forward must
+state any decision/constraint/fact the child needs that isn't obvious from
+name/brief alone — the child will not see this parent's full history by default.
+If the work is already one atomic, independently-actionable unit, leave subtasks
+empty and instead set **no_decomposition_reason** explaining why — an empty
+subtasks array with no reason is treated as a failed decomposition. Still render
+the same tree as readable prose in section_md for the human-facing artifact.
 
 Output ONLY the JSON block — nothing before, nothing after.
 `.trim();
@@ -512,7 +515,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
     can_create_subtasks: true,
-    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. In section_md, present the tree explicitly using nested bullets labeled [epic], [story], [task] so downstream tooling can parse it. Each atomic task must be independently actionable with acceptance criteria.`,
+    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. Also render the same tree as readable prose in section_md, for the human-facing artifact.`,
   },
 
   // ---- Developer (write/edit capable) ----

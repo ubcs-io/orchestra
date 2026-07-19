@@ -283,6 +283,18 @@ export function initDb(): void {
   // pushed" indicator (not surfaced directly yet).
   addColumnIfMissing(d, "tasks", "github_pr_url", "github_pr_url TEXT");
   addColumnIfMissing(d, "tasks", "github_pushed_sha", "github_pushed_sha TEXT");
+  // Structured decomposition output (JSON array of Subtask), superseding the old
+  // bracket-tag-regex-over-output_md parsing — see resolveDecompositionSubtasks
+  // in orchestrator.ts, which falls back to the regex for pre-existing rows.
+  addColumnIfMissing(d, "role_runs", "subtasks_json", "subtasks_json TEXT");
+  // Required whenever a can_create_subtasks role intentionally returns zero
+  // subtasks (already-atomic work) — an empty subtasks array with this unset is
+  // treated as a failed decomposition, not an intentional no-op.
+  addColumnIfMissing(d, "role_runs", "no_decomposition_reason", "no_decomposition_reason TEXT");
+  // Sibling local_ids (from a decomposition's subtasks[].depends_on) resolved to
+  // real task_ids at child-creation time. JSON array of task_id strings; null/
+  // absent = no dependencies. Consulted by the scheduler's dependenciesSatisfied().
+  addColumnIfMissing(d, "tasks", "depends_on_json", "depends_on_json TEXT");
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
@@ -372,6 +384,7 @@ export interface TaskRow {
   wrote_source: number | null;
   github_pr_url: string | null;
   github_pushed_sha: string | null;
+  depends_on_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -429,6 +442,8 @@ export interface RoleRunRow {
   model: string | null;
   tokens: number | null;
   git_commit_sha: string | null;
+  subtasks_json: string | null;
+  no_decomposition_reason: string | null;
   created_at: string;
 }
 
@@ -854,6 +869,8 @@ export function createTask(input: {
   network_id?: string | null;
   origin_role_key?: string | null;
   origin_question?: string | null;
+  acceptance_criteria?: string | null;
+  depends_on_json?: string | null;
 }): TaskRow {
   const d = getDb();
   const ts = now();
@@ -862,10 +879,10 @@ export function createTask(input: {
     .prepare(
       `INSERT INTO tasks (task_id, name, status, model, content, project_id, stage, level, intake_kind,
          exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json,
-         network_id, origin_role_key, origin_question, created_at, updated_at)
+         network_id, origin_role_key, origin_question, acceptance_criteria, depends_on_json, created_at, updated_at)
        VALUES (@task_id, @name, @status, @model, @content, @project_id, @stage, @level, @intake_kind,
          @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json,
-         @network_id, @origin_role_key, @origin_question, @ts, @ts)`,
+         @network_id, @origin_role_key, @origin_question, @acceptance_criteria, @depends_on_json, @ts, @ts)`,
     )
     .run({
       task_id: taskId,
@@ -886,6 +903,8 @@ export function createTask(input: {
       network_id: input.network_id ?? null,
       origin_role_key: input.origin_role_key ?? null,
       origin_question: input.origin_question ?? null,
+      acceptance_criteria: input.acceptance_criteria ?? null,
+      depends_on_json: input.depends_on_json ?? null,
       ts,
     });
   return getTask(Number(info.lastInsertRowid))!;
@@ -962,6 +981,7 @@ const TASK_UPDATABLE = new Set([
   "wrote_source",
   "github_pr_url",
   "github_pushed_sha",
+  "depends_on_json",
 ]);
 
 export function updateTask(
@@ -1045,6 +1065,7 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       task_type = 'root',
       step_number = NULL,
       model = NULL,
+      depends_on_json = NULL,
       updated_at = @ts
     WHERE ${keyCol} = @keyVal
   `).run({ ts, keyVal });
@@ -1092,6 +1113,8 @@ export function createRoleRun(input: {
   depth?: number;
   model?: string | null;
   tokens?: number | null;
+  subtasks_json?: string | null;
+  no_decomposition_reason?: string | null;
 }): RoleRunRow {
   const d = getDb();
   const ts = now();
@@ -1099,10 +1122,12 @@ export function createRoleRun(input: {
     .prepare(
       `INSERT INTO role_runs (task_id, role_key, verdict, summary, output_md, coverage_json,
          criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, stalled, thinking_md,
-         open_questions_json, target_run_id, run_kind, depth, model, tokens, created_at)
+         open_questions_json, target_run_id, run_kind, depth, model, tokens, subtasks_json,
+         no_decomposition_reason, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
          @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @stalled, @thinking_md,
-         @open_questions_json, @target_run_id, @run_kind, @depth, @model, @tokens, @ts)`,
+         @open_questions_json, @target_run_id, @run_kind, @depth, @model, @tokens, @subtasks_json,
+         @no_decomposition_reason, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -1124,6 +1149,8 @@ export function createRoleRun(input: {
       depth: input.depth ?? 1,
       model: input.model ?? null,
       tokens: input.tokens ?? null,
+      subtasks_json: input.subtasks_json ?? null,
+      no_decomposition_reason: input.no_decomposition_reason ?? null,
       ts,
     });
   return d.prepare(`SELECT * FROM role_runs WHERE id = ?`).get(Number(info.lastInsertRowid)) as RoleRunRow;

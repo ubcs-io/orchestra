@@ -15,7 +15,7 @@ import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRu
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
 import { DiffPanel } from "../components/DiffPanel";
-import { ReviewCTA, collectQuestions, type ClientOpenQuestion } from "../components/ReviewCTA";
+import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
@@ -749,6 +749,10 @@ export function TaskDetail() {
 
   // Question answer state: per-question-editing keyed by "${runId}:${qIndex}"
   const [questionEdits, setQuestionEdits] = useState<Record<string, string>>({});
+  // Keys the user has explicitly reopened for editing after the question was
+  // already answered (see findAnsweredQuestion) — an already-answered question
+  // renders as a locked "you answered" row unless its key is in this set.
+  const [editingKeys, setEditingKeys] = useState<Set<string>>(new Set());
 
   // Intake editing state
   const [editName, setEditName] = useState("");
@@ -929,9 +933,12 @@ export function TaskDetail() {
   const submitAnswer = (roleKey: string, question: string, answer: string, editKey: string) => {
     if (!answer.trim()) return;
     intervene.mutate({ kind: "question_answer", payload: { role_key: roleKey, question, answer: answer.trim() } });
-    setQuestionEdits((prev) => {
-      const next = { ...prev };
-      delete next[editKey];
+    // Exit explicit-edit mode; the typed text stays in questionEdits so the
+    // input keeps showing it (not the stale default) until the refetched
+    // interventions confirm the answer and the row locks.
+    setEditingKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(editKey);
       return next;
     });
   };
@@ -1384,6 +1391,7 @@ export function TaskDetail() {
               recapMd={d.recap_md}
               coverage={d.coverage}
               runs={d.runs}
+              interventions={d.interventions}
               childTasks={d.children}
               onMutate={refresh}
             />
@@ -1821,11 +1829,13 @@ export function TaskDetail() {
                     {group.questions.map((rawQ, qi) => {
                       const pq = parseQuestion(rawQ);
                       const editKey = `${group.runId}:${qi}`;
-                      const editVal = questionEdits[editKey] ?? pq.defaultAnswer ?? "";
+                      const answered = findAnsweredQuestion(d.interventions, group.roleKey, pq.text);
+                      const isEditing = !answered || editingKeys.has(editKey);
+                      const editVal = questionEdits[editKey] ?? answered?.answer ?? pq.defaultAnswer ?? "";
                       return (
                         <div key={qi} className="question-item">
                           <p className="question-text">{pq.text}</p>
-                          {pq.options.length > 0 && (
+                          {isEditing && pq.options.length > 0 && (
                             <div className="question-options">
                               {pq.options.map((opt, oi) => (
                                 <button
@@ -1843,32 +1853,82 @@ export function TaskDetail() {
                               suggested: <strong>{pq.defaultAnswer}</strong>
                             </p>
                           )}
-                          <div className="question-answer-row">
-                            <input
-                              className="question-answer-input"
-                              value={editVal}
-                              onChange={(e) => setQuestionEdits((prev) => ({ ...prev, [editKey]: e.target.value }))}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" && editVal.trim()) {
-                                  submitAnswer(group.roleKey, pq.text, editVal, editKey);
-                                }
-                              }}
-                              placeholder={pq.defaultAnswer ? `or edit default: ${pq.defaultAnswer}` : "your answer…"}
-                            />
-                            <button
-                              className="small primary"
-                              disabled={!editVal.trim()}
-                              onClick={() => submitAnswer(group.roleKey, pq.text, editVal, editKey)}
-                            >
-                              ✓
-                            </button>
-                            <QuestionDecomposeButton
-                              parentTaskId={taskId}
-                              roleKey={group.roleKey}
-                              question={rawQ.question}
-                              onMutate={refresh}
-                            />
-                          </div>
+                          {answered && !isEditing && (
+                            <p className="question-default">
+                              you answered: <strong>{answered.answer}</strong>
+                              <span className="pill ok" style={{ marginLeft: 6 }}>
+                                answered
+                              </span>{" "}
+                              <button
+                                className="link"
+                                style={{
+                                  background: "none",
+                                  border: "none",
+                                  color: "var(--brass)",
+                                  cursor: "pointer",
+                                  padding: 0,
+                                  textDecoration: "underline",
+                                  fontSize: 11,
+                                }}
+                                onClick={() => {
+                                  setEditingKeys((prev) => new Set(prev).add(editKey));
+                                  setQuestionEdits((prev) => ({ ...prev, [editKey]: answered.answer }));
+                                }}
+                              >
+                                change answer
+                              </button>
+                            </p>
+                          )}
+                          {isEditing && (
+                            <div className="question-answer-row">
+                              <input
+                                className="question-answer-input"
+                                value={editVal}
+                                onChange={(e) => setQuestionEdits((prev) => ({ ...prev, [editKey]: e.target.value }))}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && editVal.trim()) {
+                                    submitAnswer(group.roleKey, pq.text, editVal, editKey);
+                                  }
+                                }}
+                                placeholder={pq.defaultAnswer ? `or edit default: ${pq.defaultAnswer}` : "your answer…"}
+                              />
+                              <button
+                                className="small primary"
+                                disabled={!editVal.trim()}
+                                onClick={() => submitAnswer(group.roleKey, pq.text, editVal, editKey)}
+                              >
+                                ✓
+                              </button>
+                              {answered && (
+                                <button
+                                  className="link"
+                                  style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "var(--ink-dim)",
+                                    cursor: "pointer",
+                                    padding: "0 4px",
+                                    fontSize: 11,
+                                  }}
+                                  onClick={() =>
+                                    setEditingKeys((prev) => {
+                                      const next = new Set(prev);
+                                      next.delete(editKey);
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  cancel
+                                </button>
+                              )}
+                              <QuestionDecomposeButton
+                                parentTaskId={taskId}
+                                roleKey={group.roleKey}
+                                question={rawQ.question}
+                                onMutate={refresh}
+                              />
+                            </div>
+                          )}
                           {(() => {
                             const decomposedChild = d.children.find(
                               (c) =>

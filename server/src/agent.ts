@@ -63,6 +63,18 @@ export interface CriteriaResult {
   note?: string;
 }
 
+/** One node of a decomposition role's epic/story/task tree — the machine-readable
+ *  counterpart to the human-readable prose it also writes in section_md. */
+export interface Subtask {
+  local_id: string;
+  level: "epic" | "story" | "task";
+  name: string;
+  brief: string;
+  acceptance_criteria: string[];
+  context_to_carry_forward: string;
+  depends_on?: string[];
+}
+
 export interface RoleFindings {
   verdict: Verdict;
   summary: string;
@@ -71,6 +83,11 @@ export interface RoleFindings {
   section_md: string;
   /** Present only for counter-reviewer roles; one entry per acceptance criterion. */
   criteria_results?: CriteriaResult[];
+  /** Present only for decomposition (or any role with can_create_subtasks). */
+  subtasks?: Subtask[];
+  /** Required when subtasks is intentionally empty (already one atomic unit) —
+   *  distinguishes that from a failed/incomplete decomposition. */
+  no_decomposition_reason?: string;
 }
 
 export interface ToolCallRecord {
@@ -189,6 +206,27 @@ const OpenQuestionSchema = Type.Object({
   confidence: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
 });
 
+const SubtaskSchema = Type.Object({
+  local_id: Type.String({
+    description:
+      "Short id unique within this list (e.g. \"1\", \"1.2\") — referenced by other nodes' depends_on.",
+  }),
+  level: Type.Union([Type.Literal("epic"), Type.Literal("story"), Type.Literal("task")]),
+  name: Type.String({ description: "Short imperative title, <=120 chars." }),
+  brief: Type.String({ description: "1-3 sentences: what this unit of work is, concretely." }),
+  acceptance_criteria: Type.Array(Type.String()),
+  context_to_carry_forward: Type.String({
+    description:
+      "Decisions, constraints, or facts this child needs that aren't obvious from name/brief alone — " +
+      "this becomes the child's seed context. The child will not re-read this parent's full history by default.",
+  }),
+  depends_on: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "local_ids of sibling nodes in this same list that must complete first.",
+    }),
+  ),
+});
+
 const RecordFindingsSchema = Type.Object({
   verdict: Type.Union([
     Type.Literal("pass"),
@@ -201,6 +239,15 @@ const RecordFindingsSchema = Type.Object({
   coverage: Type.Optional(Type.Array(CoverageSchema)),
   section_md: Type.String(),
   criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
+  subtasks: Type.Optional(Type.Array(SubtaskSchema)),
+  no_decomposition_reason: Type.Optional(
+    Type.String({
+      description:
+        "Required when subtasks is empty and that's intentional (the work is already one atomic, " +
+        "independently-actionable unit). An empty subtasks array with no reason is treated as a " +
+        "failed decomposition, not an intentional no-op.",
+    }),
+  ),
 });
 
 const WriteArtifactSchema = Type.Object({
@@ -334,6 +381,10 @@ output your findings as a single JSON code block using EXACTLY this format:
 
 If you are a counter-reviewer with acceptance criteria to verify, also include:
 - **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
+
+If you are decomposing work into an epic/story/task tree, also include:
+- **subtasks**: array of { local_id, level, name, brief, acceptance_criteria, context_to_carry_forward, depends_on } — local_id is a short id you assign (e.g. "1", "1.2") that depends_on (array of other subtasks' local_ids, optional) can reference; level is "epic", "story", or "task"; context_to_carry_forward must state any decision/constraint/fact the child needs that isn't obvious from name/brief alone — the child will not see this parent's full history by default.
+- **no_decomposition_reason**: a string explaining why, REQUIRED if subtasks is empty and that's intentional (the work is already one atomic, independently-actionable unit). An empty subtasks array with no reason is treated as a failed decomposition.
 
 Output ONLY the JSON block as the last thing in your response. Do not write anything after the closing \`\`\`.
 `.trim();
@@ -595,6 +646,36 @@ function normalizeOpenQuestions(raw: unknown): OpenQuestion[] {
   return out;
 }
 
+/** Coerce loosely-typed model output into Subtask[] — same defensive posture as
+ *  normalizeOpenQuestions since this path (text-mode/two-phase JSON) is not
+ *  schema-validated like the record_findings tool call is. Drops entries missing
+ *  a name (nothing usable to seed a child task with). */
+function normalizeSubtasks(raw: unknown): Subtask[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: Subtask[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (typeof o.name !== "string" || !o.name.trim()) continue;
+    const level = o.level === "epic" || o.level === "story" || o.level === "task" ? o.level : "task";
+    out.push({
+      local_id: typeof o.local_id === "string" && o.local_id ? o.local_id : String(out.length + 1),
+      level,
+      name: o.name,
+      brief: typeof o.brief === "string" ? o.brief : "",
+      acceptance_criteria: Array.isArray(o.acceptance_criteria)
+        ? o.acceptance_criteria.filter((c): c is string => typeof c === "string")
+        : [],
+      context_to_carry_forward:
+        typeof o.context_to_carry_forward === "string" ? o.context_to_carry_forward : "",
+      depends_on: Array.isArray(o.depends_on)
+        ? o.depends_on.filter((d): d is string => typeof d === "string")
+        : undefined,
+    });
+  }
+  return out.length ? out : undefined;
+}
+
 /** Best-effort extraction of RoleFindings fields from malformed/partial JSON
  *  by matching quoted field values with regex. Only returns a result when at
  *  least verdict and summary can be extracted. */
@@ -655,6 +736,9 @@ function tryParseFindings(json: string): RoleFindings | null {
       criteria_results: Array.isArray(obj.criteria_results)
         ? (obj.criteria_results as CriteriaResult[])
         : undefined,
+      subtasks: normalizeSubtasks(obj.subtasks),
+      no_decomposition_reason:
+        typeof obj.no_decomposition_reason === "string" ? obj.no_decomposition_reason : undefined,
     };
   } catch {
     return null;
@@ -740,6 +824,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
         coverage: (p.coverage ?? []) as CoverageItem[],
         section_md: p.section_md,
         criteria_results: (p.criteria_results ?? []) as CriteriaResult[],
+        subtasks: p.subtasks as Subtask[] | undefined,
+        no_decomposition_reason: p.no_decomposition_reason,
       };
       return { ...textResult("findings recorded"), terminate: true };
     },

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api, type Task, type RoleRun, type CoverageMap } from "../api";
+import { api, type Task, type RoleRun, type CoverageMap, type Intervention } from "../api";
 import { QuestionDecomposeButton, DecomposedChildCard } from "./QuestionDecompose";
 
 export interface ReviewCTAProps {
@@ -8,6 +8,7 @@ export interface ReviewCTAProps {
   recapMd: string | null;
   coverage: CoverageMap | null;
   runs: RoleRun[];
+  interventions: Intervention[];
   childTasks: Task[];
   /** Call after any mutation to refresh data. */
   onMutate: () => void;
@@ -41,10 +42,22 @@ function extractActionItems(
     }
   }
 
-  // 2. Fallback: decomposition role output for [epic]/[story]/[task] bullets.
+  // 2. Fallback: decomposition role output. Prefer the structured subtasks_json
+  //    (name per node); fall back to regex-parsing [epic]/[story]/[task] bullets
+  //    in output_md for runs recorded before subtasks_json existed.
   if (items.length === 0) {
     const decomp = runs.find((r) => r.role_key === "decomposition");
-    if (decomp?.output_md) {
+    if (decomp?.subtasks_json) {
+      try {
+        const parsed = JSON.parse(decomp.subtasks_json) as Array<{ name?: string }>;
+        for (const node of parsed) {
+          if (node?.name) items.push(node.name.trim().slice(0, 200));
+        }
+      } catch {
+        // fall through to the legacy regex path
+      }
+    }
+    if (items.length === 0 && decomp?.output_md) {
       const labelRe = /\[(epic|story|task)\]\s*(.+)/gi;
       let lm;
       while ((lm = labelRe.exec(decomp.output_md)) !== null) {
@@ -118,6 +131,38 @@ export function collectQuestions(
   return groups;
 }
 
+export interface AnsweredQuestion {
+  answer: string;
+  createdAt: string;
+}
+
+/** Most recent human answer to a role_key+question pair, derived from the
+ *  interventions list (listInterventions returns ascending id order, so the
+ *  last match found while scanning is the most recent — and wins). Returns
+ *  null if the question was never answered. Tolerates malformed payload_json. */
+export function findAnsweredQuestion(
+  interventions: Intervention[],
+  roleKey: string,
+  question: string,
+): AnsweredQuestion | null {
+  const qNorm = question.trim();
+  let found: AnsweredQuestion | null = null;
+  for (const iv of interventions) {
+    if (iv.kind !== "question_answer") continue;
+    let payload: { role_key?: string; question?: string; answer?: string };
+    try {
+      payload = iv.payload_json ? JSON.parse(iv.payload_json) : {};
+    } catch {
+      continue;
+    }
+    if (payload.role_key !== roleKey) continue;
+    if ((payload.question ?? "").trim() !== qNorm) continue;
+    if (!payload.answer) continue;
+    found = { answer: payload.answer, createdAt: iv.created_at };
+  }
+  return found;
+}
+
 /** Find coverage concerns that were never evaluated. */
 function uncoveredConcerns(coverage: CoverageMap | null): string[] {
   if (!coverage) return [];
@@ -132,6 +177,7 @@ export function ReviewCTA({
   recapMd,
   coverage,
   runs,
+  interventions,
   childTasks,
   onMutate,
 }: ReviewCTAProps) {
@@ -142,6 +188,11 @@ export function ReviewCTA({
   const [questionAnswers, setQuestionAnswers] = useState<
     Record<string, string>
   >({});
+  // Question keys the user has explicitly reopened for editing after the
+  // question was already answered (see findAnsweredQuestion) — an already-
+  // answered question renders as a locked "you answered" row unless its key
+  // is in this set.
+  const [editingKeys, setEditingKeys] = useState<Set<string>>(new Set());
 
   const isReview = task.stage === "review";
   const isReady = task.stage === "ready";
@@ -203,12 +254,137 @@ export function ReviewCTA({
       question,
       answer: answer.trim(),
     });
-    // Clear answer input
-    setQuestionAnswers((prev) => {
-      const next = { ...prev };
-      delete next[`${roleKey}:${question}`];
+    // Exit explicit-edit mode; the typed text stays in questionAnswers so the
+    // input keeps showing it (not the stale default) until the refetched
+    // interventions confirm the answer and the row locks.
+    setEditingKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(`${roleKey}:${question}`);
       return next;
     });
+  }
+
+  /** Renders one open-question row: locked "you answered" view once answered
+   *  and not explicitly being edited, otherwise the editable input + ✓. Shared
+   *  by both the "Open Questions" (review) and "Follow-up Questions" (ready)
+   *  sections below, which are otherwise identical markup. */
+  function renderQuestionItem(
+    roleKey: string,
+    rawQ: ClientOpenQuestion,
+    qi: number,
+    decomposedChild: Task | undefined,
+  ) {
+    const answerKey = `${roleKey}:${rawQ.question}`;
+    const answered = findAnsweredQuestion(interventions, roleKey, rawQ.question);
+    const isEditing = !answered || editingKeys.has(answerKey);
+    const val = questionAnswers[answerKey] ?? answered?.answer ?? "";
+
+    return (
+      <div key={qi} className="question-item">
+        <p className="question-text">{rawQ.question}</p>
+        {rawQ.assumed_answer && (
+          <p className="question-default">
+            best-effort guess ({rawQ.confidence}):{" "}
+            <strong>{rawQ.assumed_answer}</strong>
+            {rawQ.resolved === "confirmed" && (
+              <span className="pill dim" style={{ marginLeft: 6 }}>
+                confirmed
+              </span>
+            )}
+            {rawQ.resolved === "invalidated" && (
+              <span className="pill bad" style={{ marginLeft: 6 }}>
+                corrected
+              </span>
+            )}
+          </p>
+        )}
+        {answered && !isEditing && (
+          <p className="question-default">
+            you answered: <strong>{answered.answer}</strong>
+            <span className="pill ok" style={{ marginLeft: 6 }}>
+              answered
+            </span>{" "}
+            <button
+              className="link"
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--brass)",
+                cursor: "pointer",
+                padding: 0,
+                textDecoration: "underline",
+                fontSize: 11,
+              }}
+              onClick={() => {
+                setEditingKeys((prev) => new Set(prev).add(answerKey));
+                setQuestionAnswers((prev) => ({ ...prev, [answerKey]: answered.answer }));
+              }}
+            >
+              change answer
+            </button>
+          </p>
+        )}
+        {isEditing && (
+          <div className="question-answer-row">
+            <input
+              className="question-answer-input"
+              value={val}
+              onChange={(e) =>
+                setQuestionAnswers((prev) => ({
+                  ...prev,
+                  [answerKey]: e.target.value,
+                }))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && val.trim()) {
+                  submitAnswer(roleKey, rawQ.question, val);
+                }
+              }}
+              placeholder="answer…"
+            />
+            <button
+              className="small review-cta-secondary"
+              disabled={!val.trim()}
+              style={{ padding: "2px 6px" }}
+              onClick={() => submitAnswer(roleKey, rawQ.question, val)}
+            >
+              ✓
+            </button>
+            {answered && (
+              <button
+                className="link"
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--ink-dim)",
+                  cursor: "pointer",
+                  padding: "0 4px",
+                  fontSize: 11,
+                }}
+                onClick={() =>
+                  setEditingKeys((prev) => {
+                    const next = new Set(prev);
+                    next.delete(answerKey);
+                    return next;
+                  })
+                }
+              >
+                cancel
+              </button>
+            )}
+            {!decomposedChild && (
+              <QuestionDecomposeButton
+                parentTaskId={taskId}
+                roleKey={roleKey}
+                question={rawQ.question}
+                onMutate={onMutate}
+              />
+            )}
+          </div>
+        )}
+        {decomposedChild && <DecomposedChildCard task={decomposedChild} />}
+      </div>
+    );
   }
 
   return (
@@ -252,73 +428,12 @@ export function ReviewCTA({
                     {group.roleKey}
                   </span>
                   {group.questions.map((rawQ, qi) => {
-                    const answerKey = `${group.roleKey}:${rawQ.question}`;
-                    const val = questionAnswers[answerKey] ?? "";
                     const decomposedChild = childTasks.find(
                       (c) =>
                         c.origin_role_key === group.roleKey &&
                         c.origin_question === rawQ.question,
                     );
-                    return (
-                      <div key={qi} className="question-item">
-                        <p className="question-text">{rawQ.question}</p>
-                        {rawQ.assumed_answer && (
-                          <p className="question-default">
-                            best-effort guess ({rawQ.confidence}):{" "}
-                            <strong>{rawQ.assumed_answer}</strong>
-                            {rawQ.resolved === "confirmed" && (
-                              <span className="pill dim" style={{ marginLeft: 6 }}>
-                                confirmed
-                              </span>
-                            )}
-                            {rawQ.resolved === "invalidated" && (
-                              <span className="pill bad" style={{ marginLeft: 6 }}>
-                                corrected
-                              </span>
-                            )}
-                          </p>
-                        )}
-                        <div className="question-answer-row">
-                          <input
-                            className="question-answer-input"
-                            value={val}
-                            onChange={(e) =>
-                              setQuestionAnswers((prev) => ({
-                                ...prev,
-                                [answerKey]: e.target.value,
-                              }))
-                            }
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && val.trim()) {
-                                submitAnswer(group.roleKey, rawQ.question, val);
-                              }
-                            }}
-                            placeholder="answer…"
-                          />
-                          <button
-                            className="small review-cta-secondary"
-                            disabled={!val.trim()}
-                            style={{ padding: "2px 6px" }}
-                            onClick={() =>
-                              submitAnswer(group.roleKey, rawQ.question, val)
-                            }
-                          >
-                            ✓
-                          </button>
-                          {!decomposedChild && (
-                            <QuestionDecomposeButton
-                              parentTaskId={taskId}
-                              roleKey={group.roleKey}
-                              question={rawQ.question}
-                              onMutate={onMutate}
-                            />
-                          )}
-                        </div>
-                        {decomposedChild && (
-                          <DecomposedChildCard task={decomposedChild} />
-                        )}
-                      </div>
-                    );
+                    return renderQuestionItem(group.roleKey, rawQ, qi, decomposedChild);
                   })}
                 </div>
               ))}
@@ -445,73 +560,12 @@ export function ReviewCTA({
                     {group.roleKey}
                   </span>
                   {group.questions.map((rawQ, qi) => {
-                    const answerKey = `${group.roleKey}:${rawQ.question}`;
-                    const val = questionAnswers[answerKey] ?? "";
                     const decomposedChild = childTasks.find(
                       (c) =>
                         c.origin_role_key === group.roleKey &&
                         c.origin_question === rawQ.question,
                     );
-                    return (
-                      <div key={qi} className="question-item">
-                        <p className="question-text">{rawQ.question}</p>
-                        {rawQ.assumed_answer && (
-                          <p className="question-default">
-                            best-effort guess ({rawQ.confidence}):{" "}
-                            <strong>{rawQ.assumed_answer}</strong>
-                            {rawQ.resolved === "confirmed" && (
-                              <span className="pill dim" style={{ marginLeft: 6 }}>
-                                confirmed
-                              </span>
-                            )}
-                            {rawQ.resolved === "invalidated" && (
-                              <span className="pill bad" style={{ marginLeft: 6 }}>
-                                corrected
-                              </span>
-                            )}
-                          </p>
-                        )}
-                        <div className="question-answer-row">
-                          <input
-                            className="question-answer-input"
-                            value={val}
-                            onChange={(e) =>
-                              setQuestionAnswers((prev) => ({
-                                ...prev,
-                                [answerKey]: e.target.value,
-                              }))
-                            }
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && val.trim()) {
-                                submitAnswer(group.roleKey, rawQ.question, val);
-                              }
-                            }}
-                            placeholder="answer…"
-                          />
-                          <button
-                            className="small review-cta-secondary"
-                            disabled={!val.trim()}
-                            style={{ padding: "2px 6px" }}
-                            onClick={() =>
-                              submitAnswer(group.roleKey, rawQ.question, val)
-                            }
-                          >
-                            ✓
-                          </button>
-                          {!decomposedChild && (
-                            <QuestionDecomposeButton
-                              parentTaskId={taskId}
-                              roleKey={group.roleKey}
-                              question={rawQ.question}
-                              onMutate={onMutate}
-                            />
-                          )}
-                        </div>
-                        {decomposedChild && (
-                          <DecomposedChildCard task={decomposedChild} />
-                        )}
-                      </div>
-                    );
+                    return renderQuestionItem(group.roleKey, rawQ, qi, decomposedChild);
                   })}
                 </div>
               ))}

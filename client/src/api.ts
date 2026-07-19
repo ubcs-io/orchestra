@@ -75,6 +75,9 @@ export interface RoleRun {
   /** Checkpoint commit created right after this run's artifact commit — null if
    *  the commit was a no-op/failed, or the run predates the checkpointing feature. */
   git_commit_sha: string | null;
+  /** Structured decomposition output (JSON array of Subtask), when this run is a
+   *  can_create_subtasks role — preferred over regex-parsing output_md. */
+  subtasks_json: string | null;
   created_at: string;
 }
 
