@@ -78,6 +78,79 @@ function extractActionItems(
   return items.slice(0, 8);
 }
 
+const RECOVERY_SECTION_HEADER_RE =
+  /^#{2,4}\s+(?:action\s*items?|next\s*steps?|recommended\s+update\s+strategy|recommendations?)\s*$/im;
+const LIST_ITEM_RE = /^(?:[-*]|\d+[.)])\s+(.+)$/gm;
+
+/** Extract the bullet/numbered items under the first matching heading in `md`. */
+function extractListSection(md: string, headerRe: RegExp): string[] {
+  const hdr = headerRe.exec(md);
+  if (!hdr) return [];
+  const afterHeader = md.slice(hdr.index + hdr[0].length);
+  const nextHeader = afterHeader.search(/^#{2,4}\s+/m);
+  const section = nextHeader >= 0 ? afterHeader.slice(0, nextHeader) : afterHeader;
+  const items: string[] = [];
+  const re = new RegExp(LIST_ITEM_RE.source, LIST_ITEM_RE.flags);
+  let m;
+  while ((m = re.exec(section)) !== null) {
+    const text = m[1]!.trim();
+    if (text && !text.startsWith("---")) items.push(text.slice(0, 200));
+  }
+  return items;
+}
+
+/** True (returning the run) when the terminal decomposition role failed to
+ *  produce either a subtask tree or an explicit reason it's already atomic —
+ *  mirrors the server's own zero-subtask escalation check (orchestrator.ts). */
+export function findFailedDecomposition(runs: RoleRun[]): RoleRun | null {
+  const decomp = [...runs].reverse().find((r) => r.role_key === "decomposition");
+  if (!decomp) return null;
+  if (decomp.no_decomposition_reason?.trim()) return null;
+  let hasSubtasks = false;
+  if (decomp.subtasks_json) {
+    try {
+      const parsed = JSON.parse(decomp.subtasks_json) as unknown[];
+      hasSubtasks = Array.isArray(parsed) && parsed.length > 0;
+    } catch {
+      hasSubtasks = false;
+    }
+  }
+  return hasSubtasks ? null : decomp;
+}
+
+/** When decomposition fails, salvage whatever actionable list an earlier role
+ *  already produced so the human isn't left with nothing to act on — later
+ *  roles in the pipeline often add little beyond confirming that first
+ *  analysis anyway. Scans roles in pipeline order (skipping the failed
+ *  decomposition run itself) and returns the first usable list found,
+ *  preferring a structured subtasks_json (any role's record_findings call can
+ *  include one, not just a can_create_subtasks role's) over parsing a
+ *  "Recommended Update Strategy"/"Next Steps" prose section. */
+export function extractRecoveryCandidates(
+  runs: RoleRun[],
+): { roleKey: string; items: string[] } | null {
+  for (const r of runs) {
+    if (r.role_key === "decomposition") continue;
+    if (r.subtasks_json) {
+      try {
+        const parsed = JSON.parse(r.subtasks_json) as Array<{ name?: string }>;
+        const items = parsed
+          .map((node) => node?.name?.trim())
+          .filter((n): n is string => !!n)
+          .map((n) => n.slice(0, 200));
+        if (items.length > 0) return { roleKey: r.role_key, items: items.slice(0, 10) };
+      } catch {
+        // fall through to prose parsing below
+      }
+    }
+    if (r.output_md) {
+      const items = extractListSection(r.output_md, RECOVERY_SECTION_HEADER_RE);
+      if (items.length > 0) return { roleKey: r.role_key, items: items.slice(0, 10) };
+    }
+  }
+  return null;
+}
+
 /** A role's open question together with its own best-effort guess — mirrors
  *  server/src/agent.ts's OpenQuestion. Tolerates the legacy plain-string form
  *  stored before questions carried a guess/confidence/resolution. */
@@ -200,6 +273,8 @@ export function ReviewCTA({
 
   const actionItems =
     isReady ? extractActionItems(recapMd, coverage, runs) : [];
+  const failedDecomp = findFailedDecomposition(runs);
+  const recoveryCandidates = failedDecomp ? extractRecoveryCandidates(runs) : null;
   const questionGroups = collectQuestions(runs);
   const missingConcerns = uncoveredConcerns(coverage);
   const reviewReason = task.review_reason ?? "Task requires human judgement.";
@@ -387,6 +462,48 @@ export function ReviewCTA({
     );
   }
 
+  /** Renders when decomposition failed to produce a subtask tree: salvaged
+   *  candidate tickets from an earlier role's recommendations (if any were
+   *  found), each with the same "+ subtask" affordance as the normal "next
+   *  steps" list, plus a pointer at the existing reset button to retry
+   *  decomposition itself. Shared by the review and ready panels so it shows
+   *  up regardless of which stage the task landed in. */
+  function renderRecoverySection() {
+    if (!failedDecomp) return null;
+    return (
+      <div style={{ marginTop: 14 }}>
+        <div className="review-cta-row">
+          <span
+            className="pill bad"
+            style={{ fontSize: 11, textTransform: "uppercase" }}
+          >
+            decomposition incomplete
+          </span>
+        </div>
+        <p className="review-reason" style={{ marginTop: 4 }}>
+          Decomposition didn't produce a subtask tree
+          {failedDecomp.stop_reason ? ` (stopped: ${failedDecomp.stop_reason})` : ""}.
+          {recoveryCandidates
+            ? ` Recovered these candidates from ${recoveryCandidates.roleKey}'s findings — review and create the ones that still apply, or use `
+            : ` Nothing usable was found to recover automatically — use `}
+          <strong>⟳ Reset &amp; re-run</strong> below to retry decomposition itself.
+        </p>
+        {recoveryCandidates?.items.map((item, i) => (
+          <div key={i} className="next-step-item" style={{ marginBottom: 4 }}>
+            <span className="next-step-text">{item}</span>
+            <button
+              className="small review-cta-secondary"
+              disabled={creatingSubtaskKey === item}
+              onClick={() => createSubtask(item)}
+            >
+              {creatingSubtaskKey === item ? "…" : "+ subtask"}
+            </button>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   return (
     <div className="panel review-cta-panel">
       {isReview && (
@@ -413,6 +530,8 @@ export function ReviewCTA({
                 : "Request clarification"}
             </button>
           </div>
+
+          {renderRecoverySection()}
 
           {questionGroups.length > 0 && (
             <div style={{ marginTop: 14 }}>
@@ -545,6 +664,8 @@ export function ReviewCTA({
               })}
             </div>
           )}
+
+          {renderRecoverySection()}
 
           {questionGroups.length > 0 && (
             <div style={{ marginTop: 14 }}>

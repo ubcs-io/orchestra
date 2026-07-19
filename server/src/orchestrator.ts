@@ -560,12 +560,13 @@ export function taskRepoPath(task: TaskRow, project: ProjectRow): string {
   return task.git_worktree_path ?? project.repo_path;
 }
 
-/** Scan every project's INTAKE folder and create tasks for new files. */
-function ingestProject(project: ProjectRow): number {
+/** Scan every project's INTAKE folder and create tasks for new files.
+ *  Returns the list of task rows that were created. */
+export function ingestProject(project: ProjectRow): TaskRow[] {
   const planningDir = project.planning_dir || "PLANNING";
   scaffoldPlanning(project.repo_path, planningDir);
   const files = scanIntake(project.repo_path, planningDir);
-  let created = 0;
+  const created: TaskRow[] = [];
   for (const f of files) {
     const kind = inferIntakeKind(f.fileName, f.content);
     let task = createTask({
@@ -596,7 +597,7 @@ function ingestProject(project: ProjectRow): number {
     );
     updateTask(task.task_id, { artifact_path: relArtifact });
     commitArtifacts(taskRepo, [relArtifact], `intake(${kind}): ${f.fileName}`);
-    created++;
+    created.push(task);
     publish(task.task_id, "task_update", { stage: "intake" });
   }
   return created;
@@ -1982,7 +1983,8 @@ async function applyGate(
     // REFINING. Independent of `level` — a root task that should have decomposed
     // but produced nothing never gets auto-promoted off "task", so gating this
     // check on level would silently miss the common case.
-    const isSpecTerminal = isTerminalRole(task, step.role) && (task.exit_kind as ExitKind) === "spec";
+    const isSpecTerminal =
+      isTerminalRole(task, step.role) && ((task.exit_kind as ExitKind) || "spec") === "spec";
     const roleCfg = isSpecTerminal ? getRole(project.id, step.role) : undefined;
     let level = task.level ?? "task";
     let resolvedSubtasks: Subtask[] = [];
@@ -1991,11 +1993,27 @@ async function applyGate(
       const decomp = [...runs].reverse().find((r) => r.role_key === step.role);
       resolvedSubtasks = resolveDecompositionSubtasks(decomp).subtasks;
       if (resolvedSubtasks.length === 0 && !decomp?.no_decomposition_reason?.trim()) {
-        escalate(
+        const zeroSubtaskReason =
           `Decomposition (verdict: ${verdict}) produced zero subtasks with no stated reason — this is ` +
-            `treated as a failed/incomplete breakdown, not an intentional atomic leaf. Approve to accept ` +
-            `as atomic, or reset to re-run decomposition.`,
-        );
+          `treated as a failed/incomplete breakdown, not an intentional atomic leaf. Approve to accept ` +
+          `as atomic, or reset to re-run decomposition.`;
+        // ---- Call Point 2: Escalation Assessment ----
+        // Lets an unattended pipeline self-heal a failed decomposition (e.g. a
+        // run that got cut off mid-generation, see agent.ts's twoPhase nudging)
+        // by re-running the role instead of always parking on a human.
+        if (routerCfg?.escalationAssessment) {
+          const overridden = await maybeAssessEscalation(
+            task,
+            project,
+            plan,
+            step,
+            verdict,
+            zeroSubtaskReason,
+            routerCfg,
+          );
+          if (overridden) return;
+        }
+        escalate(zeroSubtaskReason);
         triggerRecap(coverage, criteriaResults);
         return;
       }
@@ -2354,10 +2372,18 @@ async function runTaskStepOnce(taskId: string): Promise<void> {
   // Ensure a plan; intake → refining on first plan.
   let plan = readPlan(task);
   if (!plan) {
-    plan = planFromTemplate((task.intake_kind as IntakeKind) || "manual", task.network_id);
+    const intakeKind = (task.intake_kind as IntakeKind) || "manual";
+    plan = planFromTemplate(intakeKind, task.network_id);
     // Fold any promoted project roles for this kind into the plan.
     plan = withPromotedRoles(project, task, plan);
-    updateTask(task.task_id, { refinement_plan_json: JSON.stringify(plan), stage: "refining" });
+    updateTask(task.task_id, {
+      refinement_plan_json: JSON.stringify(plan),
+      stage: "refining",
+      // A reset task has exit_kind nulled out (see resetTask) — backfill it here
+      // so terminal-role gating (isSpecTerminal) doesn't silently lose its
+      // zero-subtasks safety net on a task's second time through the pipeline.
+      ...(task.exit_kind ? {} : { exit_kind: EXIT_KIND_BY_INTAKE[intakeKind] }),
+    });
     task = getTask(task.task_id)!;
     publish(task.task_id, "task_update", { stage: "refining" });
   }
@@ -2394,7 +2420,7 @@ async function runTaskStepOnce(taskId: string): Promise<void> {
  *  configured concurrency cap. */
 export async function tickOnce(limit: number): Promise<boolean> {
   let ingested = 0;
-  for (const project of listProjects()) ingested += ingestProject(project);
+  for (const project of listProjects()) ingested += ingestProject(project).length;
 
   const freeSlots = limit - inFlightTasks.size;
   if (freeSlots <= 0) return ingested > 0;

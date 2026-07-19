@@ -75,19 +75,20 @@ import {
   THINKING_FORMATS,
 } from "../settings.js";
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
-import {
-  artifactName,
-  buildParentDigest,
-  ensureTaskWorkspace,
-  isSchedulerRunning,
-  isSchedulerStopping,
-  reincorporateAnswer,
-  restoreCheckpoint,
-  startScheduler,
-  stopScheduler,
-  taskRepoPath,
-  tick,
-} from "../orchestrator.js";
+  import {
+    artifactName,
+    buildParentDigest,
+    ensureTaskWorkspace,
+    ingestProject,
+    isSchedulerRunning,
+    isSchedulerStopping,
+    reincorporateAnswer,
+    restoreCheckpoint,
+    startScheduler,
+    stopScheduler,
+    taskRepoPath,
+    tick,
+  } from "../orchestrator.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
 import { runRole } from "../agent.js";
 import { publish } from "../bus.js";
@@ -935,6 +936,8 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   });
 
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.
+  // Ingested synchronously so the task row exists before the response returns —
+  // the caller sees the task immediately instead of waiting for a scheduler tick.
   app.post("/api/projects/:id/intake", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     const project = getProject(id);
@@ -948,7 +951,12 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const ext = body.intake_kind === "error_file" ? ".log" : ".md";
     const rel = path.join(project.planning_dir, "INTAKE", `${name}${ext}`);
     writeArtifact(path.join(project.repo_path, rel), body.content);
-    return reply.code(202).send({ accepted: true, path: rel });
+
+    // Ingest synchronously — creates the task row immediately so the caller
+    // sees it without waiting for the next scheduler tick.
+    const created = ingestProject(project);
+    const task = created.length > 0 ? created[0] : null;
+    return reply.code(201).send({ accepted: true, path: rel, task_id: task?.task_id ?? null });
   });
 
   // Manual task creation without a repo file (e.g. quick note).

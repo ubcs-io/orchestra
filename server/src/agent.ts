@@ -762,6 +762,18 @@ function tryParseFindings(json: string): RoleFindings | null {
  */
 const DEFAULT_PREEMPTIVE_NUDGE_CHARS = 8000;
 const DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE = 20000;
+/**
+ * Reasoning/thinking-channel counterpart of the above: a role that reasons at
+ * great length without producing much answer text (e.g. twoPhase Phase 1
+ * exploration, which has no record_findings tool and often composes its whole
+ * answer inside its thinking trace before wrapping up) never trips the
+ * answer-text nudge above, and can run until an external/provider-side
+ * timeout cuts it off mid-thought — discarding all of that reasoning instead
+ * of cleanly handing off to Phase 2's formalize prompt. Deliberately much more
+ * generous than the answer-text threshold since deep reasoning here is
+ * expected and useful. Overridable via ModelCompat.nudgeThresholdCharsThinking.
+ */
+const DEFAULT_PREEMPTIVE_NUDGE_CHARS_THINKING = 60000;
 
 export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   const textMode = params.textMode === true;
@@ -787,6 +799,10 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
   // Pre-emptive nudge tracking: if the model emits a lot of text without ever
   // calling a tool, inject the nudge early.
   let answerTextLenSinceLastTool = 0;
+  // Thinking-channel counterpart — tracked separately since a role can reason
+  // at length while emitting little/no answer text (see
+  // DEFAULT_PREEMPTIVE_NUDGE_CHARS_THINKING above).
+  let thinkingTextLenSinceLastTool = 0;
   let preemptiveNudged = false;
 
   // Text vs. reasoning accumulators. `answerText` is the clean answer (inline
@@ -876,6 +892,8 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     connection.compat.nudgeThresholdChars ?? DEFAULT_PREEMPTIVE_NUDGE_CHARS;
   const nudgeThresholdCharsTextMode =
     connection.compat.nudgeThresholdCharsTextMode ?? DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE;
+  const nudgeThresholdCharsThinking =
+    connection.compat.nudgeThresholdCharsThinking ?? DEFAULT_PREEMPTIVE_NUDGE_CHARS_THINKING;
   const loader = new DefaultResourceLoader({
     cwd: params.repoPath,
     agentDir: getAgentDir(),
@@ -993,6 +1011,26 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     }
   };
 
+  // Thinking-channel pre-emptive nudge: a role can reason at length while
+  // emitting little/no answer text (twoPhase Phase 1 has no record_findings
+  // tool, so it may compose its whole answer inside its thinking trace before
+  // ever wrapping up) — the answer-text nudge above never trips for that
+  // shape of run, leaving it to run until an external/provider timeout
+  // discards everything. This mirrors that guard for the thinking channel.
+  const checkThinkingNudge = (d: string) => {
+    if (!d || preemptiveNudged || captured || stalled) return;
+    thinkingTextLenSinceLastTool += d.length;
+    if (thinkingTextLenSinceLastTool >= nudgeThresholdCharsThinking) {
+      preemptiveNudged = true;
+      record({
+        type: "status",
+        message:
+          "pre-emptive nudge: model has reasoned at length without a tool call — requesting action",
+      });
+      void session.abort();
+    }
+  };
+
   const unsubscribe = session.subscribe((ev) => {
     switch (ev.type) {
       case "message_update": {
@@ -1009,6 +1047,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           // narrating, so that content must not reach the stall detector.
           checkStall(answerFenceTracker.push(text).outside);
           if (!textMode) checkStall(thinkingFenceTracker.push(thinking).outside);
+          checkThinkingNudge(thinking);
 
           // Track answer text length since last tool call for pre-emptive nudge.
           if (text.length > 0) {
@@ -1036,6 +1075,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
           const d = ame.delta ?? "";
           emitThinking(d);
           if (!textMode) checkStall(thinkingFenceTracker.push(d).outside);
+          checkThinkingNudge(d);
         }
         break;
       }
@@ -1043,6 +1083,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
         record({ type: "tool_start", tool: ev.toolName, args: ev.args });
         // Reset pre-emptive nudge tracking on any tool call.
         answerTextLenSinceLastTool = 0;
+        thinkingTextLenSinceLastTool = 0;
         break;
       case "tool_execution_end": {
         // On rejection (e.g. schema validation failure), pi wraps the error

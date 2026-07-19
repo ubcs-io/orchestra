@@ -136,7 +136,14 @@ function RadarChart({ stats }: { stats: ModelStat[]; configs: ModelConfig[] }) {
         "Params (log)": s.total_parameter_count_b != null ? `${s.total_parameter_count_b}B` : s.parameter_count_b != null ? `${s.parameter_count_b}B` : "?",
       },
     };
-  });
+  })
+    .sort((a, b) => {
+      // Sort by historical runs (most-used models first)
+      const aRuns = stats.find((s) => s.config_id === a.configId)?.historical_runs ?? 0;
+      const bRuns = stats.find((s) => s.config_id === b.configId)?.historical_runs ?? 0;
+      return bRuns - aRuns;
+    })
+    .slice(0, 5);
 
   const dims = 400;
   const cx = dims / 2;

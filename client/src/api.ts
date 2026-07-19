@@ -78,6 +78,11 @@ export interface RoleRun {
   /** Structured decomposition output (JSON array of Subtask), when this run is a
    *  can_create_subtasks role — preferred over regex-parsing output_md. */
   subtasks_json: string | null;
+  /** Set by a can_create_subtasks role when it deliberately leaves subtasks
+   *  empty because the work is already one atomic, independently-actionable
+   *  unit. Empty subtasks_json with this unset means the decomposition failed
+   *  rather than intentionally concluding there was nothing to break down. */
+  no_decomposition_reason: string | null;
   created_at: string;
 }
 
@@ -503,7 +508,7 @@ export const api = {
     req<TaskDetail>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   intake: (projectId: number, body: { name: string; content: string; intake_kind?: string }) =>
-    req<{ accepted: boolean; path: string }>(`/api/projects/${projectId}/intake`, {
+    req<{ accepted: boolean; path: string; task_id: string | null }>(`/api/projects/${projectId}/intake`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

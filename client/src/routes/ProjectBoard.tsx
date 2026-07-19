@@ -83,10 +83,13 @@ export function ProjectBoard() {
 
   const submit = useMutation({
     mutationFn: () => api.intake(pid, { name: name || "intake", content, intake_kind: kind }),
-    onSuccess: () => {
+    onSuccess: (data) => {
       setContent("");
       setName("");
       qc.invalidateQueries({ queryKey: ["tasks", pid] });
+      if (data.task_id) {
+        console.log(`[intake] task ${data.task_id} created`);
+      }
     },
   });
 
@@ -132,9 +135,9 @@ export function ProjectBoard() {
         <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="Consider how to address the UX issue on the settings page…" />
         <div style={{ marginTop: 8 }}>
           <button className="primary" disabled={!content || submit.isPending} onClick={() => submit.mutate()}>
-            {submit.isPending ? "Submitting…" : "Drop into INTAKE"}
+            {submit.isPending ? "Submitting…" : "Create task"}
           </button>
-          <span className="muted" style={{ marginLeft: 10 }}>The orchestrator ingests it on the next tick.</span>
+          <span className="muted" style={{ marginLeft: 10 }}>The task appears in the intake column immediately.</span>
         </div>
       </div>
 

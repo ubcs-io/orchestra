@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
-import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, updateProject, updateTask, type TaskRow } from "../src/db";
+import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, resetTask, updateProject, updateTask, type TaskRow } from "../src/db";
 import type { RoleRunRow } from "../src/db";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
@@ -414,6 +414,41 @@ describe("orchestrator loop (integration)", () => {
     await tick();
     const t0 = rootTask(projectId);
     if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_review");
+    expect(t.review_reason).toContain("zero subtasks");
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+  });
+
+  it("still escalates to REVIEW on zero subtasks after a reset-to-intake round trip (exit_kind backfill)", async () => {
+    // Regression test: resetTask() nulls exit_kind, and the zero-subtasks
+    // escalation gate used to compare it with a strict `=== "spec"` check
+    // (unlike isTerminalRole's `|| "spec"` fallback), so a task that had ever
+    // been reset would silently lose this safety net on its next pass through
+    // the pipeline and reach "ready" with nothing to show for it.
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(decompositionRunner());
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const afterFirstRun = rootTask(projectId)!;
+    expect(afterFirstRun.stage).toBe("review");
+
+    // Simulate the "⟳ Reset to intake" button: wipes history and nulls exit_kind.
+    resetTask(afterFirstRun.task_id);
+    expect(getTask(afterFirstRun.task_id)!.exit_kind).toBeNull();
+    updateTask(afterFirstRun.task_id, { paused: 0 });
 
     await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
 

@@ -99,6 +99,11 @@ export interface ModelCompat {
   /** Text-mode counterpart of nudgeThresholdChars (overrides
    *  DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE). */
   nudgeThresholdCharsTextMode?: number;
+  /** Reasoning/thinking-channel counterpart of nudgeThresholdChars (overrides
+   *  DEFAULT_PREEMPTIVE_NUDGE_CHARS_THINKING) — guards against a role that
+   *  reasons at length without emitting answer text (e.g. twoPhase Phase 1)
+   *  running until an external/provider timeout discards it. */
+  nudgeThresholdCharsThinking?: number;
 }
 
 /** Fully resolved connection settings for a single model call. */
