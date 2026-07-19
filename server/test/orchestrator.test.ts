@@ -1122,3 +1122,66 @@ describe("best-effort guesses + auto-reincorporation", () => {
     expect(questions[0]!.resolved).toBe("assumed");
   });
 });
+
+describe("role feed-forward (buildRoleContext)", () => {
+  /** Records every context string it was invoked with; the first call reports a
+   *  guessed open question, every later call passes cleanly with no questions. */
+  function contextCapturingRunner(contexts: string[], question: string, assumedAnswer: string): RoleRunner {
+    let calls = 0;
+    return async (params) => {
+      calls += 1;
+      contexts.push(params.context);
+      return {
+        findings: {
+          verdict: "pass",
+          summary: "pass from fake",
+          open_questions:
+            calls === 1
+              ? [{ question, assumed_answer: assumedAnswer, confidence: "low" as const, resolved: "assumed" as const }]
+              : [],
+          coverage: [{ concern: "security", status: "considered" }],
+          section_md: "## role\nfindings\n",
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 3,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    };
+  }
+
+  it("carries an earlier role's unresolved guess forward into the next role's context", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    const contexts: string[] = [];
+    setRoleRunner(contextCapturingRunner(contexts, "What logging framework does this project use?", "probably the existing one"));
+
+    await tick(); // intake_triage: records the guess
+    await tick(); // explorer: should see it as unresolved context
+
+    expect(contexts.length).toBe(2);
+    expect(contexts[1]).toContain("Open questions from earlier roles (unresolved)");
+    expect(contexts[1]).toContain("What logging framework does this project use?");
+    expect(contexts[1]).toContain("probably the existing one");
+    expect(contexts[1]).toContain("intake_triage");
+  });
+
+  it("points a tool-equipped role at the on-disk artifact for full prior write-ups", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    const contexts: string[] = [];
+    setRoleRunner(contextCapturingRunner(contexts, "unused question", "unused answer"));
+
+    await tick(); // intake_triage
+    await tick(); // explorer — has tools, and now has a prior run to point at
+
+    const t = rootTask(projectId)!;
+    expect(contexts[1]).toContain(t.artifact_path);
+    expect(contexts[1]).toContain("read it with your `read` tool");
+  });
+});

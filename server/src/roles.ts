@@ -310,8 +310,10 @@ mechanism — a tool call or structured text — is specified elsewhere in your 
   be appended to the task's planning artifact. Include concrete file references.
 
 ## Keep the deliverable tight
-Your \`summary\` and \`section_md\` are the deliverable — a busy engineer or the next
-role in the pipeline will skim them, not your reasoning process. Investigate and
+Your \`summary\` and \`section_md\` are the deliverable, not your reasoning process.
+\`summary\` is short and gets shown to every later role automatically; \`section_md\`
+is the full write-up — a busy engineer or a later role reading the planning artifact
+(pointed to in your context, if you have file tools) will skim it. Investigate and
 reason as much as you need to, but do not transcribe that process into your output:
 no "first I checked X, then I considered Y" narration, no restating context you were
 given. Write findings as direct, skimmable statements — prefer bullet lists with

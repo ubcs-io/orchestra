@@ -742,7 +742,14 @@ function getRouterCfg(project: ProjectRow): RouterConfig | null {
 // Context building
 // ---------------------------------------------------------------------------
 
-function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false, textMode = false): string {
+function buildRoleContext(
+  task: TaskRow,
+  roleKey: string,
+  twoPhase = false,
+  textMode = false,
+  relArtifact?: string,
+  hasTools = false,
+): string {
   const parts: string[] = [];
   parts.push(`# Task: ${task.name ?? task.task_id}`);
   parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
@@ -754,6 +761,26 @@ function buildRoleContext(task: TaskRow, roleKey: string, twoPhase = false, text
     for (const r of priors) {
       parts.push(
         `\n### ${r.role_key} — verdict: ${r.verdict ?? "n/a"}\n${r.summary ?? ""}`.trimEnd(),
+      );
+    }
+    if (relArtifact && hasTools) {
+      parts.push(
+        `\nThe above are condensed summaries. Full prior write-ups (with code citations) are on disk ` +
+          `at \`${relArtifact}\` — read it with your \`read\` tool if a summary above isn't enough detail.`,
+      );
+    }
+  }
+
+  const unresolved = priors.flatMap((r) =>
+    parseOpenQuestions(r.open_questions_json)
+      .filter((q) => q.resolved === "assumed")
+      .map((q) => ({ ...q, roleKey: r.role_key })),
+  );
+  if (unresolved.length) {
+    parts.push(`\n## Open questions from earlier roles (unresolved)`);
+    for (const q of unresolved) {
+      parts.push(
+        `- **${q.roleKey}** [${q.confidence} confidence] ${q.question} → assumed: ${q.assumed_answer || "(no guess)"}`,
       );
     }
   }
@@ -957,7 +984,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       modelId,
       systemPrompt: role.system_prompt,
       tools,
-      context: buildRoleContext(task, step.role, connection.twoPhase, connection.textMode),
+      context: buildRoleContext(task, step.role, connection.twoPhase, connection.textMode, relArtifact, tools.length > 0),
       thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
       textMode: connection.textMode,
       twoPhase: connection.twoPhase,
