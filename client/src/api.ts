@@ -49,6 +49,9 @@ export interface Task {
   /** Set once "Push & open PR" has succeeded for this task's branch. */
   github_pr_url: string | null;
   github_pushed_sha: string | null;
+  /** Set the first time a role in this task actually writes files (not just
+   *  PLANNING artifacts) — see server/src/orchestrator.ts's commitArtifacts call. */
+  wrote_source: number | null;
   created_at: string | null;
 }
 
@@ -409,6 +412,19 @@ export interface PingResultInit {
   }>;
 }
 
+/** One resolved model target used by a task's network (a named override
+ *  config, or the single default-connection fallback), possibly shared by
+ *  several roles. */
+export interface NetworkPingTarget {
+  target_id: string;
+  label: string;
+  kind: "override" | "default";
+  roles: string[];
+  available: boolean;
+  error?: string;
+  status: "checking" | "done";
+}
+
 export interface DiffFile {
   path: string;
   oldPath?: string;
@@ -421,6 +437,16 @@ export interface DiffFile {
 export interface TaskDiff {
   base: string;
   branch: string;
+  files: DiffFile[];
+}
+
+/** Diff scoped to a single role run — base is the previous primary run's
+ *  checkpoint commit (or the task's base branch for the first one), head is
+ *  this run's own checkpoint commit. See server/src/routes/api.ts's
+ *  resolveRunDiffRefs. */
+export interface RunDiff {
+  base: string;
+  head: string;
   files: DiffFile[];
 }
 
@@ -492,6 +518,12 @@ export const api = {
   taskDiffFile: (taskId: string, path: string, oldPath?: string) =>
     req<{ path: string; patch: string }>(
       `/api/tasks/${taskId}/diff/file?path=${encodeURIComponent(path)}${oldPath ? `&oldPath=${encodeURIComponent(oldPath)}` : ""}`,
+    ),
+
+  runDiff: (taskId: string, runId: number) => req<RunDiff>(`/api/tasks/${taskId}/runs/${runId}/diff`),
+  runDiffFile: (taskId: string, runId: number, path: string, oldPath?: string) =>
+    req<{ path: string; patch: string }>(
+      `/api/tasks/${taskId}/runs/${runId}/diff/file?path=${encodeURIComponent(path)}${oldPath ? `&oldPath=${encodeURIComponent(oldPath)}` : ""}`,
     ),
 
   githubPush: (taskId: string) =>
@@ -644,6 +676,8 @@ export const api = {
   summary: () => req<SummaryStats>("/api/summary"),
   /** URL for the SSE ping-network stream (GET). */
   pingNetworkStreamUrl: () => "/api/ping-network/stream",
+  /** URL for the SSE stream that pings only the models a task's network actually uses. */
+  taskNetworkPingStreamUrl: (taskId: string) => `/api/tasks/${taskId}/network-ping/stream`,
 
   // ---- Model stats (radar chart + performance comparison) ----
   modelStats: (configIds?: number[]) =>

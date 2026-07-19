@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
 import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, resetTask, updateProject, updateTask, type TaskRow } from "../src/db";
 import type { RoleRunRow } from "../src/db";
@@ -17,9 +17,11 @@ import {
   parseDecompositionTree,
   planFromTemplate,
   reincorporateAnswer,
+  resetReachabilityChecker,
   resetRoleRunner,
   resolveDecompositionSubtasks,
   restoreCheckpoint,
+  setReachabilityChecker,
   setRoleRunner,
   tick,
   tickOnce,
@@ -28,8 +30,16 @@ import type { RoleRunner } from "../src/orchestrator";
 import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn } from "../src/router";
 import { freshDb, tempGitRepo } from "./helpers";
 
+// The pre-flight reachability gate would otherwise hit a real (nonexistent)
+// endpoint for every step — stub it as always-reachable, matching how
+// setRoleRunner() stubs out the real LLM call.
+beforeEach(() => {
+  setReachabilityChecker(async () => ({ ok: true }));
+});
+
 afterEach(() => {
   resetRoleRunner();
+  resetReachabilityChecker();
   resetRouterFns();
   closeDb();
 });

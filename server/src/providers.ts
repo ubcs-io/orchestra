@@ -120,6 +120,34 @@ export function getRegistry(): ModelRegistry {
 }
 
 /**
+ * Check whether an OpenAI-compatible endpoint is reachable by hitting its
+ * /models route. Shared by the manual ping routes and the orchestrator's
+ * pre-flight gate — the latter uses a shorter timeout since it sits on the
+ * hot path of every step dispatch.
+ */
+export async function checkReachable(
+  baseUrl: string,
+  apiKey?: string,
+  timeoutMs = 6_000,
+): Promise<{ ok: boolean; error?: string }> {
+  const trimmed = (baseUrl ?? "").trim();
+  if (!trimmed) return { ok: false, error: "No base URL configured" };
+  try {
+    const url = trimmed.replace(/\/+$/, "") + "/models";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    clearTimeout(timer);
+    return { ok: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+  } catch (err) {
+    const msg = (err as Error).message;
+    return { ok: false, error: msg === "This operation was aborted" ? "aborted" : msg };
+  }
+}
+
+/**
  * Discover model ids from the endpoint's OpenAI-compatible /models route.
  * Best-effort: returns [] if the endpoint is unreachable or shaped differently.
  */

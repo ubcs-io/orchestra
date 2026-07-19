@@ -80,6 +80,7 @@ import {
 } from "./agent.js";
 import { getConfig } from "./config.js";
 import { resolveConnectionForModel } from "./settings.js";
+import { checkReachable } from "./providers.js";
 import { resolveHarnessPolicy } from "./harness-policy.js";
 import {
   resolveRouterConfig,
@@ -106,6 +107,23 @@ export function setRoleRunner(fn: RoleRunner): void {
 /** Restore the real pi-backed runner. */
 export function resetRoleRunner(): void {
   roleRunner = defaultRunRole;
+}
+
+// ---------------------------------------------------------------------------
+// Reachability-check seam — injectable so the pre-flight gate doesn't hit a
+// real network in tests (mirrors the roleRunner seam above).
+// ---------------------------------------------------------------------------
+
+type ReachabilityChecker = (baseUrl: string, apiKey?: string) => Promise<{ ok: boolean; error?: string }>;
+let reachabilityChecker: ReachabilityChecker = checkReachable;
+
+/** Override the reachability checker (tests inject a deterministic fake). */
+export function setReachabilityChecker(fn: ReachabilityChecker): void {
+  reachabilityChecker = fn;
+}
+/** Restore the real fetch-backed checker. */
+export function resetReachabilityChecker(): void {
+  reachabilityChecker = checkReachable;
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +944,19 @@ function isJsonParseError(message: string): boolean {
   return message.includes("JSON") || message.includes("Unexpected token") || message.includes("Unexpected non-whitespace");
 }
 
+/** Detect connection-level failures (endpoint unreachable/DNS/timeout) as opposed
+ *  to a content/reasoning failure from the model itself. */
+function isNetworkError(message: string): boolean {
+  return (
+    message.includes("ECONNREFUSED") ||
+    message.includes("ENOTFOUND") ||
+    message.includes("EAI_AGAIN") ||
+    message.includes("ETIMEDOUT") ||
+    message.includes("ECONNRESET") ||
+    message.includes("fetch failed")
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Running one role step
 // ---------------------------------------------------------------------------
@@ -953,6 +984,27 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // (and its defaultModelId) when no override is set, matching prior behavior.
   const modelRef = role.model || task.model || project.default_model || null;
   const { connection, modelId } = resolveConnectionForModel(modelRef, project.id);
+
+  // Pre-flight reachability check: if the resolved connection's endpoint isn't
+  // reachable, stop before publishing role_start so the task never *looks*
+  // like it's progressing. Pause the task (same shape as the existing
+  // wont_do escalation) so the scheduler stops re-dispatching it until the
+  // user checks availability / resumes.
+  const reach = await reachabilityChecker(connection.baseUrl, connection.apiKey);
+  if (!reach.ok) {
+    updateTask(task.task_id, {
+      exit_state: "network_unavailable",
+      review_reason: `Model endpoint unreachable for role ${step.role}: ${reach.error}`,
+      paused: 1,
+    });
+    publish(task.task_id, "task_update", { exit_state: "network_unavailable" });
+    return;
+  }
+  if (task.exit_state === "network_unavailable") {
+    // Connectivity recovered since the last attempt — clear the stale flag.
+    updateTask(task.task_id, { exit_state: null, review_reason: null });
+  }
+
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const absArtifact = path.join(repoPath, relArtifact);
 
@@ -1040,6 +1092,21 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     }
 
     publish(task.task_id, "role_end", { role: step.role, error: true, aborted, model: modelId });
+
+    // A connection drop mid-run is an infra problem, not a content/reasoning
+    // failure — route it through the same graceful stop as the pre-flight
+    // gate instead of escalating to human review.
+    if (!aborted && isNetworkError(msg)) {
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        exit_state: "network_unavailable",
+        review_reason: `Model endpoint became unreachable during role ${step.role}: ${msg}`,
+        paused: 1,
+      });
+      publish(task.task_id, "task_update", { exit_state: "network_unavailable" });
+      return;
+    }
+
     createRoleRun({
       task_id: task.task_id,
       role_key: step.role,

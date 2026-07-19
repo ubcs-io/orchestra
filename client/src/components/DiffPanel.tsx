@@ -47,7 +47,7 @@ function parseUnifiedDiff(patch: string): DiffLine[] {
   return out;
 }
 
-function FileDiff({ patch }: { patch: string }) {
+export function FileDiff({ patch }: { patch: string }) {
   const lines = useMemo(() => parseUnifiedDiff(patch), [patch]);
   if (lines.length === 0) return <p className="muted" style={{ padding: "6px 10px" }}>No changes.</p>;
   return (
@@ -68,14 +68,14 @@ function FileDiff({ patch }: { patch: string }) {
   );
 }
 
-const STATUS_PILL: Record<DiffFile["status"], string> = {
+export const STATUS_PILL: Record<DiffFile["status"], string> = {
   added: "ok",
   deleted: "bad",
   modified: "dim",
   renamed: "human",
   copied: "human",
 };
-const STATUS_LABEL: Record<DiffFile["status"], string> = {
+export const STATUS_LABEL: Record<DiffFile["status"], string> = {
   added: "A",
   deleted: "D",
   modified: "M",
@@ -83,20 +83,23 @@ const STATUS_LABEL: Record<DiffFile["status"], string> = {
   copied: "C",
 };
 
-function DiffFileRow({
-  taskId,
+export function DiffFileRow({
+  queryKey,
   file,
   expanded,
   onToggle,
+  fetchPatch,
 }: {
-  taskId: string;
+  /** React-query cache key prefix — scopes the patch cache per task or per run. */
+  queryKey: unknown[];
   file: DiffFile;
   expanded: boolean;
   onToggle: () => void;
+  fetchPatch: (file: DiffFile) => Promise<{ path: string; patch: string }>;
 }) {
   const fileQ = useQuery({
-    queryKey: ["taskDiffFile", taskId, file.path, file.oldPath],
-    queryFn: () => api.taskDiffFile(taskId, file.path, file.oldPath),
+    queryKey: [...queryKey, file.path, file.oldPath],
+    queryFn: () => fetchPatch(file),
     enabled: expanded && !file.binary,
   });
 
@@ -199,7 +202,14 @@ export function DiffPanel({ taskId, task, projectHasGithubToken, onClose, onMuta
             ) : (
               <div className="diff-file-list">
                 {diffQ.data.files.map((f) => (
-                  <DiffFileRow key={f.path} taskId={taskId} file={f} expanded={expanded.has(f.path)} onToggle={() => toggle(f.path)} />
+                  <DiffFileRow
+                    key={f.path}
+                    queryKey={["taskDiffFile", taskId]}
+                    file={f}
+                    expanded={expanded.has(f.path)}
+                    onToggle={() => toggle(f.path)}
+                    fetchPatch={(file) => api.taskDiffFile(taskId, file.path, file.oldPath)}
+                  />
                 ))}
               </div>
             )}
@@ -231,6 +241,63 @@ export function DiffPanel({ taskId, task, projectHasGithubToken, onClose, onMuta
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Inline (non-modal) diff for a single role run, scoped against the previous
+ *  run's checkpoint commit (or the task's base branch for the first commit).
+ *  Rendered inside a run's panel in TaskDetail, not as an overlay. */
+export function RunDiffSection({ taskId, runId }: { taskId: string; runId: number }) {
+  const diffQ = useQuery({ queryKey: ["runDiff", taskId, runId], queryFn: () => api.runDiff(taskId, runId) });
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const toggle = (path: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
+  const totals = diffQ.data?.files.reduce(
+    (acc, f) => ({ additions: acc.additions + f.additions, deletions: acc.deletions + f.deletions }),
+    { additions: 0, deletions: 0 },
+  );
+
+  return (
+    <div style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--line)" }}>
+      {diffQ.isLoading && <p className="muted">Loading diff…</p>}
+      {diffQ.isError && <p className="pill bad">Failed to load diff.</p>}
+      {diffQ.data && (
+        <>
+          <p className="muted" style={{ margin: "0 0 8px" }}>
+            {diffQ.data.files.length} file{diffQ.data.files.length === 1 ? "" : "s"} changed in this step
+            {totals && (totals.additions > 0 || totals.deletions > 0) && (
+              <>
+                {" · "}
+                <span className="diff-add">+{totals.additions}</span> <span className="diff-del">-{totals.deletions}</span>
+              </>
+            )}
+          </p>
+          {diffQ.data.files.length === 0 ? (
+            <p className="muted">No changes.</p>
+          ) : (
+            <div className="diff-file-list">
+              {diffQ.data.files.map((f) => (
+                <DiffFileRow
+                  key={f.path}
+                  queryKey={["runDiffFile", taskId, runId]}
+                  file={f}
+                  expanded={expanded.has(f.path)}
+                  onToggle={() => toggle(f.path)}
+                  fetchPatch={(file) => api.runDiffFile(taskId, runId, file.path, file.oldPath)}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

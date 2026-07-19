@@ -11,10 +11,11 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
+import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph, type NetworkPingTarget } from "../api";
+import { rolesWithWriteTools, taskWriteCapability } from "../writeCapability";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
-import { DiffPanel } from "../components/DiffPanel";
+import { DiffPanel, RunDiffSection } from "../components/DiffPanel";
 import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
 
@@ -716,15 +717,17 @@ function RefinementNetworkPanel({
 
   const nodeTypes = useMemo(() => ({ networkNode: NetworkNodeCard }), []);
 
-  /** Resolve which role to show in the right panel: selected node, last completed, or current. */
+  /** Resolve which role to show in the right panel: selected node, last completed, current, most recent run, or first plan step. */
   const displayRoleKey = useMemo<string | null>(() => {
     if (selectedNodeRole) return selectedNodeRole;
     if (lastRole) return lastRole.role;
     if (currentRole) return currentRole;
     // Fallback: most recent completed run
     const latest = runs.filter((r) => !r.run_kind || r.run_kind === "primary").pop();
-    return latest?.role_key ?? null;
-  }, [selectedNodeRole, lastRole, currentRole, runs]);
+    if (latest?.role_key) return latest.role_key;
+    // Fallback: first step in the plan (before any roles run)
+    return plan?.steps[0]?.role ?? null;
+  }, [selectedNodeRole, lastRole, currentRole, runs, plan]);
 
   /** Find the network node for the displayed role. */
   const displayNode = useMemo(() => {
@@ -1020,6 +1023,7 @@ export function TaskDetail() {
   const [afterInput, setAfterInput] = useState("");
   const [noteInput, setNoteInput] = useState("");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
+  const [runDiffOpen, setRunDiffOpen] = useState<Set<number>>(new Set());
   const [showAdvancedSteering, setShowAdvancedSteering] = useState(false);
 
   // Question answer state: per-question-editing keyed by "${runId}:${qIndex}"
@@ -1047,6 +1051,69 @@ export function TaskDetail() {
     }, 5000);
     return () => clearInterval(iv);
   }, []);
+
+  // ---- Network availability check (for the network_unavailable blocked state) ----
+  const [netPinging, setNetPinging] = useState(false);
+  const [netPingResults, setNetPingResults] = useState<NetworkPingTarget[] | null>(null);
+  const [netPingError, setNetPingError] = useState("");
+  const netPingEsRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (netPingEsRef.current) {
+        netPingEsRef.current.close();
+        netPingEsRef.current = null;
+      }
+    };
+  }, []);
+
+  function checkNetworkAvailability() {
+    if (netPingEsRef.current) {
+      netPingEsRef.current.close();
+      netPingEsRef.current = null;
+    }
+    setNetPinging(true);
+    setNetPingError("");
+    setNetPingResults(null);
+
+    const es = new EventSource(api.taskNetworkPingStreamUrl(taskId));
+    netPingEsRef.current = es;
+
+    es.addEventListener("init", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        targets: Array<{ target_id: string; label: string; kind: "override" | "default"; roles: string[] }>;
+      };
+      setNetPingResults(
+        data.targets.map((t) => ({ ...t, available: false, status: "checking" as const })),
+      );
+    });
+
+    es.addEventListener("result", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as { target_id: string; available: boolean; error?: string };
+      setNetPingResults((prev) =>
+        prev
+          ? prev.map((r) =>
+              r.target_id === data.target_id
+                ? { ...r, available: data.available, error: data.error, status: "done" as const }
+                : r,
+            )
+          : prev,
+      );
+    });
+
+    es.addEventListener("done", () => {
+      setNetPinging(false);
+      es.close();
+      netPingEsRef.current = null;
+    });
+
+    es.onerror = () => {
+      setNetPinging(false);
+      setNetPingError("Connection lost while checking availability");
+      es.close();
+      netPingEsRef.current = null;
+    };
+  }
 
   // Sync edit fields when task data loads
   useEffect(() => {
@@ -1147,6 +1214,16 @@ export function TaskDetail() {
     queryFn: () => api.project(taskProjectId as number),
     enabled: taskProjectId != null,
   });
+  const harnessPolicyQ = useQuery({
+    queryKey: ["harness-policy", taskProjectId],
+    queryFn: () => api.harnessPolicy(taskProjectId as number),
+    enabled: taskProjectId != null,
+  });
+  const writeCap = useMemo(() => {
+    if (!q.data?.task) return null;
+    const writeRoles = rolesWithWriteTools(projectQ.data?.roles ?? []);
+    return taskWriteCapability(q.data.task, harnessPolicyQ.data?.policy.allowWrite ?? false, writeRoles);
+  }, [q.data?.task, projectQ.data?.roles, harnessPolicyQ.data?.policy.allowWrite]);
 
   const { modelCallCounts, modelTokens } = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -1309,7 +1386,15 @@ export function TaskDetail() {
           />
         )}
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
+        {writeCap === "acting" && (
+          <span className="pill accent" title="This task's plan includes a role with write/edit tools, in a write-enabled project">acting</span>
+        )}
+        {writeCap === "acting" && t.wrote_source === 1 && (
+          <span className="pill warn" title="A role has already written to this task's worktree">wrote code</span>
+        )}
+        {writeCap === "planning" && <span className="pill dim">planning</span>}
         {t.exit_state === "wont_do" && <span className="pill dim">won't do</span>}
+        {t.exit_state === "network_unavailable" && <span className="pill bad">network unavailable</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
         {t.paused === 1 && <span className="pill warn">paused</span>}
@@ -1393,7 +1478,7 @@ export function TaskDetail() {
             </div>
           )}
 
-          {t.network_id && t.stage !== "intake" ? (
+          {t.network_id ? (
             <RefinementNetworkPanel
               networkId={t.network_id}
               runs={d.runs}
@@ -1606,6 +1691,22 @@ export function TaskDetail() {
                   >
                     restore
                   </button>
+                  <button
+                    className="small"
+                    disabled={!r.git_commit_sha}
+                    title={r.git_commit_sha ? "Show what this run changed" : "No checkpoint recorded for this run"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRunDiffOpen((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(r.id)) next.delete(r.id);
+                        else next.add(r.id);
+                        return next;
+                      });
+                    }}
+                  >
+                    diff
+                  </button>
                   {t.project_id != null && (
                     <Link
                       to="/projects/$projectId/roles"
@@ -1624,6 +1725,7 @@ export function TaskDetail() {
                 {!isCollapsed && r.output_md && (
                   <div className="section-md rendered-md" dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }} />
                 )}
+                {!isCollapsed && runDiffOpen.has(r.id) && <RunDiffSection taskId={t.task_id} runId={r.id} />}
                 {!isCollapsed && r.thinking_md && (
                   <details className="reasoning-trace" style={{ marginTop: 8 }}>
                     <summary className="muted" style={{ cursor: "pointer" }}>💭 Reasoning trace ({r.thinking_md.length.toLocaleString()} chars)</summary>
@@ -1826,6 +1928,39 @@ export function TaskDetail() {
                     })}
                 </div>
               </div>
+            </div>
+          )}
+
+          {t.exit_state === "network_unavailable" && (
+            <div className="panel network-blocked-panel">
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <h2 style={{ margin: 0 }}>Network unavailable</h2>
+                <button className="small" disabled={netPinging} onClick={checkNetworkAvailability}>
+                  {netPinging ? "Checking…" : "Check availability"}
+                </button>
+              </div>
+              <p className="muted" style={{ marginTop: 8 }}>
+                Stopped before starting — {t.review_reason ?? "a model endpoint used by this task's network wasn't reachable"}.
+                Nothing is running; use Resume below once connectivity is confirmed.
+              </p>
+              {netPingError && <p className="pill bad" style={{ marginTop: 8 }}>{netPingError}</p>}
+              {netPingResults && (
+                <div className="ping-results" style={{ marginTop: 8 }}>
+                  {netPingResults.map((r) => (
+                    <div
+                      key={r.target_id}
+                      className={`ping-node ${r.status === "checking" ? "ping-checking" : r.available ? "ping-ok" : "ping-down"}`}
+                    >
+                      <span className={`ping-dot ${r.status === "checking" ? "ping-dot--checking" : r.available ? "ok" : "bad"}`} />
+                      <span className="ping-name">{r.label}</span>
+                      <span className="pill dim" style={{ fontSize: 10 }}>{r.kind}</span>
+                      <span className="muted" style={{ fontSize: 11 }}>{r.roles.join(", ")}</span>
+                      {r.status === "checking" && <span className="pill dim" style={{ fontSize: 10 }}>checking…</span>}
+                      {r.status === "done" && r.error && <span className="pill bad" style={{ fontSize: 10 }}>{r.error}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

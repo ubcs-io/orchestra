@@ -5,6 +5,7 @@ import { api, STAGES, type Plan, type Task } from "../api";
 import { buildRelationGroups, type RelationGroup } from "../relations";
 import { ModelBubble } from "../components/ModelBubble";
 import { GitHubBubble } from "../components/GitHubBubble";
+import { rolesWithWriteTools, taskWriteCapability, type WriteCapability } from "../writeCapability";
 
 function planProgress(task: Task): string {
   if (!task.refinement_plan_json) return "not planned";
@@ -23,11 +24,13 @@ function TaskCard({
   group,
   hovered,
   onHover,
+  cap,
 }: {
   task: Task;
   group?: RelationGroup;
   hovered: boolean;
   onHover: (rootId: string | null) => void;
+  cap: WriteCapability;
 }) {
   const isWontDo = task.exit_state === "wont_do";
   return (
@@ -43,6 +46,8 @@ function TaskCard({
       <div className="meta">
         {group && <span className="dot" style={{ background: group.color }} title="part of a related task family" />}
         <span className="pill dim">{task.intake_kind ?? task.level}</span>
+        {cap === "acting" && <span className="pill accent">acting</span>}
+        {cap === "planning" && <span className="pill dim">planning</span>}
         <span>{planProgress(task)}</span>
         {task.paused === 1 && <span className="pill warn">paused</span>}
         {task.stale_reason && (
@@ -97,6 +102,21 @@ export function ProjectBoard() {
 
   const relationGroups = useMemo(() => buildRelationGroups(tasksQ.data?.tasks ?? []), [tasksQ.data]);
   const [hoveredGroup, setHoveredGroup] = useState<string | null>(null);
+
+  const harnessPolicyQ = useQuery({
+    queryKey: ["harness-policy", pid],
+    queryFn: () => api.harnessPolicy(pid),
+    enabled: Number.isFinite(pid),
+  });
+  const capsByTaskId = useMemo(() => {
+    const writeRoles = rolesWithWriteTools(projectQ.data?.roles ?? []);
+    const allowWrite = harnessPolicyQ.data?.policy.allowWrite ?? false;
+    const map = new Map<string, WriteCapability>();
+    for (const t of tasksQ.data?.tasks ?? []) {
+      map.set(t.task_id, taskWriteCapability(t, allowWrite, writeRoles));
+    }
+    return map;
+  }, [tasksQ.data, projectQ.data?.roles, harnessPolicyQ.data?.policy.allowWrite]);
 
   return (
     <div>
@@ -162,6 +182,7 @@ export function ProjectBoard() {
                     group={group}
                     hovered={!!group && hoveredGroup === group.rootId}
                     onHover={setHoveredGroup}
+                    cap={capsByTaskId.get(t.task_id) ?? "pending"}
                   />
                 );
               })}
@@ -170,7 +191,7 @@ export function ProjectBoard() {
         ))}
       </div>
 
-      <TaskListTable tasks={tasksQ.data?.tasks ?? []} relationGroups={relationGroups} />
+      <TaskListTable tasks={tasksQ.data?.tasks ?? []} relationGroups={relationGroups} capsByTaskId={capsByTaskId} />
     </div>
   );
 }
@@ -182,7 +203,15 @@ function distinct(values: (string | null)[]): string[] {
   return Array.from(new Set(values.filter((v): v is string => !!v))).sort();
 }
 
-function TaskListTable({ tasks, relationGroups }: { tasks: Task[]; relationGroups: Map<string, RelationGroup> }) {
+function TaskListTable({
+  tasks,
+  relationGroups,
+  capsByTaskId,
+}: {
+  tasks: Task[];
+  relationGroups: Map<string, RelationGroup>;
+  capsByTaskId: Map<string, WriteCapability>;
+}) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState(ALL);
   const [levelFilter, setLevelFilter] = useState(ALL);
@@ -259,6 +288,7 @@ function TaskListTable({ tasks, relationGroups }: { tasks: Task[]; relationGroup
             {th("stage", "Stage")}
             {th("level", "Level")}
             {th("intake_kind", "Kind")}
+            <th style={{ whiteSpace: "nowrap" }}>Mode</th>
             {th("exit_state", "Exit State")}
             {th("created_at", "Created")}
           </tr>
@@ -275,6 +305,14 @@ function TaskListTable({ tasks, relationGroups }: { tasks: Task[]; relationGroup
                 <td>{t.stage ?? "—"}</td>
                 <td>{t.level ?? "—"}</td>
                 <td>{t.intake_kind ?? "—"}</td>
+                <td>
+                  {(() => {
+                    const cap = capsByTaskId.get(t.task_id) ?? "pending";
+                    if (cap === "acting") return <span className="pill accent">acting</span>;
+                    if (cap === "planning") return <span className="pill dim">planning</span>;
+                    return "—";
+                  })()}
+                </td>
                 <td>{t.exit_state ?? "—"}</td>
                 <td>{t.created_at ?? "—"}</td>
               </tr>

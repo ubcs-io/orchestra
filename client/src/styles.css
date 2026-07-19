@@ -68,6 +68,7 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
 .pill.human { color: var(--human); border-color: var(--human); }
 .pill.dim { color: var(--ink-dim); }
+.pill.accent { color: var(--accent); border-color: var(--accent); }
 
 /* Kanban */
 .kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -697,6 +698,10 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .blocker-name:hover {
   color: var(--accent);
   text-decoration: none;
+}
+
+.network-blocked-panel {
+  border-left: 3px solid var(--bad);
 }
 
 /* ---- Ping results ---- */

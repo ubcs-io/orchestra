@@ -29,6 +29,7 @@ import {
   getNetwork,
   getNetworkByIntakeKind,
   getProject,
+  getRole,
   getRoleStats,
   getTask,
   listChatMessages,
@@ -50,6 +51,7 @@ import {
   upsertConfig,
   upsertRole,
   type ProjectRow,
+  type TaskRow,
 } from "../db.js";
 import { resolveHarnessPolicy, validateToolsJson } from "../harness-policy.js";
 import {
@@ -66,7 +68,7 @@ import {
   writeArtifact,
 } from "../git.js";
 import { createPullRequest, resolveGithubToken, resolveOwnerRepo } from "../github.js";
-import { discoverModels } from "../providers.js";
+import { checkReachable, discoverModels } from "../providers.js";
 import {
   envTokenForModel,
   locationLabel,
@@ -88,6 +90,7 @@ import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from
     stopScheduler,
     taskRepoPath,
     tick,
+    type RefinementPlan,
   } from "../orchestrator.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
 import { runRole } from "../agent.js";
@@ -888,6 +891,57 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     if (!q.path) return bad(reply, 400, "path is required");
     try {
       const patch = diffFilePatch(ctx.repoPath, ctx.task.git_base_branch!, ctx.task.git_branch!, q.path, q.oldPath);
+      return { path: q.path, patch };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
+  });
+
+  // Resolves the (base, head) ref pair for a single primary role run's diff:
+  // head is that run's own checkpoint commit, base is the previous primary
+  // run's checkpoint commit (walking back past any that made no commit), or
+  // the task's base branch if this is the first commit on the task.
+  function resolveRunDiffRefs(task: TaskRow, runId: number): { base: string; head: string } | null {
+    const runs = listRoleRuns(task.task_id).filter((r) => !r.run_kind || r.run_kind === "primary");
+    const idx = runs.findIndex((r) => r.id === runId);
+    if (idx === -1 || !runs[idx]!.git_commit_sha) return null;
+    let base = task.git_base_branch;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (runs[i]!.git_commit_sha) {
+        base = runs[i]!.git_commit_sha;
+        break;
+      }
+    }
+    if (!base) return null;
+    return { base, head: runs[idx]!.git_commit_sha! };
+  }
+
+  // File-level diff of a single role run against its predecessor's checkpoint
+  // (or the task's base branch, for the first commit) — same semantics as
+  // /api/tasks/:id/diff above, scoped to one step instead of the whole task.
+  app.get("/api/tasks/:id/runs/:runId/diff", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    const refs = resolveRunDiffRefs(ctx.task, Number((req.params as { runId: string }).runId));
+    if (!refs) return bad(reply, 404, "no checkpoint commit for this run");
+    try {
+      const files = diffSummary(ctx.repoPath, refs.base, refs.head);
+      return { base: refs.base, head: refs.head, files };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
+  });
+
+  // Unified patch text for a single file within one role run's diff.
+  app.get("/api/tasks/:id/runs/:runId/diff/file", async (req: FastifyRequest, reply: FastifyReply) => {
+    const ctx = taskGitContext(reply, (req.params as { id: string }).id);
+    if (!ctx) return;
+    const refs = resolveRunDiffRefs(ctx.task, Number((req.params as { runId: string }).runId));
+    if (!refs) return bad(reply, 404, "no checkpoint commit for this run");
+    const q = req.query as { path?: string; oldPath?: string };
+    if (!q.path) return bad(reply, 400, "path is required");
+    try {
+      const patch = diffFilePatch(ctx.repoPath, refs.base, refs.head, q.path, q.oldPath);
       return { path: q.path, patch };
     } catch (err) {
       return bad(reply, 500, (err as Error).message);
@@ -1858,26 +1912,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     if (!cfg) return bad(reply, 404, "Config not found");
 
     const baseUrl = (cfg.base_url ?? "").trim();
-    if (!baseUrl) {
-      return { config_id: id, available: false, error: "No base URL configured" };
-    }
-
-    try {
-      const url = baseUrl.replace(/\/+$/, "") + "/models";
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8_000);
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      const apiKey = cfg.api_key?.trim();
-      const envKey = envTokenForModel(cfg.name);
-      const authKey = apiKey || envKey;
-      if (authKey) headers.Authorization = `Bearer ${authKey}`;
-      const res = await fetch(url, { headers, signal: controller.signal });
-      clearTimeout(timer);
-      return { config_id: id, available: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
-    } catch (err) {
-      const msg = (err as Error).message;
-      return { config_id: id, available: false, error: msg === "This operation was aborted" ? "aborted" : msg };
-    }
+    const authKey = cfg.api_key?.trim() || envTokenForModel(cfg.name);
+    const reach = await checkReachable(baseUrl, authKey, 8_000);
+    return { config_id: id, available: reach.ok, error: reach.error };
   });
 
   // ---- Ping network: SSE stream — sends full list immediately, then updates as each ping returns ----
@@ -1909,43 +1946,108 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     // 2. Ping each config and stream results as they complete
     const promises = configs.map(async (cfg) => {
       const baseUrl = (cfg.base_url ?? "").trim();
-      if (!baseUrl) {
-        send("result", {
-          config_id: cfg.id,
-          available: false,
-          error: "No base URL configured",
-        });
-        return;
-      }
-      try {
-        const url = baseUrl.replace(/\/+$/, "") + "/models";
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8_000);
-        const headers: Record<string, string> = { "Content-Type": "application/json" };
-        const apiKey = cfg.api_key?.trim();
-        const envKey = envTokenForModel(cfg.name);
-        const authKey = apiKey || envKey;
-        if (authKey) headers.Authorization = `Bearer ${authKey}`;
-        const res = await fetch(url, { headers, signal: controller.signal });
-        clearTimeout(timer);
-        send("result", {
-          config_id: cfg.id,
-          available: res.ok,
-          error: res.ok ? undefined : `HTTP ${res.status}`,
-        });
-      } catch (err) {
-        const msg = (err as Error).message;
-        send("result", {
-          config_id: cfg.id,
-          available: false,
-          error: msg === "This operation was aborted" ? "aborted" : msg,
-        });
-      }
+      const authKey = cfg.api_key?.trim() || envTokenForModel(cfg.name);
+      const reach = await checkReachable(baseUrl, authKey, 8_000);
+      send("result", { config_id: cfg.id, available: reach.ok, error: reach.error });
     });
 
     await Promise.all(promises);
 
     // 3. Stream complete
+    send("done", {});
+    reply.raw.end();
+  });
+
+  // ---- Ping every model a task's network will actually use (override configs
+  // + the default fallback), deduped by resolved connection. Powers the
+  // inline "Check availability" action shown alongside the graceful
+  // network-unavailable stop. ----
+  app.get("/api/tasks/:id/network-ping/stream", async (req: FastifyRequest, reply: FastifyReply) => {
+    const taskId = (req.params as { id: string }).id;
+    const task = getTask(taskId);
+    if (!task) return bad(reply, 404, "Task not found");
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+
+    // The refinement plan (task.refinement_plan_json) is the authoritative list
+    // of roles that will actually run — the network graph is a routing/display
+    // layer on top of it and may be absent (linear plans have no network_id).
+    let plan: RefinementPlan | null = null;
+    try {
+      plan = task.refinement_plan_json ? (JSON.parse(task.refinement_plan_json) as RefinementPlan) : null;
+    } catch {
+      plan = null;
+    }
+    let roleKeys = [...new Set((plan?.steps ?? []).map((s) => s.role))];
+    if (roleKeys.length === 0 && task.network_id) {
+      const network = getNetwork(task.network_id);
+      try {
+        const graph = network?.graph_json ? (JSON.parse(network.graph_json) as NetworkGraph) : null;
+        roleKeys = [...new Set((graph?.nodes ?? []).map((n) => n.roleKey))];
+      } catch {
+        roleKeys = [];
+      }
+    }
+
+    // Resolve each role to a target connection, grouping roles that share one
+    // (e.g. several roles all falling back to the default connection).
+    const configs = listModelConfigs();
+    const targets = new Map<
+      string,
+      { target_id: string; label: string; kind: "override" | "default"; base_url: string; api_key?: string; roles: string[] }
+    >();
+    const defaultConnection = resolveConnection(project?.id ?? null);
+    for (const roleKey of roleKeys) {
+      const role = getRole(project?.id ?? null, roleKey) ?? getRole(null, roleKey);
+      const modelRef = role?.model || task.model || project?.default_model || null;
+      const match = modelRef ? configs.find((c) => c.name === modelRef) : undefined;
+      const targetId = match ? `config:${match.id}` : "default";
+      let target = targets.get(targetId);
+      if (!target) {
+        target = match
+          ? {
+              target_id: targetId,
+              label: match.name ?? match.key,
+              kind: "override",
+              base_url: (match.base_url ?? "").trim(),
+              api_key: match.api_key?.trim() || envTokenForModel(match.name),
+              roles: [],
+            }
+          : {
+              target_id: targetId,
+              label: "default",
+              kind: "default",
+              base_url: defaultConnection.baseUrl,
+              api_key: defaultConnection.apiKey,
+              roles: [],
+            };
+        targets.set(targetId, target);
+      }
+      target.roles.push(roleKey);
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const send = (event: string, data: unknown) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const targetList = [...targets.values()];
+    send("init", {
+      targets: targetList.map(({ target_id, label, kind, roles }) => ({ target_id, label, kind, roles })),
+    });
+
+    await Promise.all(
+      targetList.map(async (target) => {
+        const reach = await checkReachable(target.base_url, target.api_key, 8_000);
+        send("result", { target_id: target.target_id, available: reach.ok, error: reach.error });
+      }),
+    );
+
     send("done", {});
     reply.raw.end();
   });
