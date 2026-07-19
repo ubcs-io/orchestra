@@ -504,7 +504,7 @@ export const api = {
       body: JSON.stringify(body ?? {}),
     }),
 
-  updateTask: (taskId: string, body: { name?: string; content?: string }) =>
+  updateTask: (taskId: string, body: { name?: string; content?: string; intake_kind?: string }) =>
     req<TaskDetail>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   intake: (projectId: number, body: { name: string; content: string; intake_kind?: string }) =>

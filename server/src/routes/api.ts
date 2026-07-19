@@ -788,13 +788,14 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     if (task.stage !== "intake") {
       return bad(reply, 400, "Only intake tasks can be edited. Reset the task to intake first.");
     }
-    const body = (req.body ?? {}) as { name?: string; content?: string };
-    if (body.name === undefined && body.content === undefined) {
-      return bad(reply, 400, "name or content is required");
+    const body = (req.body ?? {}) as { name?: string; content?: string; intake_kind?: string };
+    if (body.name === undefined && body.content === undefined && body.intake_kind === undefined) {
+      return bad(reply, 400, "name, content, or intake_kind is required");
     }
     const updates: Partial<import("../db.js").TaskRow> = {};
     if (body.name !== undefined) updates.name = body.name;
     if (body.content !== undefined) updates.content = body.content;
+    if (body.intake_kind !== undefined) updates.intake_kind = body.intake_kind;
     const updated = updateTask(taskId, updates);
     if (!updated) return bad(reply, 500, "update failed");
     // Refresh the full detail view

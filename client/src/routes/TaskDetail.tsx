@@ -757,6 +757,7 @@ export function TaskDetail() {
   // Intake editing state
   const [editName, setEditName] = useState("");
   const [editContent, setEditContent] = useState("");
+  const [editKind, setEditKind] = useState("");
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
   const [hoveredCoverage, setHoveredCoverage] = useState<{ role: string; concern: string } | null>(null);
@@ -776,6 +777,7 @@ export function TaskDetail() {
     if (q.data) {
       setEditName(q.data.task.name ?? "");
       setEditContent(q.data.task.content ?? "");
+      setEditKind(q.data.task.intake_kind ?? "manual");
     }
   }, [q.data]);
 
@@ -1054,9 +1056,6 @@ export function TaskDetail() {
             onClose={() => setDiffOpen(false)}
             onMutate={refresh}
           />
-        )}
-        {t.stage === "intake" && t.project_id != null && (
-          <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}
       </div>
 
@@ -1732,6 +1731,17 @@ export function TaskDetail() {
                     onChange={(e) => setEditName(e.target.value)}
                     placeholder="Task name"
                   />
+                  <label className="muted" style={{ display: "block", marginBottom: 4 }}>Kind</label>
+                  <div className="row" style={{ marginBottom: 8, gap: 8, alignItems: "center" }}>
+                    <select value={editKind} onChange={(e) => setEditKind(e.target.value)}>
+                      {["manual", "error_file", "feature", "bug", "chore", "spike", "research", "ux", "question"].map((k) => (
+                        <option key={k} value={k}>{k}</option>
+                      ))}
+                    </select>
+                    {t.project_id != null && (
+                      <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={editKind} onChanged={refresh} />
+                    )}
+                  </div>
                   <label className="muted" style={{ display: "block", marginBottom: 4 }}>Content</label>
                   <textarea
                     className="intake-textarea"
@@ -1751,7 +1761,7 @@ export function TaskDetail() {
                       onClick={async () => {
                         setSaving(true);
                         try {
-                          await api.updateTask(taskId, { name: editName, content: editContent });
+                          await api.updateTask(taskId, { name: editName, content: editContent, intake_kind: editKind });
                           refresh();
                         } catch (e: unknown) {
                           // error will show via query refetch
@@ -1767,6 +1777,7 @@ export function TaskDetail() {
                       onClick={() => {
                         setEditName(t.name ?? "");
                         setEditContent(t.content ?? "");
+                        setEditKind(t.intake_kind ?? "manual");
                       }}
                     >
                       Revert
