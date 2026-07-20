@@ -1186,6 +1186,54 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     findings.section_md = `${renderSubtaskTree(findings.subtasks)}\n\n${findings.section_md}`;
   }
 
+  // The counter-reviewer gate below treats a missing entry in
+  // `criteria_results` as "unmet" (a fail-safe default), so a reviewer that
+  // reports verdict "pass" while leaving criteria_results empty — the same
+  // "complied with the easy prose half, skipped the structured half" failure
+  // as the decomposition check above — silently reads as a full gate
+  // failure and burns a loop-back for nothing. Retry with corrective
+  // guidance (same bounded shape/counter as the other retries) before that
+  // happens, instead of only discovering it after the loop-backs are spent.
+  const flow = flowForTask(task);
+  const isReviewerStep = step.role === flow.reviewerRole;
+  if (isReviewerStep && flow.criteria.length > 0 && !findings.criteria_results?.length) {
+    const retryCount = step.attempts ?? 0;
+    if (retryCount < 2) {
+      console.warn(
+        `[orchestrator] reviewer role ${step.role} left criteria_results empty ` +
+          `(attempt ${retryCount + 1}/2) — re-queuing with corrective guidance`,
+      );
+      step.status = "pending";
+      step.attempts = retryCount + 1;
+      createIntervention({
+        task_id: task.task_id,
+        kind: "steer_note",
+        payload_json: JSON.stringify({
+          text:
+            `[orchestrator·retry] You reported a verdict but left \`criteria_results\` empty — every ` +
+            `criterion in the "Acceptance criteria to verify" checklist needs one entry there ({ id, ` +
+            `status, note }), or your verdict can't be trusted (a missing entry is treated as unmet). ` +
+            `Re-check the checklist and populate \`criteria_results\` for every criterion.`,
+        }),
+        created_by: "orchestrator",
+      });
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        stage: "refining",
+        paused: 0,
+      });
+      publish(task.task_id, "task_update", {
+        stage: "refining",
+        retryReason: "empty-criteria-results",
+        attempt: retryCount + 1,
+      });
+      return;
+    }
+    console.warn(
+      `[orchestrator] reviewer role ${step.role} left criteria_results empty after ${retryCount} retries — proceeding`,
+    );
+  }
+
   // Surface degraded runs (missing verdict / truncated output / stalled narration) in the logs.
   if (result.fallback || result.stopReason === "length" || result.stalled) {
     console.warn(
@@ -1265,8 +1313,6 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // the effective verdict below, never silently); the optional second-review
   // call adds an authoritative LLM-mediated synthesis on top when enabled, and
   // can downgrade a critique false-positive or independently escalate.
-  const flow = flowForTask(task);
-  const isReviewerStep = step.role === flow.reviewerRole;
   const shouldCritique =
     flow.reviewDepth === "every_step"
       ? !isCritiqueExempt(step.role)

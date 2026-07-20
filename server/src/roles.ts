@@ -323,8 +323,10 @@ in your own thinking process, not in section_md.
 ## If you are a counter-reviewer
 When the context gives you an "Acceptance criteria to verify" checklist, your job
 is to VERIFY the prior roles' work against it — not to author new content. Read the
-findings and the code, then include one entry per criterion in the optional
-\`criteria_results\` argument: { id, status: "met" | "partial" | "unmet", note }.
+findings and the code, then include one entry per criterion in \`criteria_results\`:
+{ id, status: "met" | "partial" | "unmet", note }. This is required, not optional —
+a criterion with no entry is treated as unmet no matter what your verdict says, so a
+"pass" with \`criteria_results\` left empty is rejected as incomplete, not accepted.
 Set verdict "needs_more" if any "must" criterion is not fully met (this routes the
 work back to the responsible role); use "pass" only when every "must" criterion is met.
 For any "partial" or "unmet" criterion, write \`note\` as a short, imperative fix

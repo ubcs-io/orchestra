@@ -238,7 +238,14 @@ const RecordFindingsSchema = Type.Object({
   open_questions: Type.Optional(Type.Array(OpenQuestionSchema)),
   coverage: Type.Optional(Type.Array(CoverageSchema)),
   section_md: Type.String(),
-  criteria_results: Type.Optional(Type.Array(CriteriaResultSchema)),
+  criteria_results: Type.Optional(
+    Type.Array(CriteriaResultSchema, {
+      description:
+        "Required if you are a counter-reviewer checking an \"Acceptance criteria to verify\" checklist " +
+        "— one entry per criterion. A criterion with no entry here is treated as unmet regardless of your " +
+        "verdict, so a \"pass\" verdict with this left empty will be rejected as incomplete.",
+    }),
+  ),
   subtasks: Type.Optional(Type.Array(SubtaskSchema)),
   no_decomposition_reason: Type.Optional(
     Type.String({
@@ -830,7 +837,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     name: "record_findings",
     label: "Record findings",
     description:
-      "Finish this role by recording your verdict, summary, open questions, concern coverage, and the markdown section for the planning artifact. If you are decomposing work, also populate `subtasks` or `no_decomposition_reason` — never leave both empty. Call this exactly once.",
+      "Finish this role by recording your verdict, summary, open questions, concern coverage, and the markdown section for the planning artifact. If you are decomposing work, also populate `subtasks` or `no_decomposition_reason` — never leave both empty. If you are a counter-reviewer, also populate `criteria_results` for every criterion in the checklist — a `pass` verdict with this empty will be rejected. Call this exactly once.",
     parameters: RecordFindingsSchema,
     execute: async (_id: string, p: Static<typeof RecordFindingsSchema>) => {
       captured = {

@@ -357,6 +357,51 @@ function scriptedRunner(opts: { reviewerFailures: number; unmetId?: string }): R
 }
 
 /**
+ * A reviewer that reports verdict "pass" with an EMPTY criteria_results for
+ * its first `failCount` calls — the "complied with the prose verdict, skipped
+ * the structured checklist" failure mode — then, on the call after, populates
+ * criteria_results with every criterion met. The (separate) decomposition
+ * role, if the flow reaches one, always reports an intentional
+ * no_decomposition_reason so this fixture isolates the reviewer-retry
+ * behavior instead of also tripping the empty-subtasks retry. Every other
+ * producer role just passes cleanly.
+ */
+function reviewerEmptyCriteriaRunner(failCount: number): RoleRunner {
+  let reviewerCalls = 0;
+  return async (params) => {
+    const isReviewer = params.context.includes("Acceptance criteria to verify");
+    const isDecomp = params.context.includes("**decomposition** role");
+    let criteria: CriteriaResult[] = [];
+    if (isReviewer) {
+      reviewerCalls += 1;
+      if (reviewerCalls > failCount) {
+        const ids = [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => m[1]!);
+        criteria = ids.map((id) => ({ id, status: "met" as const }));
+      }
+    }
+    return {
+      findings: {
+        verdict: "pass",
+        summary: isReviewer ? "reviewer pass (see criteria_results)" : "pass from fake",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: "## role\ndone",
+        criteria_results: criteria,
+        no_decomposition_reason: isDecomp ? "Atomic fix, no further decomposition needed." : undefined,
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+    };
+  };
+}
+
+/**
  * A runner that distinguishes the counter-reviewer (same detection as
  * scriptedRunner, auto-passing every criterion) from the decomposition role
  * (detected via buildRoleContext's "You are the **decomposition** role" line),
@@ -835,6 +880,41 @@ describe("orchestrator loop (integration)", () => {
     // maxLoopbacks = 2 → reviewer ran 3 times (2 loop-backs + the final escalation).
     const runs = listRoleRuns(t.task_id);
     expect(runs.filter((r) => r.role_key === "bug_review").length).toBe(3);
+  });
+
+  it("retries the reviewer when a pass verdict leaves criteria_results empty, then reaches READY", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // Reviewer reports "pass" with empty criteria_results once, then populates it.
+    setRoleRunner(reviewerEmptyCriteriaRunner(1));
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    // The empty-criteria attempt was never persisted — only the eventual
+    // valid one was.
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.filter((r) => r.role_key === "bug_review").length).toBe(1);
+  });
+
+  it("falls through to the existing unmet-criteria escalation once empty-criteria-results retries are exhausted", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // Reviewer always reports "pass" with empty criteria_results.
+    setRoleRunner(reviewerEmptyCriteriaRunner(Infinity));
+
+    await drainTicks(projectId, (t) => t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_review");
+    expect(t.review_reason).toContain("bug.locate");
+    // Two retries went unpersisted; the retry budget is shared with
+    // maxLoopbacks (2), so the third (persisted, still empty) attempt lands
+    // with attempts already at the loop-back cap and escalates immediately.
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.filter((r) => r.role_key === "bug_review").length).toBe(1);
   });
 
   it("re-routes when a mandatory concern is never covered", async () => {
