@@ -398,8 +398,10 @@ state any decision/constraint/fact the child needs that isn't obvious from
 name/brief alone — the child will not see this parent's full history by default.
 If the work is already one atomic, independently-actionable unit, leave subtasks
 empty and instead set **no_decomposition_reason** explaining why — an empty
-subtasks array with no reason is treated as a failed decomposition. Still render
-the same tree as readable prose in section_md for the human-facing artifact.
+subtasks array with no reason is treated as a failed decomposition. The tree
+itself is rendered into the human-facing artifact automatically from
+**subtasks** — do not re-render it in section_md; use section_md only for
+sequencing rationale, rough sizing, and other facts subtasks doesn't capture.
 
 Output ONLY the JSON block — nothing before, nothing after.
 `.trim();
@@ -517,7 +519,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
     can_create_subtasks: true,
-    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. Also render the same tree as readable prose in section_md, for the human-facing artifact.`,
+    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. The tree itself is rendered into the human-facing artifact automatically from \`subtasks\` — do not re-render it in section_md. Use section_md only for anything subtasks doesn't already capture: sequencing rationale, rough sizing, and key facts an implementer would need.`,
   },
 
   // ---- Developer (write/edit capable) ----

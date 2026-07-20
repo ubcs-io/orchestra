@@ -1135,6 +1135,57 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   const { findings } = result;
 
+  // A can_create_subtasks role that leaves both `subtasks` and
+  // `no_decomposition_reason` empty complied with the free-text half of its
+  // instructions but skipped the structured half — retry with a corrective
+  // steer note (same bounded shape/counter as the JSON-parse-error retry
+  // above) instead of silently falling through to the zero-subtask
+  // escalation in applyGate.
+  if (role.can_create_subtasks && !findings.subtasks?.length && !findings.no_decomposition_reason?.trim()) {
+    const retryCount = step.attempts ?? 0;
+    if (retryCount < 2) {
+      console.warn(
+        `[orchestrator] role ${step.role} left subtasks empty with no reason ` +
+          `(attempt ${retryCount + 1}/2) — re-queuing with corrective guidance`,
+      );
+      step.status = "pending";
+      step.attempts = retryCount + 1;
+      createIntervention({
+        task_id: task.task_id,
+        kind: "steer_note",
+        payload_json: JSON.stringify({
+          text:
+            `[orchestrator·retry] You left \`subtasks\` empty without setting \`no_decomposition_reason\` — ` +
+            `either populate \`subtasks\` with the epic/story/task breakdown, or set \`no_decomposition_reason\` ` +
+            `explaining why this work is already one atomic, independently-actionable unit. Never leave both empty.`,
+        }),
+        created_by: "orchestrator",
+      });
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        stage: "refining",
+        paused: 0,
+      });
+      publish(task.task_id, "task_update", {
+        stage: "refining",
+        retryReason: "empty-subtasks",
+        attempt: retryCount + 1,
+      });
+      return;
+    }
+    console.warn(
+      `[orchestrator] role ${step.role} left subtasks empty with no reason after ${retryCount} retries — escalating`,
+    );
+  }
+
+  // Render the tree deterministically from the validated `subtasks` array
+  // instead of trusting whatever freeform rendering the model wrote —
+  // guarantees the artifact always shows a correctly-formatted, parseable
+  // tree when subtasks are present, regardless of prose format drift.
+  if (role.can_create_subtasks && findings.subtasks?.length) {
+    findings.section_md = `${renderSubtaskTree(findings.subtasks)}\n\n${findings.section_md}`;
+  }
+
   // Surface degraded runs (missing verdict / truncated output / stalled narration) in the logs.
   if (result.fallback || result.stopReason === "length" || result.stalled) {
     console.warn(
@@ -2192,15 +2243,40 @@ async function applyGate(
   publish(task.task_id, "task_update", { stage: "refining" });
 }
 
-/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets. Legacy
- *  fallback — superseded by the structured `subtasks_json` field on role_runs
- *  (see resolveDecompositionSubtasks), kept for rows written before that field
- *  existed and for models that ignore the structured-output instructions. */
+/** Pure: render a validated `subtasks` array back into the bracket-tag format
+ *  `parseDecompositionTree` recognizes first/fastest — used to splice a
+ *  deterministic tree into a decomposition run's section_md instead of
+ *  trusting the model to hand-author an equivalent rendering (which drifts
+ *  across freeform prose formats the parser can't anticipate). `subtasks` has
+ *  no parent-pointer field — level + depends_on are the only structure — so a
+ *  flat per-node list is exactly as informative as a nested one. */
+export function renderSubtaskTree(subtasks: Subtask[]): string {
+  const lines = subtasks.map(
+    (s) =>
+      `- [${s.level}] ${s.name}` +
+      (s.depends_on?.length ? ` (depends on: ${s.depends_on.join(", ")})` : ""),
+  );
+  return `### Task Tree\n${lines.join("\n")}`;
+}
+
+/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets, or
+ *  (as a second pass, only if that finds nothing) a numbered/tree-drawing
+ *  prose format some models produce instead, e.g. "1. Epic: Foo" / "├── 2.
+ *  Story: Bar". Legacy fallback — superseded by the structured `subtasks_json`
+ *  field on role_runs (see resolveDecompositionSubtasks), kept for rows
+ *  written before that field existed and for models that ignore the
+ *  structured-output instructions. */
 export function parseDecompositionTree(md: string): Array<{ level: string; name: string }> {
-  const re = /\[(epic|story|task)\]\s*(.+)/gi;
+  const bracketRe = /\[(epic|story|task)\]\s*(.+)/gi;
   const out: Array<{ level: string; name: string }> = [];
   let m: RegExpExecArray | null;
-  while ((m = re.exec(md)) !== null) {
+  while ((m = bracketRe.exec(md)) !== null) {
+    out.push({ level: m[1]!.toLowerCase(), name: m[2]!.trim().slice(0, 120) });
+  }
+  if (out.length) return out;
+
+  const treeRe = /^[\s│├└─]*\d+\.\s*(epic|story|task)\s*:\s*(.+)$/gim;
+  while ((m = treeRe.exec(md)) !== null) {
     out.push({ level: m[1]!.toLowerCase(), name: m[2]!.trim().slice(0, 120) });
   }
   return out;

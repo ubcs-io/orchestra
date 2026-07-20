@@ -830,7 +830,7 @@ export async function runRole(params: RunRoleParams): Promise<RoleRunResult> {
     name: "record_findings",
     label: "Record findings",
     description:
-      "Finish this role by recording your verdict, summary, open questions, concern coverage, and the markdown section for the planning artifact. Call this exactly once.",
+      "Finish this role by recording your verdict, summary, open questions, concern coverage, and the markdown section for the planning artifact. If you are decomposing work, also populate `subtasks` or `no_decomposition_reason` — never leave both empty. Call this exactly once.",
     parameters: RecordFindingsSchema,
     execute: async (_id: string, p: Static<typeof RecordFindingsSchema>) => {
       captured = {

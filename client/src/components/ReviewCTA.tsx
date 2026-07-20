@@ -118,6 +118,23 @@ export function findFailedDecomposition(runs: RoleRun[]): RoleRun | null {
   return hasSubtasks ? null : decomp;
 }
 
+/** Pure: parse a decomposition section for [epic]/[story]/[task] bullets, or
+ *  (as a second pass, only if that finds nothing) a numbered/tree-drawing
+ *  prose format some models produce instead of the structured `subtasks`
+ *  array, e.g. "1. Epic: Foo" / "├── 2. Story: Bar" — mirrors
+ *  parseDecompositionTree in server/src/orchestrator.ts. */
+function parseDecompositionTreeNames(md: string): string[] {
+  const bracketRe = /\[(?:epic|story|task)\]\s*(.+)/gi;
+  const out: string[] = [];
+  let m;
+  while ((m = bracketRe.exec(md)) !== null) out.push(m[1]!.trim().slice(0, 200));
+  if (out.length) return out;
+
+  const treeRe = /^[\s│├└─]*\d+\.\s*(?:epic|story|task)\s*:\s*(.+)$/gim;
+  while ((m = treeRe.exec(md)) !== null) out.push(m[1]!.trim().slice(0, 200));
+  return out;
+}
+
 /** When decomposition fails, salvage whatever actionable list an earlier role
  *  already produced so the human isn't left with nothing to act on — later
  *  roles in the pipeline often add little beyond confirming that first
@@ -125,12 +142,21 @@ export function findFailedDecomposition(runs: RoleRun[]): RoleRun | null {
  *  decomposition run itself) and returns the first usable list found,
  *  preferring a structured subtasks_json (any role's record_findings call can
  *  include one, not just a can_create_subtasks role's) over parsing a
- *  "Recommended Update Strategy"/"Next Steps" prose section. */
+ *  "Recommended Update Strategy"/"Next Steps" prose section. Finally falls
+ *  back to the decomposition run's own output_md — the model often renders a
+ *  correct tree there even when it left the structured `subtasks` array
+ *  empty (see findFailedDecomposition), so this is the difference between
+ *  telling the human "nothing usable was found" and showing them the
+ *  breakdown that's actually sitting right there. */
 export function extractRecoveryCandidates(
   runs: RoleRun[],
 ): { roleKey: string; items: string[] } | null {
+  let decomp: RoleRun | undefined;
   for (const r of runs) {
-    if (r.role_key === "decomposition") continue;
+    if (r.role_key === "decomposition") {
+      decomp = r;
+      continue;
+    }
     if (r.subtasks_json) {
       try {
         const parsed = JSON.parse(r.subtasks_json) as Array<{ name?: string }>;
@@ -147,6 +173,10 @@ export function extractRecoveryCandidates(
       const items = extractListSection(r.output_md, RECOVERY_SECTION_HEADER_RE);
       if (items.length > 0) return { roleKey: r.role_key, items: items.slice(0, 10) };
     }
+  }
+  if (decomp?.output_md) {
+    const items = parseDecompositionTreeNames(decomp.output_md);
+    if (items.length > 0) return { roleKey: decomp.role_key, items: items.slice(0, 10) };
   }
   return null;
 }

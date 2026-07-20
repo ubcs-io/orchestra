@@ -17,6 +17,7 @@ import {
   parseDecompositionTree,
   planFromTemplate,
   reincorporateAnswer,
+  renderSubtaskTree,
   resetReachabilityChecker,
   resetRoleRunner,
   resolveDecompositionSubtasks,
@@ -136,6 +137,40 @@ describe("parseDecompositionTree", () => {
     expect(tree.map((n) => n.level)).toEqual(["epic", "story", "task", "task"]);
     expect(tree[2]!.name).toBe("do x");
   });
+
+  it("falls back to a numbered/tree-drawing prose format when no bracket tags are present", () => {
+    const md = [
+      "1. Epic: Tags default to collapsed in sidebar",
+      "├── 2. Story: Implement default collapsed state",
+      "│   ├── 3. Task: Change useState initial value (DashboardClient.tsx:247)",
+      "│   │   └── `useState(true)` → `useState(false)`",
+      "│   └── 4. Task: Update PREF_DEFAULTS (user-preferences.ts:36)",
+      "│       └── `tagsExpanded: 'true'` → `tagsExpanded: 'false'`",
+      "└── 5. Story: Add test coverage (recommended)",
+      "    ├── 6. Task: Unit test for PREF_DEFAULTS.tagsExpanded",
+      "    │   └── Add to media-vault/__tests__/lib/display-name.test.ts",
+      "    └── 7. Task: E2e regression test for collapsed default",
+      "        └── Add to media-vault/e2e/tags.spec.ts",
+    ].join("\n");
+    const tree = parseDecompositionTree(md);
+    expect(tree.map((n) => n.level)).toEqual([
+      "epic", "story", "task", "task", "story", "task", "task",
+    ]);
+    expect(tree.map((n) => n.name)).toEqual([
+      "Tags default to collapsed in sidebar",
+      "Implement default collapsed state",
+      "Change useState initial value (DashboardClient.tsx:247)",
+      "Update PREF_DEFAULTS (user-preferences.ts:36)",
+      "Add test coverage (recommended)",
+      "Unit test for PREF_DEFAULTS.tagsExpanded",
+      "E2e regression test for collapsed default",
+    ]);
+  });
+
+  it("prefers bracket tags over the tree-drawing fallback when both could match", () => {
+    const tree = parseDecompositionTree("- [epic] Big\n1. Task: should not be used");
+    expect(tree).toEqual([{ level: "epic", name: "Big" }]);
+  });
 });
 
 function createProjectTask(projectId: number, overrides: Record<string, unknown> = {}): TaskRow {
@@ -154,6 +189,28 @@ function makeSubtask(overrides: Partial<Subtask> = {}): Subtask {
     ...overrides,
   };
 }
+
+describe("renderSubtaskTree", () => {
+  it("renders bracket-tag lines that round-trip through parseDecompositionTree", () => {
+    const subtasks = [
+      makeSubtask({ local_id: "1", level: "epic", name: "Big epic" }),
+      makeSubtask({ local_id: "2", level: "story", name: "A story" }),
+      makeSubtask({ local_id: "3", level: "task", name: "do x", depends_on: ["2"] }),
+    ];
+    const md = renderSubtaskTree(subtasks);
+    expect(md).toContain("### Task Tree");
+    expect(md).toContain("- [epic] Big epic");
+    expect(md).toContain("- [story] A story");
+    expect(md).toContain("- [task] do x (depends on: 2)");
+
+    const parsed = parseDecompositionTree(md);
+    expect(parsed.map((n) => ({ level: n.level, name: n.name }))).toEqual([
+      { level: "epic", name: "Big epic" },
+      { level: "story", name: "A story" },
+      { level: "task", name: "do x (depends on: 2)" },
+    ]);
+  });
+});
 
 describe("resolveDecompositionSubtasks", () => {
   it("prefers subtasks_json when present and non-empty", () => {
@@ -344,6 +401,49 @@ function decompositionRunner(
   };
 }
 
+/**
+ * Like decompositionRunner, but the decomposition role specifically returns
+ * empty subtasks/no reason for its first `failCount` invocations before
+ * reporting `subtasks` on the call after — for exercising the empty-subtasks
+ * retry in runOneStep. Only counts calls where isDecomp is true, so earlier
+ * pipeline roles (intake_triage, explorer, ...) don't consume the budget.
+ */
+function decompositionRetryRunner(failCount: number, subtasks: Subtask[]): RoleRunner {
+  let decompCalls = 0;
+  return async (params) => {
+    const isReviewer = params.context.includes("Acceptance criteria to verify");
+    const isDecomp = params.context.includes("**decomposition** role");
+    const criteria: CriteriaResult[] = isReviewer
+      ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => ({
+          id: m[1]!,
+          status: "met" as const,
+        }))
+      : [];
+    if (isDecomp) decompCalls += 1;
+    const succeeds = isDecomp && decompCalls > failCount;
+    return {
+      findings: {
+        verdict: "pass",
+        summary: isDecomp ? "decomposition done" : "pass from fake",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: isDecomp ? "## Decomposition\n(see structured subtasks)" : "## role\ndone",
+        criteria_results: criteria,
+        subtasks: isDecomp ? (succeeds ? subtasks : []) : undefined,
+        no_decomposition_reason: undefined,
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+    };
+  };
+}
+
 function rootTask(projectId: number): TaskRow | undefined {
   return listTasks({ projectId }).find((t) => t.parent_task_id == null);
 }
@@ -432,6 +532,56 @@ describe("orchestrator loop (integration)", () => {
     expect(t.exit_state).toBe("needs_review");
     expect(t.review_reason).toContain("zero subtasks");
     expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+  });
+
+  it("retries decomposition when subtasks and no_decomposition_reason are both empty, then succeeds", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    const subtasks = [makeSubtask({ local_id: "1", name: "Only task" })];
+    setRoleRunner(decompositionRetryRunner(1, subtasks));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(1);
+    // The failed first attempt never persisted a role_run — only the
+    // eventual successful one did.
+    const decompRuns = listRoleRuns(t.task_id).filter((r) => r.role_key === "decomposition");
+    expect(decompRuns.length).toBe(1);
+    expect(decompRuns[0]!.output_md).toContain("### Task Tree");
+    expect(decompRuns[0]!.output_md).toContain("[task] Only task");
+  });
+
+  it("escalates to REVIEW after exhausting empty-subtasks retries", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    // Never succeeds — always reports empty subtasks/no reason.
+    setRoleRunner(decompositionRetryRunner(Infinity, []));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.review_reason).toContain("zero subtasks");
+    // Two retries (empty, un-persisted) plus the final attempt that gets
+    // recorded and escalated.
+    const decompRuns = listRoleRuns(t.task_id).filter((r) => r.role_key === "decomposition");
+    expect(decompRuns.length).toBe(1);
   });
 
   it("still escalates to REVIEW on zero subtasks after a reset-to-intake round trip (exit_kind backfill)", async () => {
