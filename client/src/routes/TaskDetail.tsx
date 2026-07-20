@@ -12,12 +12,14 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph, type NetworkPingTarget } from "../api";
+import { blockedDeps } from "../relations";
 import { rolesWithWriteTools, taskWriteCapability } from "../writeCapability";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
 import { DiffPanel, RunDiffSection } from "../components/DiffPanel";
 import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
+import { CollapsibleCard } from "../components/CollapsibleCard";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -104,6 +106,178 @@ function ElapsedTime({ startTime }: { startTime: number }) {
   const m = Math.floor(elapsed / 60);
   const s = elapsed % 60;
   return <>{m > 0 ? `${m}m ${s}s` : `${s}s`}</>;
+}
+
+/** Format a duration in milliseconds to a compact human-readable string. */
+function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+interface TimelineSegment {
+  roleKey: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  runIds: number[];
+}
+
+/**
+ * Group primary runs into timeline segments.
+ * Consecutive runs with the same role_key are bundled into one segment.
+ * A loopback (role A → role B → role A) creates separate segments.
+ */
+function buildTimelineSegments(runs: RoleRun[]): TimelineSegment[] {
+  const primary = runs
+    .filter((r) => !r.run_kind || r.run_kind === "primary")
+    .sort((a, b) => a.id - b.id);
+
+  if (primary.length === 0) return [];
+
+  const segments: TimelineSegment[] = [];
+  let current: TimelineSegment | null = null;
+
+  for (const run of primary) {
+    // Use started_at / ended_at if available; fall back to created_at
+    const startedAt = run.started_at ? new Date(run.started_at).getTime() : new Date(run.created_at).getTime();
+    const endedAt = run.ended_at ? new Date(run.ended_at).getTime() : startedAt;
+
+    // If same role as previous, bundle
+    if (current && current.roleKey === run.role_key) {
+      current.endedAt = Math.max(current.endedAt, endedAt);
+      current.durationMs = current.endedAt - current.startedAt;
+      current.runIds.push(run.id);
+    } else {
+      if (current) segments.push(current);
+      current = {
+        roleKey: run.role_key,
+        startedAt,
+        endedAt,
+        durationMs: endedAt - startedAt,
+        runIds: [run.id],
+      };
+    }
+  }
+  if (current) segments.push(current);
+
+  return segments;
+}
+
+/** Role-keyed color palette — deterministic colors for consistent display. */
+function roleColor(roleKey: string): string {
+  const palette = [
+    "#4caf50", "#2196f3", "#ff9800", "#e91e63", "#9c27b0",
+    "#00bcd4", "#ff5722", "#607d8b", "#795548", "#3f51b5",
+    "#8bc34a", "#ffc107", "#673ab7", "#cddc39", "#009688",
+  ];
+  let hash = 0;
+  for (let i = 0; i < roleKey.length; i++) {
+    hash = ((hash << 5) - hash) + roleKey.charCodeAt(i);
+    hash |= 0;
+  }
+  return palette[Math.abs(hash) % palette.length] ?? palette[0]!;
+}
+
+function TotalRunTime({ runs, activeRunRole }: { runs: RoleRun[]; activeRunRole: string | null }) {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState<TimelineSegment | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const segments = useMemo(() => buildTimelineSegments(runs), [runs]);
+
+  // Compute total: first segment start → last segment end
+  const totalMs = useMemo(() => {
+    if (segments.length === 0) return 0;
+    return segments[segments.length - 1]!.endedAt - segments[0]!.startedAt;
+  }, [segments]);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as HTMLElement)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  if (segments.length === 0) return null;
+
+  const handleSegmentClick = (seg: TimelineSegment) => {
+    // Scroll to the first run in this segment
+    const firstRunId = seg.runIds[0];
+    const run = runs.find((r) => r.id === firstRunId);
+    if (run) {
+      const el = document.getElementById(`run-${run.role_key}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        setOpen(false);
+      }
+    }
+  };
+
+  return (
+    <div className="total-run-time" ref={containerRef} style={{ position: "relative" }}>
+      <button
+        className="pill dim total-run-time-pill"
+        onClick={() => setOpen(!open)}
+        title="Click to see role timeline"
+      >
+        {formatDuration(totalMs)}
+      </button>
+
+      {open && (
+        <div className="timeline-popover">
+          <div className="timeline-bar-container">
+            {segments.map((seg, i) => {
+              const pct = totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
+              const isActive = activeRunRole === seg.roleKey;
+              return (
+                <div
+                  key={i}
+                  className={`timeline-segment ${isActive ? "timeline-segment--active" : ""}`}
+                  style={{
+                    width: `${pct}%`,
+                    backgroundColor: roleColor(seg.roleKey),
+                  }}
+                  onMouseEnter={() => setHovered(seg)}
+                  onMouseLeave={() => setHovered(null)}
+                  onClick={() => handleSegmentClick(seg)}
+                  title={`${seg.roleKey}: ${formatDuration(seg.durationMs)}`}
+                />
+              );
+            })}
+          </div>
+
+          <div className="timeline-tooltip">
+            {hovered ? (
+              <>
+                <span className="timeline-tooltip-role" style={{ color: roleColor(hovered.roleKey) }}>
+                  {hovered.roleKey}
+                </span>
+                <span className="muted">{formatDuration(hovered.durationMs)}</span>
+                <span className="muted" style={{ fontSize: 10 }}>
+                  {new Date(hovered.startedAt).toLocaleTimeString()} – {new Date(hovered.endedAt).toLocaleTimeString()}
+                </span>
+                {hovered.runIds.length > 1 && (
+                  <span className="pill dim" style={{ fontSize: 10 }}>{hovered.runIds.length} runs</span>
+                )}
+              </>
+            ) : (
+              <span className="muted" style={{ fontSize: 11 }}>Hover a segment</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export interface ActivityState {
@@ -1046,7 +1220,7 @@ export function TaskDetail() {
   const [noteInput, setNoteInput] = useState("");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
   const [runDiffOpen, setRunDiffOpen] = useState<Set<number>>(new Set());
-  const [showAdvancedSteering, setShowAdvancedSteering] = useState(false);
+  const [steeringExpanded, setSteeringExpanded] = useState(false);
 
   // Question answer state: per-question-editing keyed by "${runId}:${qIndex}"
   const [questionEdits, setQuestionEdits] = useState<Record<string, string>>({});
@@ -1226,6 +1400,19 @@ export function TaskDetail() {
     return { map, roleKeys };
   }, [q.data]);
 
+  const coverageCounts = useMemo(() => {
+    const taxonomy = q.data?.taxonomy ?? [];
+    const counts = { considered: 0, skipped: 0, out_of_scope: 0, never: 0 };
+    for (const concern of taxonomy) {
+      for (const roleKey of coverageGrid.roleKeys) {
+        const status = coverageGrid.map[concern]?.[roleKey]?.status ?? "never";
+        if (status in counts) counts[status as keyof typeof counts]++;
+        else counts.never++;
+      }
+    }
+    return counts;
+  }, [q.data, coverageGrid]);
+
   /** Per-model API call counts and tokens derived from persisted role runs. */
   const modelConfigsQ = useQuery({ queryKey: ["modelConfigs"], queryFn: () => api.modelConfigs() });
 
@@ -1241,6 +1428,18 @@ export function TaskDetail() {
     queryFn: () => api.harnessPolicy(taskProjectId as number),
     enabled: taskProjectId != null,
   });
+  /** Sibling tasks, only fetched when this task actually has unmet dependencies to
+   *  resolve — shares ProjectBoard's ["tasks", projectId] cache key. */
+  const siblingsQ = useQuery({
+    queryKey: ["tasks", taskProjectId],
+    queryFn: () => api.tasks(taskProjectId as number),
+    enabled: taskProjectId != null && !!q.data?.task.depends_on_json,
+  });
+  const blockedOn = useMemo(() => {
+    if (!q.data?.task.depends_on_json) return null;
+    const byId = new Map((siblingsQ.data?.tasks ?? []).map((t) => [t.task_id, t]));
+    return blockedDeps(q.data.task, byId);
+  }, [q.data?.task, siblingsQ.data]);
   const writeCap = useMemo(() => {
     if (!q.data?.task) return null;
     const writeRoles = rolesWithWriteTools(projectQ.data?.roles ?? []);
@@ -1306,6 +1505,11 @@ export function TaskDetail() {
   nextRoleRef.current = nextPendingRole;
 
   const questionGroups = collectQuestions(d.runs);
+  const openQuestionsCount = questionGroups.reduce(
+    (sum, group) => sum + group.questions.filter((rawQ) => !findAnsweredQuestion(d.interventions, group.roleKey, parseQuestion(rawQ).text)).length,
+    0,
+  );
+  const steeringPendingCount = d.interventions.filter((iv) => iv.consumed_at == null).length;
 
   const submitAnswer = (roleKey: string, question: string, answer: string, editKey: string) => {
     if (!answer.trim()) return;
@@ -1408,6 +1612,18 @@ export function TaskDetail() {
           />
         )}
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
+        {activity.currentRole && activity.disposition !== "done" && (
+          <span className="in-progress-pulse" title={`${activity.currentRole} running now`} />
+        )}
+        {blockedOn && blockedOn.length > 0 && (
+          <span
+            className="pill dim"
+            title={`waiting on: ${blockedOn.map((b) => `${b.name ?? b.task_id.slice(0, 8)} (${b.stage})`).join(", ")}`}
+          >
+            blocked
+          </span>
+        )}
+        <TotalRunTime runs={d.runs} activeRunRole={activity.currentRole} />
         {writeCap === "acting" && (
           <span className="pill accent" title="This task's plan includes a role with write/edit tools, in a write-enabled project">acting</span>
         )}
@@ -1791,8 +2007,30 @@ export function TaskDetail() {
 
           {/* Current state panel — shown whenever there's meaningful state */}
           {(activity.currentRole || activity.lastRole) && (
-            <div className="panel">
-              <h2>Current State</h2>
+            <CollapsibleCard
+              title="Current State"
+              summary={
+                <>
+                  {activity.currentRole && (
+                    <span className="pill warn">{activity.currentRole}</span>
+                  )}
+                  {activity.disposition && (
+                    <span className="pill">
+                      {activity.disposition === "reading" && "📖 reading"}
+                      {activity.disposition === "thinking" && "💭 thinking"}
+                      {activity.disposition === "responding" && "✍ responding"}
+                      {activity.disposition === "tool" && "🔧 tool use"}
+                      {activity.disposition === "done" && "✅ complete"}
+                    </span>
+                  )}
+                  {activity.roleStartTime && activity.disposition !== "done" && (
+                    <span className="pill dim">
+                      <ElapsedTime startTime={activity.roleStartTime} />
+                    </span>
+                  )}
+                </>
+              }
+            >
               <div className="current-state">
                 {activity.currentRole && (
                   <div className="current-state-row">
@@ -1848,13 +2086,25 @@ export function TaskDetail() {
                   </div>
                 )}
               </div>
-            </div>
+            </CollapsibleCard>
           )}
 
           {/* API Calls panel — expanded with local/API split, avg TPS, and per-model breakdown */}
           {Object.keys(modelCallCounts).length > 0 && (
-            <div className="panel">
-              <h2>API Calls</h2>
+            <CollapsibleCard
+              title="API Calls"
+              summary={
+                <>
+                  <span className="pill dim">{localApiAgg.local + localApiAgg.api} calls</span>
+                  {avgTps != null && <span className="pill dim">{avgTps.toFixed(0)} tps</span>}
+                  {localApiAgg.local + localApiAgg.api > 0 && (
+                    <span className="muted" style={{ fontSize: 11 }}>
+                      {localApiAgg.local} local / {localApiAgg.api} api
+                    </span>
+                  )}
+                </>
+              }
+            >
               <div className="calls-summary">
                 <div className="calls-total">
                   <span className="calls-total-num">
@@ -1915,7 +2165,7 @@ export function TaskDetail() {
                     })}
                 </div>
               </div>
-            </div>
+            </CollapsibleCard>
           )}
 
           {t.exit_state === "network_unavailable" && (
@@ -1951,31 +2201,40 @@ export function TaskDetail() {
             </div>
           )}
 
-          <div className="panel">
+          <div
+            className={`panel${!steeringExpanded ? " panel--expandable" : ""}`}
+            onClick={() => { if (!steeringExpanded) setSteeringExpanded(true); }}
+          >
             <div className="steering-header">
               <h2 style={{ margin: 0 }}>Steering</h2>
               <div className="steer">
                 {t.paused === 1 ? (
-                  <button className="small primary" onClick={() => intervene.mutate({ kind: "resume" })}>Resume</button>
+                  <button className="small primary" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "resume" }); }}>Resume</button>
                 ) : (
-                  <button className="small" onClick={() => intervene.mutate({ kind: "pause" })}>Pause</button>
+                  <button className="small" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "pause" }); }}>Pause</button>
                 )}
-                <button className="small" onClick={() => setResetModal(true)} title="Reset to intake">
+                <button className="small" onClick={(e) => { e.stopPropagation(); setResetModal(true); }} title="Reset to intake">
                   🔄
                 </button>
-                <button className="small danger" onClick={() => { setRemovePlan(false); setDeleteModal(true); }} title="Delete task">
+                <button className="small danger" onClick={(e) => { e.stopPropagation(); setRemovePlan(false); setDeleteModal(true); }} title="Delete task">
                   🗑
                 </button>
               </div>
               <button
                 className="small"
-                onClick={() => setShowAdvancedSteering((p) => !p)}
-                title={showAdvancedSteering ? "Hide advanced controls" : "Show advanced controls"}
+                onClick={(e) => { e.stopPropagation(); setSteeringExpanded((p) => !p); }}
+                title={steeringExpanded ? "Hide details" : "Show advanced controls and steering log"}
               >
-                {showAdvancedSteering ? "Advanced ▾" : "Advanced ▸"}
+                {steeringExpanded ? "Details ▾" : "Details ▸"}
               </button>
             </div>
-            {showAdvancedSteering && (
+            {!steeringExpanded && (
+              <div className="row" style={{ marginTop: 6, gap: 8 }}>
+                <span className="pill dim">{steeringPendingCount} pending</span>
+                <span className="pill dim">{d.interventions.length} total</span>
+              </div>
+            )}
+            {steeringExpanded && (
               <>
                 <div className="steer" style={{ marginTop: 8 }}>
                   <button className="small" onClick={() => api.tick().then(refresh)}>Tick now</button>
@@ -1997,55 +2256,63 @@ export function TaskDetail() {
                   <input value={noteInput} onChange={(e) => setNoteInput(e.target.value)} placeholder="focus on token handling…" />
                   <button className="small" disabled={!noteInput} onClick={() => { intervene.mutate({ kind: "steer_note", payload: { text: noteInput } }); setNoteInput(""); }}>add</button>
                 </div>
+
+                {d.interventions.length > 0 && (
+                  <div style={{ marginTop: 14 }}>
+                    <h2 style={{ marginBottom: 6 }}>Steering log</h2>
+                    <div className="steering-log">
+                      {[...d.interventions].reverse().map((iv) => {
+                        let payload: Record<string, unknown> = {};
+                        try { payload = iv.payload_json ? JSON.parse(iv.payload_json) : {}; } catch { /* skip */ }
+
+                        const kindLabel = {
+                          steer_note: "NOTE",
+                          pin_question: "PIN",
+                          question_answer: "ANSWER",
+                          inject_role: "INJECT",
+                          deepen: "DEEPEN",
+                          promote_role: "PROMOTE",
+                          pause: "PAUSE",
+                          resume: "RESUME",
+                          run_now: "RUN NOW",
+                        }[iv.kind] ?? iv.kind.toUpperCase();
+
+                        const detail =
+                          iv.kind === "steer_note" || iv.kind === "pin_question"
+                            ? (payload.text as string ?? "")
+                            : iv.kind === "inject_role"
+                              ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
+                              : iv.kind === "deepen" || iv.kind === "promote_role"
+                                ? (payload.role as string ?? "?")
+                                : "";
+
+                        const isConsumed = iv.consumed_at != null;
+
+                        return (
+                          <div key={iv.id} className={`steering-entry ${isConsumed ? "consumed" : "pending"}`}>
+                            <span className={`pill ${isConsumed ? "dim" : "warn"}`}>{kindLabel}</span>
+                            {detail && <span className={isConsumed ? "muted" : ""}>{detail}</span>}
+                            <span className="muted" style={{ fontSize: 11 }}>{iv.created_at.replace("T", " ").slice(0, 16)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </>
-            )}
-
-            {d.interventions.length > 0 && (
-              <div style={{ marginTop: 14 }}>
-                <h2 style={{ marginBottom: 6 }}>Steering log</h2>
-                <div className="steering-log">
-                  {[...d.interventions].reverse().map((iv) => {
-                    let payload: Record<string, unknown> = {};
-                    try { payload = iv.payload_json ? JSON.parse(iv.payload_json) : {}; } catch { /* skip */ }
-
-                    const kindLabel = {
-                      steer_note: "NOTE",
-                      pin_question: "PIN",
-                      question_answer: "ANSWER",
-                      inject_role: "INJECT",
-                      deepen: "DEEPEN",
-                      promote_role: "PROMOTE",
-                      pause: "PAUSE",
-                      resume: "RESUME",
-                      run_now: "RUN NOW",
-                    }[iv.kind] ?? iv.kind.toUpperCase();
-
-                    const detail =
-                      iv.kind === "steer_note" || iv.kind === "pin_question"
-                        ? (payload.text as string ?? "")
-                        : iv.kind === "inject_role"
-                          ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
-                          : iv.kind === "deepen" || iv.kind === "promote_role"
-                            ? (payload.role as string ?? "?")
-                            : "";
-
-                    const isConsumed = iv.consumed_at != null;
-
-                    return (
-                      <div key={iv.id} className={`steering-entry ${isConsumed ? "consumed" : "pending"}`}>
-                        <span className={`pill ${isConsumed ? "dim" : "warn"}`}>{kindLabel}</span>
-                        {detail && <span className={isConsumed ? "muted" : ""}>{detail}</span>}
-                        <span className="muted" style={{ fontSize: 11 }}>{iv.created_at.replace("T", " ").slice(0, 16)}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
             )}
           </div>
 
-          <div className="panel">
-            <h2>Coverage map</h2>
+          <CollapsibleCard
+            title="Coverage map"
+            summary={
+              <>
+                <span className="pill ok">{coverageCounts.considered} considered</span>
+                {coverageCounts.skipped > 0 && <span className="pill warn">{coverageCounts.skipped} skipped</span>}
+                {coverageCounts.never > 0 && <span className="pill bad">{coverageCounts.never} never</span>}
+              </>
+            }
+          >
             {coverageGrid.roleKeys.length > 0 ? (
               <>
                 <div className="coverage-grid" style={{ gridTemplateColumns: `120px repeat(${coverageGrid.roleKeys.length}, minmax(28px, 1fr))` }}>
@@ -2136,12 +2403,17 @@ export function TaskDetail() {
             ) : (
               <p className="muted">No coverage recorded yet.</p>
             )}
-          </div>
+          </CollapsibleCard>
 
-          <div className="panel">
-            <div className="plan-header">
-              <h2>Intake — original request</h2>
-            </div>
+          <CollapsibleCard
+            title="Intake — original request"
+            summary={
+              <>
+                <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
+                <span className="pill dim">name: {t.name ?? t.task_id.slice(0, 8)}</span>
+              </>
+            }
+          >
             <div className="intake-content">
               <div className="row" style={{ marginBottom: 6 }}>
                 <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
@@ -2232,11 +2504,17 @@ export function TaskDetail() {
                 </>
               )}
             </div>
-          </div>
+          </CollapsibleCard>
 
           {questionGroups.length > 0 && t.stage !== "review" && t.stage !== "ready" && (
-            <div className="panel">
-              <h2>Questions</h2>
+            <CollapsibleCard
+              title="Questions"
+              summary={
+                <span className="pill warn">
+                  {openQuestionsCount} open question{openQuestionsCount === 1 ? "" : "s"}
+                </span>
+              }
+            >
               <div className="questions-panel">
                 {questionGroups.map((group) => (
                   <div key={group.runId} className="questions-role-group">
@@ -2382,7 +2660,7 @@ export function TaskDetail() {
                   </div>
                 ))}
               </div>
-            </div>
+            </CollapsibleCard>
           )}
         </div>
       </div>

@@ -137,6 +137,10 @@ export function Projects() {
               <span className="stat-label stat-bad">Blockers</span>
             </div>
             <div className="stat-card">
+              <span className="stat-value">{stats.review_count}</span>
+              <span className="stat-label stat-warn">Needs Review</span>
+            </div>
+            <div className="stat-card">
               <span className="stat-value">{stats.paused}</span>
               <span className="stat-label">Paused</span>
             </div>
@@ -172,6 +176,37 @@ export function Projects() {
                 {b.review_reason && (
                   <span className="muted" style={{ fontSize: 11, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     — {b.review_reason}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ---- Needs Your Review ---- */}
+      {stats && stats.review_list.length > 0 && (
+        <div className="panel">
+          <h2>Needs Your Review ({stats.review_list.length})</h2>
+          <p className="muted" style={{ marginTop: -4, marginBottom: 8, fontSize: 12 }}>
+            Parked awaiting a human decision (approve/reset/request changes) — nothing will progress on these,
+            or on any task depending on them, until you act.
+          </p>
+          <div className="blockers-list">
+            {stats.review_list.map((r) => (
+              <div key={r.task_id} className="blocker-row">
+                <span className="pill human">{r.exit_state ? r.exit_state.replace(/_/g, " ") : "needs review"}</span>
+                <Link to="/tasks/$taskId" params={{ taskId: r.task_id }} className="blocker-name">
+                  {r.name ?? r.task_id.slice(0, 8)}
+                </Link>
+                {r.project_name && (
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {r.project_name}
+                  </span>
+                )}
+                {r.review_reason && (
+                  <span className="muted" style={{ fontSize: 11, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    — {r.review_reason}
                   </span>
                 )}
               </div>
@@ -243,7 +278,7 @@ export function Projects() {
         ) : (
           <div className="project-grid">
             {data?.projects && data.projects.length > 0 && data.projects.map((p) => (
-              <Link className="project-card" to="/projects/$projectId" params={{ projectId: String(p.id) }} key={p.id}>
+              <Link className={`project-card${p.processing ? " project-card--processing" : ""}`} to="/projects/$projectId" params={{ projectId: String(p.id) }} key={p.id}>
                 <Link className="project-roles-icon" to="/projects/$projectId/roles" params={{ projectId: String(p.id) }} title="Roles" onClick={(e) => e.stopPropagation()}>👤</Link>
                 <span className="project-name">{p.name}</span>
                 <div className="project-meta">

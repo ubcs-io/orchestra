@@ -534,9 +534,57 @@ export function ReviewCTA({
     );
   }
 
+  const isMergeReview = isReview && task.exit_state === "needs_merge_approval";
+
   return (
     <div className="panel review-cta-panel">
-      {isReview && (
+      {isMergeReview && (
+        <>
+          <span className="review-cta-tag">needs merge review</span>
+          <h2>Code Ready for Merge Review</h2>
+          <p className="review-reason">{reviewReason}</p>
+          {task.reconcile_status === "pending_human_merge" && (
+            <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+              Review the diff via the "review branch" pill above, then push/open a PR before approving.
+            </p>
+          )}
+
+          <div className="review-cta-row">
+            <button
+              className="small review-cta-primary"
+              disabled={loading === "approve_merge"}
+              onClick={() => doMutate("approve_merge")}
+            >
+              {loading === "approve_merge" ? "…" : "Approve & mark merged"}
+            </button>
+            <button
+              className="small review-cta-secondary"
+              disabled={loading === "request_changes"}
+              onClick={() => doMutate("request_changes")}
+            >
+              {loading === "request_changes" ? "…" : "Request changes"}
+            </button>
+          </div>
+
+          <div className="review-cta-row escape">
+            <button
+              className="small review-cta-escape"
+              disabled={loading === "reset"}
+              onClick={doReset}
+            >
+              {loading === "reset" ? "…" : "⟳ Reset to intake"}
+            </button>
+            <button
+              className="small review-cta-escape"
+              disabled={loading === "wont_do"}
+              onClick={() => doMutate("wont_do")}
+            >
+              {loading === "wont_do" ? "…" : "✕ Won't do"}
+            </button>
+          </div>
+        </>
+      )}
+      {isReview && !isMergeReview && (
         <>
           <span className="review-cta-tag">needs review</span>
           <h2>Human Review Required</h2>

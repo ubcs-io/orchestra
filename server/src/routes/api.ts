@@ -78,6 +78,8 @@ import {
 } from "../settings.js";
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
   import {
+    activeTaskIds,
+    approveCodeChangeMerge,
     artifactName,
     buildParentDigest,
     ensureTaskWorkspace,
@@ -85,6 +87,7 @@ import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from
     isSchedulerRunning,
     isSchedulerStopping,
     reincorporateAnswer,
+    requestCodeChanges,
     restoreCheckpoint,
     startScheduler,
     stopScheduler,
@@ -571,6 +574,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   // ---- Projects ----
   app.get("/api/projects", async () => {
     const projects = listProjects();
+    const activeIds = new Set(activeTaskIds());
     const enriched = projects.map((p) => {
       const roles = listRoles(p.id);
       const models = [...new Set(
@@ -594,7 +598,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       let internal_calls = 0;
       let external_calls = 0;
       const projectTasks = listTasks({ projectId: p.id });
+      let processing = false;
       for (const task of projectTasks) {
+        if (activeIds.has(task.task_id)) processing = true;
         const runs = listRoleRuns(task.task_id);
         for (const run of runs) {
           if (!run.model) continue;
@@ -612,7 +618,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
           else external_calls++;
         }
       }
-      return { ...projectResponse(p), models, internal_calls, external_calls };
+      return { ...projectResponse(p), models, internal_calls, external_calls, processing };
     });
     return { projects: enriched };
   });
@@ -1232,6 +1238,14 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         }
       }
     }
+    // Atomic execution leaf (exit_kind "code_change") merge-review actions —
+    // same immediate-handling need as question_answer above: a review-stage
+    // task has no scheduler pass coming to consume a deferred intervention.
+    if (body.kind === "approve_merge") approveCodeChangeMerge(task.task_id);
+    if (body.kind === "request_changes") {
+      const p = (body.payload ?? {}) as { note?: string };
+      requestCodeChanges(task.task_id, p.note);
+    }
     return { intervention: iv, task: getTask(task.task_id) };
   });
 
@@ -1423,6 +1437,17 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       project_id: number | null;
       review_reason: string | null;
     }> = [];
+    // Every task genuinely parked at stage "review" is awaiting a human decision
+    // (approve/reset/request changes) — a more reliable signal than exit_state,
+    // which is null for some review gates (e.g. a failed decomposition) that
+    // blockersList's exit_state filter above misses entirely.
+    const reviewList: Array<{
+      task_id: string;
+      name: string | null;
+      exit_state: string | null;
+      review_reason: string | null;
+      project_id: number | null;
+    }> = [];
 
     for (const t of allTasks) {
       const stage = t.stage ?? "intake";
@@ -1440,6 +1465,15 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
           review_reason: t.review_reason,
         });
       }
+      if (stage === "review") {
+        reviewList.push({
+          task_id: t.task_id,
+          name: t.name,
+          exit_state: t.exit_state,
+          review_reason: t.review_reason,
+          project_id: t.project_id,
+        });
+      }
       if (t.paused === 1) paused++;
     }
 
@@ -1448,16 +1482,23 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       const proj = projects.find((p) => p.id === b.project_id);
       return { ...b, project_name: proj?.name ?? null };
     });
+    const enrichedReview = reviewList.map((r) => {
+      const proj = projects.find((p) => p.id === r.project_id);
+      return { ...r, project_name: proj?.name ?? null };
+    });
 
     return {
       total: allTasks.length,
       by_stage: byStage,
       in_flight: inFlight,
+      in_flight_task_ids: activeTaskIds(),
       action_items: actionItems,
       blockers,
       paused,
       projects_count: projects.length,
       blockers_list: enrichedBlockers,
+      review_count: reviewList.length,
+      review_list: enrichedReview,
     };
   });
 

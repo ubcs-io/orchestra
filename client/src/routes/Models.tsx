@@ -1581,8 +1581,12 @@ function ModelEditor({
               <input value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} placeholder="16384" />
             </div>
             <div>
-              <label>Request timeout (ms)</label>
+              <label>Idle timeout (ms)</label>
               <input value={timeoutMs} onChange={(e) => setTimeoutMs(e.target.value)} placeholder="300000" />
+              <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
+                Aborted and auto-retried if a role's call goes this long with no streamed output at all —
+                resets on every token/tool event, so a long-but-active run is never cut off.
+              </p>
             </div>
           </div>
 

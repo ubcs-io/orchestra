@@ -73,6 +73,12 @@ export interface Subtask {
   acceptance_criteria: string[];
   context_to_carry_forward: string;
   depends_on?: string[];
+  /** Set true only on a `level: "task"` node that's already fully scoped and
+   *  needs no further requirements/architecture analysis — just implementation.
+   *  Routes the spawned child straight to the developer/critic execution flow
+   *  instead of re-entering the full planning pipeline (see orchestrator.ts's
+   *  createDecompositionChildren). */
+  execution_ready?: boolean;
 }
 
 export interface RoleFindings {
@@ -223,6 +229,14 @@ const SubtaskSchema = Type.Object({
   depends_on: Type.Optional(
     Type.Array(Type.String(), {
       description: "local_ids of sibling nodes in this same list that must complete first.",
+    }),
+  ),
+  execution_ready: Type.Optional(
+    Type.Boolean({
+      description:
+        "level: \"task\" nodes only — true if this needs no further requirements/architecture analysis and " +
+        "a developer could implement it directly from brief + acceptance_criteria alone. Always false/omitted " +
+        "for epic/story nodes or anything still needing analysis.",
     }),
   ),
 });
@@ -390,7 +404,7 @@ If you are a counter-reviewer with acceptance criteria to verify, also include:
 - **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
 
 If you are decomposing work into an epic/story/task tree, also include:
-- **subtasks**: array of { local_id, level, name, brief, acceptance_criteria, context_to_carry_forward, depends_on } — local_id is a short id you assign (e.g. "1", "1.2") that depends_on (array of other subtasks' local_ids, optional) can reference; level is "epic", "story", or "task"; context_to_carry_forward must state any decision/constraint/fact the child needs that isn't obvious from name/brief alone — the child will not see this parent's full history by default.
+- **subtasks**: array of { local_id, level, name, brief, acceptance_criteria, context_to_carry_forward, depends_on, execution_ready } — local_id is a short id you assign (e.g. "1", "1.2") that depends_on (array of other subtasks' local_ids, optional) can reference; level is "epic", "story", or "task"; context_to_carry_forward must state any decision/constraint/fact the child needs that isn't obvious from name/brief alone — the child will not see this parent's full history by default. On a "task"-level node only, set execution_ready: true if it's already fully scoped and needs no further requirements/architecture analysis — a developer could implement it directly from brief + acceptance_criteria alone; leave it false/omitted otherwise, and always for epic/story nodes.
 - **no_decomposition_reason**: a string explaining why, REQUIRED if subtasks is empty and that's intentional (the work is already one atomic, independently-actionable unit). An empty subtasks array with no reason is treated as a failed decomposition.
 
 Output ONLY the JSON block as the last thing in your response. Do not write anything after the closing \`\`\`.
@@ -678,6 +692,7 @@ function normalizeSubtasks(raw: unknown): Subtask[] | undefined {
       depends_on: Array.isArray(o.depends_on)
         ? o.depends_on.filter((d): d is string => typeof d === "string")
         : undefined,
+      execution_ready: o.execution_ready === true,
     });
   }
   return out.length ? out : undefined;

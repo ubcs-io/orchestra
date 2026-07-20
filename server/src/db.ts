@@ -291,6 +291,10 @@ export function initDb(): void {
   // subtasks (already-atomic work) — an empty subtasks array with this unset is
   // treated as a failed decomposition, not an intentional no-op.
   addColumnIfMissing(d, "role_runs", "no_decomposition_reason", "no_decomposition_reason TEXT");
+  // Timing: when a role_start/role_end event was first/last observed for this
+  // run. Populated by the orchestrator; null for runs that predate this feature.
+  addColumnIfMissing(d, "role_runs", "started_at", "started_at TEXT");
+  addColumnIfMissing(d, "role_runs", "ended_at", "ended_at TEXT");
   // Sibling local_ids (from a decomposition's subtasks[].depends_on) resolved to
   // real task_ids at child-creation time. JSON array of task_id strings; null/
   // absent = no dependencies. Consulted by the scheduler's dependenciesSatisfied().
@@ -444,6 +448,8 @@ export interface RoleRunRow {
   git_commit_sha: string | null;
   subtasks_json: string | null;
   no_decomposition_reason: string | null;
+  started_at: string | null;
+  ended_at: string | null;
   created_at: string;
 }
 
@@ -1061,7 +1067,6 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       reconcile_detail = NULL,
       github_pr_url = NULL,
       github_pushed_sha = NULL,
-      parent_task_id = NULL,
       task_type = 'root',
       step_number = NULL,
       model = NULL,
@@ -1176,6 +1181,18 @@ export function listCritiquesForRun(runId: number): RoleRunRow[] {
 /** Record the checkpoint commit created right after a primary run's artifact commit. */
 export function setRoleRunCommitSha(id: number, sha: string): void {
   getDb().prepare(`UPDATE role_runs SET git_commit_sha = ? WHERE id = ?`).run(sha, id);
+}
+
+/** Record timing for a role run. Only writes columns that are currently null
+ *  (first event wins for started_at, last event wins for ended_at). */
+export function setRoleRunTimings(id: number, timings: { started_at?: string; ended_at?: string }): void {
+  const d = getDb();
+  if (timings.started_at) {
+    d.prepare(`UPDATE role_runs SET started_at = COALESCE(started_at, ?) WHERE id = ?`).run(timings.started_at, id);
+  }
+  if (timings.ended_at) {
+    d.prepare(`UPDATE role_runs SET ended_at = ? WHERE id = ?`).run(timings.ended_at, id);
+  }
 }
 
 /** Update a run's open_questions_json — used to mark a guess "confirmed"/"invalidated"

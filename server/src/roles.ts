@@ -47,7 +47,11 @@ export type IntakeKind =
   | "ux"
   | "question";
 
-export type ExitKind = "spec" | "research_brief";
+/** "code_change" is never selected by intake kind (see EXIT_KIND_BY_INTAKE) —
+ *  it's assigned directly to a decomposition child flagged `execution_ready`,
+ *  routing that one child through EXECUTION_FLOW_TEMPLATE instead of a
+ *  planning flow. */
+export type ExitKind = "spec" | "research_brief" | "code_change";
 
 /** Which terminal shape each intake kind targets. */
 export const EXIT_KIND_BY_INTAKE: Record<IntakeKind, ExitKind> = {
@@ -218,6 +222,24 @@ export const FLOW_TEMPLATES: Record<IntakeKind, FlowTemplate> = {
   },
 };
 
+/**
+ * The flow for an atomic decomposition leaf flagged `execution_ready`
+ * (exit_kind "code_change") — routes straight to implementation instead of
+ * another planning pass. Intake-kind-independent: the child already carries
+ * its own scoped acceptance criteria and context from decomposition, so no
+ * criteria checklist is re-derived here. `critic`'s own verdict (pass /
+ * blocker / needs_human) is the sole automated gate before human merge review.
+ * reviewDepth is "none": `critic` is already itself the review step here (not
+ * a producer being reviewed), so the separate adversarial-critique-pass
+ * mechanism (which fires when a step's role matches reviewerRole) would just
+ * have critic redundantly critique its own output.
+ */
+export const EXECUTION_FLOW_TEMPLATE: FlowTemplate = {
+  key: "execute", rigor: "standard", reviewerRole: "critic", maxLoopbacks: 1,
+  mandatoryConcerns: [], criteria: [], reviewDepth: "none",
+  steps: ["developer", "critic"],
+};
+
 /** Resolve the flow for an intake kind (falls back to the manual flow). */
 export function flowForIntake(kind: IntakeKind): FlowTemplate {
   return FLOW_TEMPLATES[kind] ?? FLOW_TEMPLATES.manual;
@@ -238,6 +260,7 @@ export const ROUTING_TEMPLATES: Record<IntakeKind, string[]> = Object.fromEntrie
 
 /** The role that, once run, terminates each exit kind. */
 export const TERMINAL_ROLE: Record<ExitKind, string> = {
+  code_change: "critic",
   spec: "decomposition",
   research_brief: "research_synthesis",
 };
@@ -521,7 +544,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
     can_create_subtasks: true,
-    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. The tree itself is rendered into the human-facing artifact automatically from \`subtasks\` — do not re-render it in section_md. Use section_md only for anything subtasks doesn't already capture: sequencing rationale, rough sizing, and key facts an implementer would need.`,
+    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. On a \`level: "task"\` node only, set \`execution_ready: true\` if it needs no further requirements/architecture/design analysis — a developer could pick it up and implement it directly from the brief and acceptance criteria alone. Leave it false (or omitted) for anything that still needs analysis, and always false for \`epic\`/\`story\` nodes — do not mark speculative or ambiguous work execution-ready just because it's small. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. The tree itself is rendered into the human-facing artifact automatically from \`subtasks\` — do not re-render it in section_md. Use section_md only for anything subtasks doesn't already capture: sequencing rationale, rough sizing, and key facts an implementer would need.`,
   },
 
   // ---- Developer (write/edit capable) ----

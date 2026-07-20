@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
 import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, resetTask, updateProject, updateTask, type TaskRow } from "../src/db";
 import type { RoleRunRow } from "../src/db";
+import { resetConfig } from "../src/config";
 import { scaffoldPlanning, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
@@ -20,6 +21,7 @@ import {
   renderSubtaskTree,
   resetReachabilityChecker,
   resetRoleRunner,
+  abortAllInFlight,
   resolveDecompositionSubtasks,
   restoreCheckpoint,
   setReachabilityChecker,
@@ -774,6 +776,53 @@ describe("orchestrator loop (integration)", () => {
     expect(dependenciesSatisfied(children[0]!)).toBe(true);
   });
 
+  it("routes a decomposition child flagged execution_ready straight to the developer/critic execution flow instead of re-planning", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(
+      decompositionRunner({
+        decompSubtasks: [
+          makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true }),
+          makeSubtask({ local_id: "2", name: "Needs more scoping" }),
+        ],
+      }),
+    );
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    const children = listTasks({ parentTaskId: t.task_id });
+    const execChild = children.find((c) => c.name === "Atomic fix")!;
+    const planChild = children.find((c) => c.name === "Needs more scoping")!;
+
+    // Only the flagged node gets the execution exit kind; its sibling inherits
+    // the parent's exit_kind (spec) exactly as before this feature existed.
+    expect(execChild.exit_kind).toBe("code_change");
+    expect(planChild.exit_kind).toBe(t.exit_kind);
+
+    // Drive the execution-flow child to completion with a runner that just
+    // passes every step — if it were re-entering the normal planning flow,
+    // roles like intake_triage/requirements_analyst/decomposition would show
+    // up in its role_runs too.
+    setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: [] }));
+    for (let i = 0; i < 20; i++) {
+      await tick();
+      if (getTask(execChild.task_id)!.stage !== "intake" && getTask(execChild.task_id)!.stage !== "refining") break;
+    }
+
+    const finished = getTask(execChild.task_id)!;
+    expect(finished.stage).toBe("review");
+    expect(finished.exit_state).toBe("needs_merge_approval");
+    expect(finished.reconcile_status).toBe("pending_human_merge");
+    expect(listRoleRuns(execChild.task_id).map((r) => r.role_key)).toEqual(["developer", "critic"]);
+  });
+
   it("escalates to REVIEW when a role returns needs_human", async () => {
     const { repo, projectId } = setupProject();
     writeArtifact(path.join(repo, "PLANNING", "INTAKE", "vague.md"), "make it better somehow");
@@ -963,6 +1012,118 @@ describe("orchestrator loop (integration)", () => {
     expect(first.fallback).toBe(1);
     expect(first.stop_reason).toBe("length");
     expect(first.thinking_md).toBe("the model was thinking hard");
+  });
+});
+
+describe("role-call idle watchdog", () => {
+  /** A runner that hangs until its AbortSignal fires, then either succeeds
+   *  (after `succeedOnAttempt` prior hangs) or hangs forever. Mirrors the
+   *  shape of a real hung LLM call: never emits an event, so the idle timer
+   *  in runOneStep is never reset and fires on schedule. */
+  function hangingRunner(succeedOnAttempt: number): RoleRunner {
+    let calls = 0;
+    return (params) => {
+      calls += 1;
+      if (calls > succeedOnAttempt) {
+        return fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: allMet("error_file") })(params);
+      }
+      return new Promise((_, reject) => {
+        params.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    };
+  }
+
+  beforeEach(() => {
+    process.env.ORCHESTRA_REQUEST_TIMEOUT_MS = "30";
+    resetConfig();
+  });
+  afterEach(() => {
+    delete process.env.ORCHESTRA_REQUEST_TIMEOUT_MS;
+    resetConfig();
+  });
+
+  it("auto-retries a role call that times out once, then succeeds", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(hangingRunner(1));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    // Reached a normal terminal stage — the timeout was invisible to the outcome.
+    expect(["ready", "review"]).toContain(t.stage);
+    // The timed-out attempt for the first step is never persisted as a role_run,
+    // matching the JSON-parse-error / empty-subtasks retry contract.
+    const firstStepRuns = listRoleRuns(t.task_id).filter((r) => r.role_key === "intake_triage");
+    expect(firstStepRuns.length).toBe(1);
+  });
+
+  it("escalates to REVIEW after exhausting timeout retries, without reading as a user abort", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(hangingRunner(Infinity));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_review");
+    expect(t.review_reason).toContain("timed out");
+    expect(t.review_reason).not.toContain("aborted by user");
+  });
+
+  it("a genuine external abort (e.g. stopScheduler) still reads as aborted by user, not a timeout", async () => {
+    // A generous timeout that would never fire within this test — the abort
+    // here comes from outside the watchdog, simulating stopScheduler()'s
+    // "fire every in-flight AbortController" behavior (abortAllInFlight is the
+    // same abort-every-controller mechanic, minus the start/stop flag dance,
+    // so this test doesn't need to spin up the real scheduler loop).
+    process.env.ORCHESTRA_REQUEST_TIMEOUT_MS = "60000";
+    resetConfig();
+
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    // By the time this runner is invoked, runOneStep has already registered its
+    // AbortController in the module-level activeAborts map (synchronously,
+    // before awaiting the runner) — so calling abortAllInFlight() here reliably
+    // aborts THIS call's own signal, without any race on scheduling internals.
+    setRoleRunner((params) => {
+      abortAllInFlight();
+      return new Promise((_, reject) => {
+        // The abort above happens synchronously — check first in case the
+        // signal already fired before this listener could attach.
+        if (params.signal?.aborted) { reject(new Error("aborted")); return; }
+        params.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "review", 10);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.review_reason).toContain("aborted by user");
+    expect(t.review_reason).not.toContain("timed out");
   });
 });
 

@@ -70,6 +70,10 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .pill.dim { color: var(--ink-dim); }
 .pill.accent { color: var(--accent); border-color: var(--accent); }
 
+.banner { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); font-size: 13px; }
+.banner.human { border-color: var(--human); color: var(--human); background: rgba(209, 145, 60, 0.08); }
+.banner.human a { color: var(--human); }
+
 /* Kanban */
 .kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .kanban .col { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-height: 120px; }
@@ -79,9 +83,19 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .card:hover { border-color: var(--brass); }
 .card .title { font-size: 13px; margin-bottom: 4px; }
 .card .meta { font-size: 11px; color: var(--ink-dim); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.card-root-star { position: absolute; top: 4px; right: 6px; font-size: 14px; color: #f0c040; opacity: 0.85; }
 .card--wont-do { opacity: 0.45; }
 .card--wont-do:hover { opacity: 0.65; }
 .card--related-highlight { background: rgba(201, 162, 75, 0.08); border-color: var(--brass-dim); }
+.card--processing {
+  animation: card-pulse 2.5s ease-in-out infinite;
+}
+@keyframes card-pulse {
+  0%, 100% { background: var(--panel-2); }
+  50% { background: rgba(91, 163, 201, 0.06); }
+}
+/* Table rows can't reliably animate background on <tr> across browsers — apply per-cell. */
+.row--processing td { animation: card-pulse 2.5s ease-in-out infinite; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .dot.warn { background: var(--warn); }
 
@@ -519,6 +533,13 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
   text-decoration: none;
 }
 .project-card--register { grid-column: span 2; }
+.project-card--processing {
+  animation: project-card-pulse 2.5s ease-in-out infinite;
+}
+@keyframes project-card-pulse {
+  0%, 100% { background: var(--panel-2); }
+  50% { background: rgba(201, 162, 75, 0.08); }
+}
 
 /* ---- API calls progress bar on project cards ---- */
 .api-calls-bar {
@@ -752,6 +773,8 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .row.collapsible { cursor: pointer; user-select: none; }
 .row.collapsible:hover { background: rgba(201, 162, 75, 0.06); border-radius: 4px; padding: 2px 4px; margin: -2px -4px; }
 .collapse-caret { font-size: 12px; color: var(--brass); width: 14px; flex-shrink: 0; }
+.panel--expandable { cursor: pointer; }
+.panel--expandable:hover { border-color: var(--brass-dim); }
 
 /* Steering log */
 .steering-log { max-height: 280px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
@@ -1374,7 +1397,11 @@ a.clickable-role:hover {
 
 .task-network-node--active .network-node-card {
   border-color: var(--warn) !important;
-  box-shadow: 0 0 8px rgba(209, 145, 60, 0.3);
+  animation: task-network-node-pulse 1.6s ease-in-out infinite;
+}
+@keyframes task-network-node-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(209, 145, 60, 0.3); }
+  50% { box-shadow: 0 0 14px rgba(209, 145, 60, 0.55); }
 }
 
 .task-network-node--done .network-node-card {
@@ -2073,4 +2100,76 @@ button.review-cta-escape.danger:hover {
   background: var(--panel);
   padding: 2px 8px;
   margin-top: 4px;
+}
+
+/* ---- Total Run Time / Timeline ---- */
+
+.total-run-time {
+  display: inline-flex;
+  align-items: center;
+}
+
+.total-run-time-pill {
+  cursor: pointer;
+  user-select: none;
+}
+
+.total-run-time-pill:hover {
+  border-color: var(--brass);
+  color: var(--brass);
+}
+
+.timeline-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 320px;
+  max-width: 420px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  z-index: 100;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+}
+
+.timeline-bar-container {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--panel-2);
+  gap: 1px;
+}
+
+.timeline-segment {
+  height: 100%;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: filter 0.15s, transform 0.15s;
+  min-width: 3px;
+}
+
+.timeline-segment:hover {
+  filter: brightness(1.4);
+  transform: scaleY(1.3);
+}
+
+.timeline-segment--active {
+  box-shadow: 0 0 4px rgba(201, 162, 75, 0.6);
+  outline: 1px solid rgba(255,255,255,0.3);
+}
+
+.timeline-tooltip {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  min-height: 18px;
+  font-size: 12px;
+}
+
+.timeline-tooltip-role {
+  font-weight: 600;
+  font-size: 13px;
 }

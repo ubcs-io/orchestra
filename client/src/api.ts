@@ -3,6 +3,7 @@
 export interface Project {
   internal_calls?: number;
   external_calls?: number;
+  processing?: boolean;
   id: number;
   name: string;
   repo_path: string;
@@ -53,6 +54,9 @@ export interface Task {
    *  PLANNING artifacts) — see server/src/orchestrator.ts's commitArtifacts call. */
   wrote_source: number | null;
   created_at: string | null;
+  /** JSON array of task ids this task can't be scheduled until reach stage "ready" —
+   *  set by decomposition when a subtask declared `depends_on` on a sibling. */
+  depends_on_json: string | null;
 }
 
 export interface RoleRun {
@@ -86,6 +90,8 @@ export interface RoleRun {
    *  unit. Empty subtasks_json with this unset means the decomposition failed
    *  rather than intentionally concluding there was nothing to break down. */
   no_decomposition_reason: string | null;
+  started_at: string | null;
+  ended_at: string | null;
   created_at: string;
 }
 
@@ -377,6 +383,7 @@ export interface SummaryStats {
   total: number;
   by_stage: Record<string, number>;
   in_flight: number;
+  in_flight_task_ids: string[];
   action_items: number;
   blockers: number;
   paused: number;
@@ -388,6 +395,18 @@ export interface SummaryStats {
     stage: string | null;
     project_id: number | null;
     review_reason: string | null;
+    project_name: string | null;
+  }>;
+  /** Count of tasks parked at stage "review" awaiting a human decision (approve/reset/
+   *  request changes) — a superset of blockers_list, since exit_state is null for some
+   *  review gates (e.g. a failed decomposition) that blockers_list's exit_state filter misses. */
+  review_count: number;
+  review_list: Array<{
+    task_id: string;
+    name: string | null;
+    exit_state: string | null;
+    review_reason: string | null;
+    project_id: number | null;
     project_name: string | null;
   }>;
 }

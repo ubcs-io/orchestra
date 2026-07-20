@@ -30,7 +30,11 @@ export interface Config {
   /** Context window / max output tokens advertised to pi for the local model. */
   contextWindow: number;
   maxTokens: number;
-  /** Per-request timeout (ms) for LLM calls. */
+  /** Idle/heartbeat timeout (ms) for a role's LLM call — enforced in
+   *  orchestrator.ts's runOneStep as a watchdog reset on every streamed event,
+   *  not a flat overall-duration cap, so a long-but-active run never trips it.
+   *  A hang past this window auto-aborts and gets a bounded auto-retry before
+   *  ever escalating to a human. */
   requestTimeoutMs: number;
 
   /**

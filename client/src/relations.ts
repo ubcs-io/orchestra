@@ -61,3 +61,30 @@ export function buildRelationGroups(tasks: Task[]): Map<string, RelationGroup> {
   }
   return groups;
 }
+
+export interface BlockedDep {
+  task_id: string;
+  name: string | null;
+  stage: string | null;
+}
+
+/** Mirrors the server's dependenciesSatisfied() (server/src/orchestrator.ts) — a task
+ *  can't be scheduled until every id in its depends_on_json reaches stage "ready".
+ *  Returns null when the task isn't blocked (no deps, or all satisfied). */
+export function blockedDeps(
+  task: Pick<Task, "depends_on_json">,
+  byId: Map<string, Pick<Task, "task_id" | "name" | "stage">>,
+): BlockedDep[] | null {
+  if (!task.depends_on_json) return null;
+  let ids: string[];
+  try {
+    ids = JSON.parse(task.depends_on_json) as string[];
+  } catch {
+    return null;
+  }
+  const unmet = ids
+    .map((id) => byId.get(id))
+    .filter((dep): dep is Pick<Task, "task_id" | "name" | "stage"> => !!dep && dep.stage !== "ready")
+    .map((dep) => ({ task_id: dep.task_id, name: dep.name, stage: dep.stage }));
+  return unmet.length > 0 ? unmet : null;
+}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, STAGES, type Plan, type Task } from "../api";
-import { buildRelationGroups, type RelationGroup } from "../relations";
+import { buildRelationGroups, blockedDeps, type RelationGroup, type BlockedDep } from "../relations";
 import { ModelBubble } from "../components/ModelBubble";
 import { GitHubBubble } from "../components/GitHubBubble";
 import { rolesWithWriteTools, taskWriteCapability, type WriteCapability } from "../writeCapability";
@@ -25,23 +25,29 @@ function TaskCard({
   hovered,
   onHover,
   cap,
+  isProcessing,
+  blockedOn,
 }: {
   task: Task;
   group?: RelationGroup;
   hovered: boolean;
   onHover: (rootId: string | null) => void;
   cap: WriteCapability;
+  isProcessing?: boolean;
+  blockedOn?: BlockedDep[] | null;
 }) {
   const isWontDo = task.exit_state === "wont_do";
+  const isRoot = !!(group && group.rootId === task.task_id);
   return (
     <Link
       to="/tasks/$taskId"
       params={{ taskId: task.task_id }}
-      className={`card${isWontDo ? " card--wont-do" : ""}${hovered ? " card--related-highlight" : ""}`}
-      style={{ display: "block", color: "inherit" }}
+      className={`card${isWontDo ? " card--wont-do" : ""}${hovered ? " card--related-highlight" : ""}${isProcessing ? " card--processing" : ""}`}
+      style={{ display: "block", color: "inherit", position: "relative" }}
       onMouseEnter={() => group && onHover(group.rootId)}
       onMouseLeave={() => group && onHover(null)}
     >
+      {isRoot && <span className="card-root-star" title="Primary task">★</span>}
       <div className="title">{task.name ?? task.task_id.slice(0, 8)}</div>
       <div className="meta">
         {group && <span className="dot" style={{ background: group.color }} title="part of a related task family" />}
@@ -60,6 +66,14 @@ function TaskCard({
             {task.exit_state.replace(/_/g, " ")}
           </span>
         )}
+        {blockedOn && blockedOn.length > 0 && (
+          <span
+            className="pill dim"
+            title={`waiting on: ${blockedOn.map((d) => `${d.name ?? d.task_id.slice(0, 8)} (${d.stage})`).join(", ")}`}
+          >
+            blocked
+          </span>
+        )}
       </div>
     </Link>
   );
@@ -71,6 +85,7 @@ export function ProjectBoard() {
   const qc = useQueryClient();
   const projectQ = useQuery({ queryKey: ["project", pid], queryFn: () => api.project(pid) });
   const tasksQ = useQuery({ queryKey: ["tasks", pid], queryFn: () => api.tasks(pid), refetchInterval: 3000 });
+  const summaryQ = useQuery({ queryKey: ["summary"], queryFn: api.summary, refetchInterval: 10_000, staleTime: 5_000 });
 
   const [content, setContent] = useState("");
   const [name, setName] = useState("");
@@ -118,6 +133,13 @@ export function ProjectBoard() {
     return map;
   }, [tasksQ.data, projectQ.data?.roles, harnessPolicyQ.data?.policy.allowWrite]);
 
+  const activeTaskIds = useMemo(() => new Set(summaryQ.data?.in_flight_task_ids ?? []), [summaryQ.data]);
+  const tasksById = useMemo(() => new Map((tasksQ.data?.tasks ?? []).map((t) => [t.task_id, t])), [tasksQ.data]);
+  const reviewList = useMemo(
+    () => (summaryQ.data?.review_list ?? []).filter((r) => r.project_id === pid),
+    [summaryQ.data, pid],
+  );
+
   return (
     <div>
       <div className="row" style={{ marginBottom: 12 }}>
@@ -134,6 +156,18 @@ export function ProjectBoard() {
         <div className="spacer" style={{ flex: 1 }} />
         <Link to="/projects/$projectId/roles" params={{ projectId }}>edit roles →</Link>
       </div>
+
+      {reviewList.length > 0 && (
+        <div className="banner human" style={{ marginBottom: 12 }}>
+          {reviewList.length} task{reviewList.length === 1 ? "" : "s"} need{reviewList.length === 1 ? "s" : ""} your review:{" "}
+          {reviewList.map((r, i) => (
+            <span key={r.task_id}>
+              {i > 0 && ", "}
+              <Link to="/tasks/$taskId" params={{ taskId: r.task_id }}>{r.name ?? r.task_id.slice(0, 8)}</Link>
+            </span>
+          ))}
+        </div>
+      )}
 
       <div className="panel">
         <h2>New intake</h2>
@@ -183,6 +217,8 @@ export function ProjectBoard() {
                     hovered={!!group && hoveredGroup === group.rootId}
                     onHover={setHoveredGroup}
                     cap={capsByTaskId.get(t.task_id) ?? "pending"}
+                    isProcessing={activeTaskIds.has(t.task_id)}
+                    blockedOn={blockedDeps(t, tasksById)}
                   />
                 );
               })}
@@ -191,7 +227,13 @@ export function ProjectBoard() {
         ))}
       </div>
 
-      <TaskListTable tasks={tasksQ.data?.tasks ?? []} relationGroups={relationGroups} capsByTaskId={capsByTaskId} />
+      <TaskListTable
+        tasks={tasksQ.data?.tasks ?? []}
+        relationGroups={relationGroups}
+        capsByTaskId={capsByTaskId}
+        activeTaskIds={activeTaskIds}
+        tasksById={tasksById}
+      />
     </div>
   );
 }
@@ -207,10 +249,14 @@ function TaskListTable({
   tasks,
   relationGroups,
   capsByTaskId,
+  activeTaskIds,
+  tasksById,
 }: {
   tasks: Task[];
   relationGroups: Map<string, RelationGroup>;
   capsByTaskId: Map<string, WriteCapability>;
+  activeTaskIds: Set<string>;
+  tasksById: Map<string, Task>;
 }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState(ALL);
@@ -290,14 +336,16 @@ function TaskListTable({
             {th("intake_kind", "Kind")}
             <th style={{ whiteSpace: "nowrap" }}>Mode</th>
             {th("exit_state", "Exit State")}
+            <th style={{ whiteSpace: "nowrap" }}>Blocked</th>
             {th("created_at", "Created")}
           </tr>
         </thead>
         <tbody>
           {rows.map((t) => {
             const group = relationGroups.get(t.task_id);
+            const blocked = blockedDeps(t, tasksById);
             return (
-              <tr key={t.task_id}>
+              <tr key={t.task_id} className={activeTaskIds.has(t.task_id) ? "row--processing" : ""}>
                 <td>
                   <span className="dot" style={{ background: group ? group.color : "transparent", marginRight: 6 }} title={group ? "part of a related task family" : undefined} />
                   <Link to="/tasks/$taskId" params={{ taskId: t.task_id }}>{t.name ?? t.task_id.slice(0, 8)}</Link>
@@ -314,6 +362,16 @@ function TaskListTable({
                   })()}
                 </td>
                 <td>{t.exit_state ?? "—"}</td>
+                <td>
+                  {blocked && blocked.length > 0 && (
+                    <span
+                      className="pill dim"
+                      title={`waiting on: ${blocked.map((d) => `${d.name ?? d.task_id.slice(0, 8)} (${d.stage})`).join(", ")}`}
+                    >
+                      blocked
+                    </span>
+                  )}
+                </td>
                 <td>{t.created_at ?? "—"}</td>
               </tr>
             );

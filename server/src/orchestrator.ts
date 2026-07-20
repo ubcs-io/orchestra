@@ -57,6 +57,7 @@ import {
 } from "./git.js";
 import {
   CONCERN_TAXONOMY,
+  EXECUTION_FLOW_TEMPLATE,
   EXIT_KIND_BY_INTAKE,
   flowForIntake,
   isCritiqueExempt,
@@ -173,6 +174,11 @@ export interface EdgeEvaluationContext {
  *  If the task has a custom network_id, resolve criteria, reviewer, rigor,
  *  mandatoryConcerns, and maxLoopbacks from the stored graph. */
 function flowForTask(task: TaskRow): FlowTemplate {
+  // An atomic decomposition leaf routed straight to implementation — see
+  // createDecompositionChildren. Independent of intake_kind/network_id: it's
+  // scoped by the parent's decomposition, not re-planned.
+  if ((task.exit_kind as ExitKind) === "code_change") return EXECUTION_FLOW_TEMPLATE;
+
   const base = flowForIntake((task.intake_kind as IntakeKind) || "manual");
   if (!task.network_id) return base;
 
@@ -1028,6 +1034,24 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   let result;
   const ac = new AbortController();
   activeAborts.set(task.task_id, ac);
+  // Idle/heartbeat watchdog: a role can legitimately run long while actively
+  // streaming (many tool calls, deep reasoning) — the actual failure mode this
+  // guards against is a call that hangs with zero output at all (dead
+  // connection, provider outage), which the content-based stall detector in
+  // agent.ts can never catch since it only reacts to received stream events.
+  // Reset on every event; if none arrive for a full `requestTimeoutMs` window,
+  // abort so the bounded-retry path below gets a chance to recover instead of
+  // wedging the task until a process restart.
+  let timedOut = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const armIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, connection.requestTimeoutMs);
+  };
+  armIdleTimer();
   try {
     result = await roleRunner({
       repoPath,
@@ -1043,7 +1067,10 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       thinkingBudgets: connection.thinkingBudgets,
       connection,
       harnessPolicy,
-      onEvent: (ev) => publish(task.task_id, ev.type as never, sanitizeEventData(ev)),
+      onEvent: (ev) => {
+        armIdleTimer();
+        publish(task.task_id, ev.type as never, sanitizeEventData(ev));
+      },
       signal: ac.signal,
     });
   } catch (err) {
@@ -1091,6 +1118,45 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       );
     }
 
+    // A watchdog-triggered abort is a transient infra hiccup, not a human
+    // hitting stop — give it the same bounded auto-retry the JSON-parse-error
+    // case gets (same shared `step.attempts` counter/budget) before ever
+    // escalating to a human, and make sure it never reads as "aborted by
+    // user" below if it does.
+    if (timedOut) {
+      const retryCount = step.attempts ?? 0;
+      if (retryCount < 2) {
+        console.warn(
+          `[orchestrator] role ${step.role} timed out (idle > ${connection.requestTimeoutMs}ms, ` +
+            `attempt ${retryCount + 1}/2) — re-queuing`,
+        );
+        step.status = "pending";
+        step.attempts = retryCount + 1;
+        createIntervention({
+          task_id: task.task_id,
+          kind: "steer_note",
+          payload_json: JSON.stringify({
+            text:
+              `[orchestrator·retry] The previous attempt stopped responding (no output for over ` +
+              `${Math.round(connection.requestTimeoutMs / 1000)}s) and was aborted. Please retry the task from the beginning.`,
+          }),
+          created_by: "orchestrator",
+        });
+        updateTask(task.task_id, {
+          refinement_plan_json: JSON.stringify(plan),
+          stage: "refining",
+          paused: 0,
+        });
+        publish(task.task_id, "task_update", {
+          stage: "refining",
+          retryReason: "timeout",
+          attempt: retryCount + 1,
+        });
+        return;
+      }
+      console.warn(`[orchestrator] role ${step.role} timed out after ${retryCount} retries — escalating`);
+    }
+
     publish(task.task_id, "role_end", { role: step.role, error: true, aborted, model: modelId });
 
     // A connection drop mid-run is an infra problem, not a content/reasoning
@@ -1111,9 +1177,11 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       task_id: task.task_id,
       role_key: step.role,
       verdict: aborted ? "needs_human" : "blocker",
-      summary: aborted
-        ? `Role ${step.role} was aborted by user.`
-        : `Role execution failed: ${msg}`,
+      summary: timedOut
+        ? `Role ${step.role} timed out repeatedly (idle > ${connection.requestTimeoutMs}ms).`
+        : aborted
+          ? `Role ${step.role} was aborted by user.`
+          : `Role execution failed: ${msg}`,
       depth: step.depth,
       model: modelId,
     });
@@ -1122,14 +1190,17 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       refinement_plan_json: JSON.stringify(plan),
       stage: "review",
       exit_state: "needs_review",
-      review_reason: aborted
-        ? `Role ${step.role} was aborted by user — task needs human judgement.`
-        : `Role ${step.role} failed: ${msg}`,
+      review_reason: timedOut
+        ? `Role ${step.role} timed out repeatedly (idle > ${connection.requestTimeoutMs}ms) — needs human judgement.`
+        : aborted
+          ? `Role ${step.role} was aborted by user — task needs human judgement.`
+          : `Role ${step.role} failed: ${msg}`,
       status: "failed",
     });
     publish(task.task_id, "task_update", { stage: "review" });
     return;
   } finally {
+    if (idleTimer) clearTimeout(idleTimer);
     activeAborts.delete(task.task_id);
   }
 
@@ -2217,6 +2288,43 @@ async function applyGate(
       }
     }
 
+    // An atomic execution leaf: `critic` passing means the code (if any was
+    // written — see the developer role's write/edit tools gate) is ready for a
+    // human to review and merge, not "ready for work" like a spec terminus.
+    // Unlike the generic path below, this never auto-reconciles the branch —
+    // merging only happens via the explicit "approve_merge" intervention
+    // (see the /api/tasks/:id/interventions route), regardless of whether
+    // wrote_source ended up true.
+    if ((task.exit_kind as ExitKind) === "code_change") {
+      const destCC = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}READY${path.sep}`);
+      moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, destCC));
+      updateTask(task.task_id, {
+        refinement_plan_json: JSON.stringify(plan),
+        coverage_json: coverageJson,
+        stage: "review",
+        exit_state: "needs_merge_approval",
+        review_reason: task.wrote_source
+          ? "Code written — awaiting human review before merge."
+          : "Developer role ran without write/edit tools (dry-run) — review the described change before merge.",
+        artifact_path: destCC,
+        reconcile_status: "pending_human_merge",
+        reconcile_detail: task.wrote_source ? null : "no write/edit tools granted — nothing was committed",
+      });
+      commitArtifacts(repoPath, [relArtifact, destCC], `review: ${task.name ?? task.task_id}`);
+      triggerRecap(coverage, criteriaResults);
+      if (task.git_base_branch) {
+        try {
+          checkoutBranch(project.repo_path, task.git_base_branch);
+        } catch (err) {
+          console.warn(
+            `[git] could not return to base branch "${task.git_base_branch}" after finishing ${task.task_id.slice(0, 8)}: ${(err as Error).message}`,
+          );
+        }
+      }
+      publish(task.task_id, "task_update", { stage: "review", exit_state: "needs_merge_approval" });
+      return;
+    }
+
     const dest = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}READY${path.sep}`);
     moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, dest));
     updateTask(task.task_id, {
@@ -2443,6 +2551,11 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
       }),
     );
     const content = sections.join("\n\n");
+    // A fully-scoped atomic leaf skips straight to the developer/critic
+    // execution flow instead of re-entering planning (see flowForTask /
+    // runTaskStepOnce). Only honored on a "task"-level node — epics/stories
+    // always need their own decomposition pass regardless of what the model set.
+    const isExecutionLeaf = node.level === "task" && node.execution_ready === true;
 
     let child = createTask({
       name: node.name,
@@ -2451,7 +2564,7 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
       stage: "intake",
       level: node.level,
       intake_kind: task.intake_kind ?? "manual",
-      exit_kind: task.exit_kind ?? "spec",
+      exit_kind: isExecutionLeaf ? "code_change" : task.exit_kind ?? "spec",
       parent_task_id: task.task_id,
       task_type: "child",
       step_number: step++,
@@ -2589,9 +2702,16 @@ async function runTaskStepOnce(taskId: string): Promise<void> {
   let plan = readPlan(task);
   if (!plan) {
     const intakeKind = (task.intake_kind as IntakeKind) || "manual";
-    plan = planFromTemplate(intakeKind, task.network_id);
-    // Fold any promoted project roles for this kind into the plan.
-    plan = withPromotedRoles(project, task, plan);
+    // An atomic decomposition leaf (exit_kind "code_change") skips intake/
+    // network-based planning entirely — it's already scoped by its parent.
+    const isExecutionLeaf = (task.exit_kind as ExitKind) === "code_change";
+    plan = isExecutionLeaf
+      ? { steps: EXECUTION_FLOW_TEMPLATE.steps.map((role) => ({ role, status: "pending" as const, depth: 1 })) }
+      : planFromTemplate(intakeKind, task.network_id);
+    // Fold any promoted project roles for this kind into the plan — skipped for
+    // an execution leaf, whose minimal developer/critic flow is deliberate,
+    // not the inherited intake_kind's usual planning role set.
+    if (!isExecutionLeaf) plan = withPromotedRoles(project, task, plan);
     updateTask(task.task_id, {
       refinement_plan_json: JSON.stringify(plan),
       stage: "refining",
@@ -2750,6 +2870,60 @@ export function reincorporateAnswer(taskId: string, question: string, answer: st
   return serializeTask(taskId, () => doReincorporateAnswer(taskId, question, answer));
 }
 
+/**
+ * Human approval of an atomic execution leaf's code-review gate (exit_kind
+ * "code_change", exit_state "needs_merge_approval"). Deliberately does NOT
+ * merge anything itself — the branch is reviewed and merged via the existing
+ * diff/GitHub-PR flow (DiffPanel, gated on reconcile_status ===
+ * "pending_human_merge" independent of stage), the same path any other
+ * wrote_source task already uses. This just records that a human has done so
+ * (or accepted a no-op dry run) and closes out the task.
+ */
+export function approveCodeChangeMerge(taskId: string): void {
+  const task = getTask(taskId);
+  if (!task || task.stage !== "review" || task.exit_state !== "needs_merge_approval") return;
+  updateTask(taskId, {
+    stage: "ready",
+    exit_state: "ready_for_work",
+    review_reason: null,
+    status: "complete",
+  });
+  publish(taskId, "task_update", { stage: "ready" });
+}
+
+/**
+ * Human requested changes on an atomic execution leaf's code-review gate:
+ * reopen `developer` and `critic` for another pass instead of escalating
+ * further, mirroring the reviewer-gate loop-back in runOneStep but triggered
+ * explicitly by a human rather than an unmet criterion (this flow has none).
+ */
+export function requestCodeChanges(taskId: string, note?: string): void {
+  const task = getTask(taskId);
+  if (!task || task.stage !== "review" || task.exit_state !== "needs_merge_approval") return;
+  const plan = readPlan(task);
+  if (!plan) return;
+  for (const s of plan.steps) {
+    if (s.role === "developer" || s.role === "critic") s.status = "pending";
+  }
+  if (note?.trim()) {
+    createIntervention({
+      task_id: taskId,
+      kind: "steer_note",
+      payload_json: JSON.stringify({ text: `[human review] Requested changes: ${note.trim()}` }),
+      created_by: "user",
+    });
+  }
+  updateTask(taskId, {
+    refinement_plan_json: JSON.stringify(plan),
+    stage: "refining",
+    exit_state: null,
+    review_reason: null,
+    reconcile_status: null,
+    reconcile_detail: null,
+  });
+  publish(taskId, "task_update", { stage: "refining" });
+}
+
 async function doReincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
   const task = getTask(taskId);
   if (!task || task.stage !== "review") return; // manual restore required first once "ready"
@@ -2896,12 +3070,25 @@ export function stopScheduler(): void {
   for (const ac of activeAborts.values()) ac.abort();
 }
 
+/** Test seam: aborts every in-progress role call without touching the
+ *  start/stop flags — lets a test simulate "something external aborted this
+ *  call" (the real-world stopScheduler() case) without spinning up the actual
+ *  scheduler loop via startScheduler(). */
+export function abortAllInFlight(): void {
+  for (const ac of activeAborts.values()) ac.abort();
+}
+
 export function isSchedulerRunning(): boolean {
   return !stopped && !stopping;
 }
 
 export function isSchedulerStopping(): boolean {
   return stopping;
+}
+
+/** List of task IDs currently being processed by the scheduler loop. */
+export function activeTaskIds(): string[] {
+  return Array.from(inFlightTasks.keys());
 }
 
 function sleep(ms: number): Promise<void> {
