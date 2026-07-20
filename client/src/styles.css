@@ -2102,35 +2102,14 @@ button.review-cta-escape.danger:hover {
   margin-top: 4px;
 }
 
-/* ---- Total Run Time / Timeline ---- */
+/* ---- Role Timeline sidebar card ---- */
 
-.total-run-time {
-  display: inline-flex;
-  align-items: center;
+.timeline-sidebar-card {
+  /* squished flat — minimal vertical space */
 }
 
-.total-run-time-pill {
-  cursor: pointer;
-  user-select: none;
-}
-
-.total-run-time-pill:hover {
-  border-color: var(--brass);
-  color: var(--brass);
-}
-
-.timeline-popover {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  min-width: 320px;
-  max-width: 420px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 10px 12px;
-  z-index: 100;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+.timeline-sidebar-card h2 {
+  margin-bottom: 8px;
 }
 
 .timeline-bar-container {
@@ -2147,7 +2126,7 @@ button.review-cta-escape.danger:hover {
   border-radius: 2px;
   cursor: pointer;
   transition: filter 0.15s, transform 0.15s;
-  min-width: 3px;
+  min-width: 6px;
 }
 
 .timeline-segment:hover {
@@ -2172,4 +2151,12 @@ button.review-cta-escape.danger:hover {
 .timeline-tooltip-role {
   font-weight: 600;
   font-size: 13px;
+}
+
+/* ---- Stopped indicator pill (header) ---- */
+
+.stopped-indicator {
+  color: var(--ink-dim) !important;
+  border-color: var(--ink-dim);
+  font-size: 11px;
 }

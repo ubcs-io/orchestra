@@ -142,10 +142,22 @@ function buildTimelineSegments(runs: RoleRun[]): TimelineSegment[] {
   const segments: TimelineSegment[] = [];
   let current: TimelineSegment | null = null;
 
-  for (const run of primary) {
+  for (let i = 0; i < primary.length; i++) {
+    const run = primary[i]!;
     // Use started_at / ended_at if available; fall back to created_at
     const startedAt = run.started_at ? new Date(run.started_at).getTime() : new Date(run.created_at).getTime();
-    const endedAt = run.ended_at ? new Date(run.ended_at).getTime() : startedAt;
+    let endedAt = run.ended_at ? new Date(run.ended_at).getTime() : 0;
+
+    // If no ended_at, borrow the next run's start as the boundary so this
+    // segment shows meaningful width instead of collapsing to zero.
+    if (!run.ended_at && i + 1 < primary.length) {
+      const nextRun = primary[i + 1]!;
+      endedAt = nextRun.started_at
+        ? new Date(nextRun.started_at).getTime()
+        : new Date(nextRun.created_at).getTime();
+    }
+    // Last run with no ended_at — can't borrow, keep it as a sliver
+    if (endedAt === 0) endedAt = startedAt;
 
     // If same role as previous, bundle
     if (current && current.roleKey === run.role_key) {
@@ -183,30 +195,16 @@ function roleColor(roleKey: string): string {
   return palette[Math.abs(hash) % palette.length] ?? palette[0]!;
 }
 
-function TotalRunTime({ runs, activeRunRole }: { runs: RoleRun[]; activeRunRole: string | null }) {
-  const [open, setOpen] = useState(false);
+function TimelineSidebarCard({ runs, activeRunRole }: { runs: RoleRun[]; activeRunRole: string | null }) {
   const [hovered, setHovered] = useState<TimelineSegment | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
 
   const segments = useMemo(() => buildTimelineSegments(runs), [runs]);
 
-  // Compute total: first segment start → last segment end
+  // Compute total: sum of all segment durations (fills bar completely, no dead tail)
   const totalMs = useMemo(() => {
     if (segments.length === 0) return 0;
-    return segments[segments.length - 1]!.endedAt - segments[0]!.startedAt;
+    return segments.reduce((sum, seg) => sum + seg.durationMs, 0);
   }, [segments]);
-
-  // Close on outside click
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as HTMLElement)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
 
   if (segments.length === 0) return null;
 
@@ -218,64 +216,52 @@ function TotalRunTime({ runs, activeRunRole }: { runs: RoleRun[]; activeRunRole:
       const el = document.getElementById(`run-${run.role_key}`);
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "start" });
-        setOpen(false);
       }
     }
   };
 
   return (
-    <div className="total-run-time" ref={containerRef} style={{ position: "relative" }}>
-      <button
-        className="pill dim total-run-time-pill"
-        onClick={() => setOpen(!open)}
-        title="Click to see role timeline"
-      >
-        {formatDuration(totalMs)}
-      </button>
+    <div className="panel timeline-sidebar-card">
+      <h2>Role Timeline · {formatDuration(totalMs)}</h2>
 
-      {open && (
-        <div className="timeline-popover">
-          <div className="timeline-bar-container">
-            {segments.map((seg, i) => {
-              const pct = totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
-              const isActive = activeRunRole === seg.roleKey;
-              return (
-                <div
-                  key={i}
-                  className={`timeline-segment ${isActive ? "timeline-segment--active" : ""}`}
-                  style={{
-                    width: `${pct}%`,
-                    backgroundColor: roleColor(seg.roleKey),
-                  }}
-                  onMouseEnter={() => setHovered(seg)}
-                  onMouseLeave={() => setHovered(null)}
-                  onClick={() => handleSegmentClick(seg)}
-                  title={`${seg.roleKey}: ${formatDuration(seg.durationMs)}`}
-                />
-              );
-            })}
-          </div>
+      <div className="timeline-bar-container">
+        {segments.map((seg, i) => {
+          const pct = totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
+          const isActive = activeRunRole === seg.roleKey;
+          return (
+            <div
+              key={i}
+              className={`timeline-segment ${isActive ? "timeline-segment--active" : ""}`}
+              style={{
+                width: `${pct}%`,
+                backgroundColor: roleColor(seg.roleKey),
+              }}
+              onMouseEnter={() => setHovered(seg)}
+              onClick={() => handleSegmentClick(seg)}
+              title={`${seg.roleKey}: ${formatDuration(seg.durationMs)}`}
+            />
+          );
+        })}
+      </div>
 
-          <div className="timeline-tooltip">
-            {hovered ? (
-              <>
-                <span className="timeline-tooltip-role" style={{ color: roleColor(hovered.roleKey) }}>
-                  {hovered.roleKey}
-                </span>
-                <span className="muted">{formatDuration(hovered.durationMs)}</span>
-                <span className="muted" style={{ fontSize: 10 }}>
-                  {new Date(hovered.startedAt).toLocaleTimeString()} – {new Date(hovered.endedAt).toLocaleTimeString()}
-                </span>
-                {hovered.runIds.length > 1 && (
-                  <span className="pill dim" style={{ fontSize: 10 }}>{hovered.runIds.length} runs</span>
-                )}
-              </>
-            ) : (
-              <span className="muted" style={{ fontSize: 11 }}>Hover a segment</span>
+      <div className="timeline-tooltip">
+        {hovered ? (
+          <>
+            <span className="timeline-tooltip-role" style={{ color: roleColor(hovered.roleKey) }}>
+              {hovered.roleKey}
+            </span>
+            <span className="muted">{formatDuration(hovered.durationMs)}</span>
+            <span className="muted" style={{ fontSize: 10 }}>
+              {new Date(hovered.startedAt).toLocaleTimeString()} – {new Date(hovered.endedAt).toLocaleTimeString()}
+            </span>
+            {hovered.runIds.length > 1 && (
+              <span className="pill dim" style={{ fontSize: 10 }}>{hovered.runIds.length} runs</span>
             )}
-          </div>
-        </div>
-      )}
+          </>
+        ) : (
+          <span className="muted" style={{ fontSize: 11 }}>Hover a segment</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -1623,7 +1609,17 @@ export function TaskDetail() {
             blocked
           </span>
         )}
-        <TotalRunTime runs={d.runs} activeRunRole={activity.currentRole} />
+        {(t.stage === "ready" || t.stage === "review") && (() => {
+          const primaryRuns = d.runs.filter((r) => !r.run_kind || r.run_kind === "primary");
+          const lastRun = primaryRuns[primaryRuns.length - 1];
+          if (!lastRun?.ended_at) return null;
+          const finishedMs = Date.now() - new Date(lastRun.ended_at).getTime();
+          const finishedHrs = finishedMs / 3600000;
+          const label = finishedHrs >= 1
+            ? `Stopped ${finishedHrs.toFixed(1)} Hours Ago`
+            : `Stopped ${Math.floor(finishedMs / 60000)}m Ago`;
+          return <span className="pill dim stopped-indicator">{label}</span>;
+        })()}
         {writeCap === "acting" && (
           <span className="pill accent" title="This task's plan includes a role with write/edit tools, in a write-enabled project">acting</span>
         )}
@@ -2004,6 +2000,9 @@ export function TaskDetail() {
               onMutate={refresh}
             />
           )}
+
+          {/* Role timeline card — always visible when there are runs */}
+          <TimelineSidebarCard runs={d.runs} activeRunRole={activity.currentRole} />
 
           {/* Current state panel — shown whenever there's meaningful state */}
           {(activity.currentRole || activity.lastRole) && (
