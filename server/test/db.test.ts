@@ -11,6 +11,8 @@ import {
   createProject,
   createRoleRun,
   createTask,
+  familyMembersExcluding,
+  familyRootId,
   getDb,
   getGlobalConfig,
   getProject,
@@ -107,6 +109,66 @@ describe("tasks CRUD", () => {
     const parent = createTask({ name: "epic" });
     createTask({ name: "child", parent_task_id: parent.task_id, level: "task" });
     expect(listTasks({ parentTaskId: parent.task_id }).length).toBe(1);
+  });
+});
+
+describe("worktree families (root_task_id)", () => {
+  it("a brand-new task self-references as its own family root", () => {
+    freshDb();
+    const t = createTask({ name: "solo" });
+    expect(t.root_task_id).toBe(t.task_id);
+    expect(familyRootId(t)).toBe(t.task_id);
+  });
+
+  it("a child inherits its parent's resolved root, at any depth, with no chain-walking", () => {
+    freshDb();
+    const root = createTask({ name: "epic" });
+    const child = createTask({ name: "story", parent_task_id: root.task_id, task_type: "child" });
+    const grandchild = createTask({ name: "task", parent_task_id: child.task_id, task_type: "child" });
+    expect(child.root_task_id).toBe(root.task_id);
+    // Copied straight from the parent's already-resolved value, not walked.
+    expect(grandchild.root_task_id).toBe(root.task_id);
+    expect(familyRootId(grandchild)).toBe(root.task_id);
+  });
+
+  it("a legacy task (root_task_id null) resolves its own id as root and doesn't share a family with new children", () => {
+    freshDb();
+    const legacyRoot = createTask({ name: "predates the column" });
+    updateTask(legacyRoot.task_id, {}); // no-op, just ensures the row round-trips
+    // Simulate a pre-migration row directly, since createTask always sets it now.
+    getDb().prepare("UPDATE tasks SET root_task_id = NULL WHERE task_id = ?").run(legacyRoot.task_id);
+    const stale = getTask(legacyRoot.task_id)!;
+    expect(familyRootId(stale)).toBe(stale.task_id);
+
+    const child = createTask({ name: "new child of a legacy parent", parent_task_id: stale.task_id, task_type: "child" });
+    // getTask(parent)?.root_task_id is null, so the child gets its own
+    // standalone family too — no retroactive sharing with the legacy parent.
+    expect(child.root_task_id).toBeNull();
+    expect(familyRootId(child)).toBe(child.task_id);
+  });
+
+  it("listTasks({rootTaskId}) returns every family member, including the root's own row", () => {
+    freshDb();
+    const root = createTask({ name: "epic" });
+    const childA = createTask({ name: "a", parent_task_id: root.task_id, task_type: "child" });
+    const childB = createTask({ name: "b", parent_task_id: root.task_id, task_type: "child" });
+    const other = createTask({ name: "unrelated" });
+
+    const family = listTasks({ rootTaskId: root.task_id }).map((t) => t.task_id).sort();
+    expect(family).toEqual([root.task_id, childA.task_id, childB.task_id].sort());
+    expect(family).not.toContain(other.task_id);
+  });
+
+  it("familyMembersExcluding omits the task itself but includes every other family member", () => {
+    freshDb();
+    const root = createTask({ name: "epic" });
+    const child = createTask({ name: "child", parent_task_id: root.task_id, task_type: "child" });
+
+    expect(familyMembersExcluding(root).map((t) => t.task_id)).toEqual([child.task_id]);
+    expect(familyMembersExcluding(child).map((t) => t.task_id)).toEqual([root.task_id]);
+    // Solo task: no siblings.
+    const solo = createTask({ name: "solo" });
+    expect(familyMembersExcluding(solo)).toEqual([]);
   });
 });
 

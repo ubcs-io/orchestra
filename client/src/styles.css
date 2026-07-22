@@ -85,8 +85,107 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .card .meta { font-size: 11px; color: var(--ink-dim); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .card-root-star { position: absolute; top: 4px; right: 6px; font-size: 14px; color: #f0c040; opacity: 0.85; }
 .card--wont-do { opacity: 0.45; }
-.card--wont-do:hover { opacity: 0.65; }
-.card--related-highlight { background: rgba(201, 162, 75, 0.08); border-color: var(--brass-dim); }
+.card--wont-do:hover { opacity: 0.65; border-color: var(--brass); }
+.card--related-highlight {
+  background: linear-gradient(rgba(201, 162, 75, 0.08), rgba(201, 162, 75, 0.08)), var(--panel-2);
+  border-color: var(--brass-dim);
+}
+.card--cleanup-mode {
+  border-color: var(--warn);
+  border-style: dashed;
+}
+.card--cleanup-mode:hover {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.08);
+}
+.card--selected {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.12);
+}
+.card--selected:hover {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.18);
+}
+.card-checkmark {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  color: var(--bad);
+  font-weight: bold;
+}
+.row--selected td {
+  background: rgba(204, 91, 91, 0.08);
+}
+.trash-icon {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: border-color 0.15s, background 0.15s;
+}
+.trash-icon:hover {
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.12);
+}
+.trash-icon--active {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.12);
+}
+.trash-icon--active:hover {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.2);
+}
+.cleanup-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(204, 91, 91, 0.08);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--bad);
+}
+.archived-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.archived-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  color: var(--ink-dim);
+  transition: background 0.15s;
+}
+.archived-header:hover {
+  background: rgba(201, 162, 75, 0.06);
+}
+.archived-caret {
+  font-size: 12px;
+  color: var(--brass);
+  width: 14px;
+  flex-shrink: 0;
+}
+.archived-cards {
+  padding: 4px 12px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.archived-cards .card {
+  flex: 0 0 auto;
+  width: 200px;
+}
 .card--processing {
   animation: card-pulse 2.5s ease-in-out infinite;
 }
@@ -2101,6 +2200,40 @@ button.review-cta-escape.danger:hover {
   padding: 2px 8px;
   margin-top: 4px;
 }
+
+/* ---- Worktree kanban + file tree / diff master-detail ---- */
+
+.card--button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+}
+
+.file-tree { font-size: 12px; }
+.file-tree-dir,
+.file-tree-leaf {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 3px 10px;
+  text-align: left;
+  color: var(--ink);
+  cursor: pointer;
+}
+.file-tree-dir:hover,
+.file-tree-leaf:hover { background: var(--panel-2); border-color: transparent; }
+.file-tree-caret { width: 10px; flex-shrink: 0; color: var(--ink-dim); }
+.file-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-leaf.selected { background: rgba(201, 162, 75, 0.12); color: var(--brass); }
+
+.worktree-detail-body { display: flex; gap: 12px; margin-top: 12px; align-items: flex-start; }
+.worktree-detail-tree { width: 260px; flex-shrink: 0; max-height: 70vh; overflow-y: auto; padding: 6px 0; }
+.worktree-detail-diff { flex: 1; min-width: 0; max-height: 70vh; overflow-y: auto; }
 
 /* ---- Role Timeline sidebar card ---- */
 

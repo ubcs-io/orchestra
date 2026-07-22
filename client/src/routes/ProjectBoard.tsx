@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, STAGES, type Plan, type Task } from "../api";
-import { buildRelationGroups, blockedDeps, type RelationGroup, type BlockedDep } from "../relations";
+import { buildRelationGroups, blockedDeps, buildWorktreeFamilies, type RelationGroup, type BlockedDep } from "../relations";
 import { ModelBubble } from "../components/ModelBubble";
 import { GitHubBubble } from "../components/GitHubBubble";
+import { WorktreeKanban } from "../components/WorktreeKanban";
+import { WorktreeDetailPane } from "../components/WorktreeDetailPane";
 import { rolesWithWriteTools, taskWriteCapability, type WriteCapability } from "../writeCapability";
 
 function planProgress(task: Task): string {
@@ -27,6 +29,9 @@ function TaskCard({
   cap,
   isProcessing,
   blockedOn,
+  isCleanupMode,
+  isSelected,
+  onToggleSelect,
 }: {
   task: Task;
   group?: RelationGroup;
@@ -35,19 +40,73 @@ function TaskCard({
   cap: WriteCapability;
   isProcessing?: boolean;
   blockedOn?: BlockedDep[] | null;
+  isCleanupMode?: boolean;
+  isSelected?: boolean;
+  onToggleSelect?: (taskId: string) => void;
 }) {
   const isWontDo = task.exit_state === "wont_do";
-  const isRoot = !!(group && group.rootId === task.task_id);
+
+  // In cleanup mode, clicking the card selects/deselects instead of navigating
+  const className = [
+    "card",
+    isWontDo ? "card--wont-do" : "",
+    hovered ? "card--related-highlight" : "",
+    isProcessing ? "card--processing" : "",
+    isCleanupMode ? "card--cleanup-mode" : "",
+    isSelected ? "card--selected" : "",
+  ]
+    .filter(Boolean)
+    .join("");
+
+  if (isCleanupMode) {
+    return (
+      <div
+        className={className}
+        style={{ display: "block", color: "inherit", position: "relative", cursor: "pointer" }}
+        onClick={() => onToggleSelect?.(task.task_id)}
+      >
+        {isSelected && <span className="card-checkmark" title="Selected for cleanup">✓</span>}
+        <div className="title">{task.name ?? task.task_id.slice(0, 8)}</div>
+        <div className="meta">
+          {group && <span className="dot" style={{ background: group.color }} title="part of a related task family" />}
+          <span className="pill dim">{task.intake_kind ?? task.level}</span>
+          {cap === "acting" && <span className="pill accent">acting</span>}
+          {cap === "planning" && <span className="pill dim">planning</span>}
+          <span>{planProgress(task)}</span>
+          {task.paused === 1 && <span className="pill warn">paused</span>}
+          {task.stale_reason && (
+            <span className="pill bad" title={task.stale_reason}>
+              possibly stale
+            </span>
+          )}
+          {task.exit_state && (
+            <span className={`pill ${isWontDo ? "dim" : task.exit_state === "ready_for_work" ? "ok" : "human"}`}>
+              {task.exit_state.replace(/_/g, " ")}
+            </span>
+          )}
+          {blockedOn && blockedOn.length > 0 && (
+            <span
+              className="pill dim"
+              title={`waiting on: ${blockedOn.map((d) => `${d.name ?? d.task_id.slice(0, 8)} (${d.stage})`).join(", ")}`}
+            >
+              blocked
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Link
       to="/tasks/$taskId"
       params={{ taskId: task.task_id }}
-      className={`card${isWontDo ? " card--wont-do" : ""}${hovered ? " card--related-highlight" : ""}${isProcessing ? " card--processing" : ""}`}
+      className={className}
       style={{ display: "block", color: "inherit", position: "relative" }}
       onMouseEnter={() => group && onHover(group.rootId)}
       onMouseLeave={() => group && onHover(null)}
     >
-      {isRoot && <span className="card-root-star" title="Primary task">★</span>}
+      {group && group.rootId === task.task_id && <span className="card-root-star" title="Primary task">★</span>}
       <div className="title">{task.name ?? task.task_id.slice(0, 8)}</div>
       <div className="meta">
         {group && <span className="dot" style={{ background: group.color }} title="part of a related task family" />}
@@ -91,6 +150,11 @@ export function ProjectBoard() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState("manual");
 
+  // Cleanup mode state
+  const [isCleanupMode, setIsCleanupMode] = useState(false);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
+  const [showCleanupModal, setShowCleanupModal] = useState(false);
+
   // Scheduler state for the intake column banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
   useEffect(() => {
@@ -113,10 +177,35 @@ export function ProjectBoard() {
     },
   });
 
-  const byStage = (stage: string) => (tasksQ.data?.tasks ?? []).filter((t) => (t.stage ?? "intake") === stage);
+  const bulkWontDo = useMutation({
+    mutationFn: () => api.bulkWontDo(pid, [...selectedTaskIds]),
+    onSuccess: () => {
+      setSelectedTaskIds(new Set());
+      setIsCleanupMode(false);
+      setShowCleanupModal(false);
+      qc.invalidateQueries({ queryKey: ["tasks", pid] });
+    },
+  });
+
+  const byStage = (stage: string) => (tasksQ.data?.tasks ?? []).filter(
+    (t) => (t.stage ?? "intake") === stage && t.exit_state !== "wont_do"
+  );
+  const archivedTasks = useMemo(
+    () => (tasksQ.data?.tasks ?? []).filter((t) => t.exit_state === "wont_do"),
+    [tasksQ.data]
+  );
+  const [showArchived, setShowArchived] = useState(false);
 
   const relationGroups = useMemo(() => buildRelationGroups(tasksQ.data?.tasks ?? []), [tasksQ.data]);
   const [hoveredGroup, setHoveredGroup] = useState<string | null>(null);
+
+  const worktreeFamilies = useMemo(() => buildWorktreeFamilies(tasksQ.data?.tasks ?? []), [tasksQ.data]);
+  const activeWorktreeFamilies = useMemo(
+    () => Array.from(worktreeFamilies.values()).filter((f) => f.root.git_worktree_path),
+    [worktreeFamilies],
+  );
+  const [selectedFamilyRoot, setSelectedFamilyRoot] = useState<string | null>(null);
+  const selectedFamily = selectedFamilyRoot ? worktreeFamilies.get(selectedFamilyRoot) : undefined;
 
   const harnessPolicyQ = useQuery({
     queryKey: ["harness-policy", pid],
@@ -139,6 +228,48 @@ export function ProjectBoard() {
     () => (summaryQ.data?.review_list ?? []).filter((r) => r.project_id === pid),
     [summaryQ.data, pid],
   );
+
+  function toggleCleanupMode() {
+    if (isCleanupMode && selectedTaskIds.size > 0) {
+      // Already in cleanup mode with selections — show confirmation modal
+      setShowCleanupModal(true);
+    } else if (isCleanupMode) {
+      // In cleanup mode but nothing selected — just exit
+      setIsCleanupMode(false);
+      setSelectedTaskIds(new Set());
+    } else {
+      // Enter cleanup mode
+      setIsCleanupMode(true);
+      setSelectedTaskIds(new Set());
+    }
+  }
+
+  function toggleSelectTask(taskId: string) {
+    setSelectedTaskIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) {
+        next.delete(taskId);
+      } else {
+        next.add(taskId);
+      }
+      return next;
+    });
+  }
+
+  function handleCleanupConfirm() {
+    bulkWontDo.mutate();
+  }
+
+  function handleCleanupCancel() {
+    setShowCleanupModal(false);
+    // Stay in cleanup mode so user can adjust their selection
+  }
+
+  function exitCleanupMode() {
+    setIsCleanupMode(false);
+    setSelectedTaskIds(new Set());
+    setShowCleanupModal(false);
+  }
 
   return (
     <div>
@@ -195,45 +326,171 @@ export function ProjectBoard() {
         </div>
       </div>
 
-      <div className="kanban">
-        {STAGES.map((stage) => (
-          <div className="col" key={stage}>
-            <h3>
-              {stage} ({byStage(stage).length})
-              {stage === "intake" && !schedulerRunning && (
-                <span className="banner stopped" style={{ display: "block", marginTop: 4, fontSize: 12, fontWeight: 400, color: "var(--brass)" }}>
-                  ⏸ Stopped
+      {selectedFamily ? (
+        <div className="row" style={{ marginBottom: 12 }}>
+          <span className="muted">
+            {(tasksQ.data?.tasks ?? []).length} tasks · {activeWorktreeFamilies.length} active worktree
+            {activeWorktreeFamilies.length === 1 ? "" : "s"}
+          </span>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button className="small" onClick={() => setSelectedFamilyRoot(null)}>
+            Expand board ▾
+          </button>
+        </div>
+      ) : (
+        <>
+          {/* Cleanup mode banner */}
+          {isCleanupMode && (
+            <div className="cleanup-banner" style={{ marginBottom: 12 }}>
+              <span>🗑️ Cleanup mode — click tasks to select them for archival</span>
+              <div className="spacer" style={{ flex: 1 }} />
+              <span className="muted" style={{ fontSize: 12, marginRight: 8 }}>
+                {selectedTaskIds.size} selected
+              </span>
+              <button className="small" onClick={exitCleanupMode} style={{ marginRight: 4 }}>
+                Cancel
+              </button>
+              <button
+                className="primary small"
+                disabled={selectedTaskIds.size === 0}
+                onClick={() => setShowCleanupModal(true)}
+              >
+                Archive selected ({selectedTaskIds.size})
+              </button>
+            </div>
+          )}
+
+          <div className="row" style={{ marginBottom: 8, justifyContent: "space-between" }}>
+            <div className="row">
+              <h3 style={{ margin: 0, color: "var(--ink-dim)", fontSize: 12, textTransform: "uppercase", letterSpacing: 1 }}>
+                Kanban
+              </h3>
+            </div>
+            <button
+              className={`trash-icon${isCleanupMode ? " trash-icon--active" : ""}`}
+              onClick={toggleCleanupMode}
+              title={isCleanupMode ? "Confirm selection to archive" : "Enter cleanup mode to archive tasks"}
+            >
+              🗑️
+            </button>
+          </div>
+
+          <div className="kanban">
+            {STAGES.map((stage) => (
+              <div className="col" key={stage}>
+                <h3>
+                  {stage} ({byStage(stage).length})
+                  {stage === "intake" && !schedulerRunning && (
+                    <span className="banner stopped" style={{ display: "block", marginTop: 4, fontSize: 12, fontWeight: 400, color: "var(--brass)" }}>
+                      ⏸ Stopped
+                    </span>
+                  )}
+                </h3>
+                <div className="cards">
+                  {byStage(stage).map((t) => {
+                    const group = relationGroups.get(t.task_id);
+                    return (
+                      <TaskCard
+                        key={t.task_id}
+                        task={t}
+                        group={group}
+                        hovered={!!group && hoveredGroup === group.rootId}
+                        onHover={setHoveredGroup}
+                        cap={capsByTaskId.get(t.task_id) ?? "pending"}
+                        isProcessing={activeTaskIds.has(t.task_id)}
+                        blockedOn={blockedDeps(t, tasksById)}
+                        isCleanupMode={isCleanupMode}
+                        isSelected={selectedTaskIds.has(t.task_id)}
+                        onToggleSelect={toggleSelectTask}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Archived tasks (wont_do) collapsible section */}
+          {archivedTasks.length > 0 && (
+            <div className="archived-panel" style={{ marginTop: 16 }}>
+              <div
+                className="archived-header"
+                onClick={() => setShowArchived((v) => !v)}
+              >
+                <span className="archived-caret">{showArchived ? "▾" : "▸"}</span>
+                <span>🗄️ Archived ({archivedTasks.length})</span>
+                <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+                  {showArchived ? "click to collapse" : "click to expand"}
                 </span>
+              </div>
+              {showArchived && (
+                <div className="archived-cards">
+                  {archivedTasks.map((t) => (
+                    <div key={t.task_id} className="card card--wont-do" style={{ cursor: "default" }}>
+                      <div className="title">{t.name ?? t.task_id.slice(0, 8)}</div>
+                      <div className="meta">
+                        {t.intake_kind && <span className="pill dim">{t.intake_kind}</span>}
+                        <span className="pill dim">{t.stage}</span>
+                        {t.created_at && <span>{t.created_at.slice(0, 10)}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               )}
-            </h3>
-            <div className="cards">
-              {byStage(stage).map((t) => {
-                const group = relationGroups.get(t.task_id);
-                return (
-                  <TaskCard
-                    key={t.task_id}
-                    task={t}
-                    group={group}
-                    hovered={!!group && hoveredGroup === group.rootId}
-                    onHover={setHoveredGroup}
-                    cap={capsByTaskId.get(t.task_id) ?? "pending"}
-                    isProcessing={activeTaskIds.has(t.task_id)}
-                    blockedOn={blockedDeps(t, tasksById)}
-                  />
-                );
-              })}
+            </div>
+          )}
+
+          <TaskListTable
+            tasks={tasksQ.data?.tasks ?? []}
+            relationGroups={relationGroups}
+            capsByTaskId={capsByTaskId}
+            activeTaskIds={activeTaskIds}
+            tasksById={tasksById}
+            isCleanupMode={isCleanupMode}
+            selectedTaskIds={selectedTaskIds}
+            onToggleSelect={toggleSelectTask}
+          />
+
+          <WorktreeKanban
+            families={activeWorktreeFamilies}
+            activeTaskIds={activeTaskIds}
+            onSelect={setSelectedFamilyRoot}
+          />
+        </>
+      )}
+
+      {selectedFamily && (
+        <WorktreeDetailPane
+          family={selectedFamily}
+          onBack={() => setSelectedFamilyRoot(null)}
+          onMutate={() => qc.invalidateQueries({ queryKey: ["tasks", pid] })}
+        />
+      )}
+
+      {/* Cleanup confirmation modal */}
+      {showCleanupModal && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h3>🗑️ Archive tasks</h3>
+            <p style={{ color: "var(--ink-dim)", fontSize: 13, marginTop: 8 }}>
+              Mark <strong>{selectedTaskIds.size}</strong> selected task{selectedTaskIds.size === 1 ? "" : "s"} as
+              "won't do" and archive them? They will be paused and removed from active scheduling.
+            </p>
+            <div className="modal-actions">
+              <button onClick={handleCleanupCancel}>
+                Cancel
+              </button>
+              <button
+                className="danger"
+                disabled={bulkWontDo.isPending}
+                onClick={handleCleanupConfirm}
+              >
+                {bulkWontDo.isPending ? "Archiving…" : `Yes, archive ${selectedTaskIds.size} task${selectedTaskIds.size === 1 ? "" : "s"}`}
+              </button>
             </div>
           </div>
-        ))}
-      </div>
-
-      <TaskListTable
-        tasks={tasksQ.data?.tasks ?? []}
-        relationGroups={relationGroups}
-        capsByTaskId={capsByTaskId}
-        activeTaskIds={activeTaskIds}
-        tasksById={tasksById}
-      />
+        </div>
+      )}
     </div>
   );
 }
@@ -251,12 +508,18 @@ function TaskListTable({
   capsByTaskId,
   activeTaskIds,
   tasksById,
+  isCleanupMode,
+  selectedTaskIds,
+  onToggleSelect,
 }: {
   tasks: Task[];
   relationGroups: Map<string, RelationGroup>;
   capsByTaskId: Map<string, WriteCapability>;
   activeTaskIds: Set<string>;
   tasksById: Map<string, Task>;
+  isCleanupMode?: boolean;
+  selectedTaskIds?: Set<string>;
+  onToggleSelect?: (taskId: string) => void;
 }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState(ALL);
@@ -330,6 +593,7 @@ function TaskListTable({
       <table className="stats-table">
         <thead>
           <tr>
+            {isCleanupMode && <th style={{ width: 36 }}>Sel.</th>}
             {th("name", "Name")}
             {th("stage", "Stage")}
             {th("level", "Level")}
@@ -345,10 +609,32 @@ function TaskListTable({
             const group = relationGroups.get(t.task_id);
             const blocked = blockedDeps(t, tasksById);
             return (
-              <tr key={t.task_id} className={activeTaskIds.has(t.task_id) ? "row--processing" : ""}>
+              <tr
+                key={t.task_id}
+                className={[
+                  activeTaskIds.has(t.task_id) ? "row--processing" : "",
+                  isCleanupMode && selectedTaskIds?.has(t.task_id) ? "row--selected" : "",
+                ].filter(Boolean).join(" ")}
+                style={isCleanupMode ? { cursor: "pointer" } : undefined}
+                onClick={isCleanupMode ? () => onToggleSelect?.(t.task_id) : undefined}
+              >
+                {isCleanupMode && (
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={selectedTaskIds?.has(t.task_id) ?? false}
+                      onChange={() => onToggleSelect?.(t.task_id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </td>
+                )}
                 <td>
                   <span className="dot" style={{ background: group ? group.color : "transparent", marginRight: 6 }} title={group ? "part of a related task family" : undefined} />
-                  <Link to="/tasks/$taskId" params={{ taskId: t.task_id }}>{t.name ?? t.task_id.slice(0, 8)}</Link>
+                  {isCleanupMode ? (
+                    <span style={{ color: "var(--ink)" }}>{t.name ?? t.task_id.slice(0, 8)}</span>
+                  ) : (
+                    <Link to="/tasks/$taskId" params={{ taskId: t.task_id }}>{t.name ?? t.task_id.slice(0, 8)}</Link>
+                  )}
                 </td>
                 <td>{t.stage ?? "—"}</td>
                 <td>{t.level ?? "—"}</td>

@@ -36,11 +36,18 @@ export interface Task {
   origin_question: string | null;
   parent_task_id: string | null;
   task_type: string | null;
+  /** Family root's task_id — tasks sharing a root_task_id share one worktree
+   *  and branch. null on tasks that predate this column (treat as if it were
+   *  their own task_id, i.e. their own standalone worktree/family). */
+  root_task_id: string | null;
   /** Set when a later answer invalidated an assumption the parent task made
    *  while spawning this decomposition child — flagged for human triage. */
   stale_reason: string | null;
   git_branch: string | null;
   git_base_branch: string | null;
+  /** This task's (family's) worktree directory on disk. null until the task
+   *  has actually done a step of work. */
+  git_worktree_path: string | null;
   /** Outcome of merging this task's branch back into base on completion.
    *  "pending_human_merge" means a role wrote real source (not just PLANNING
    *  artifacts this run) — the branch was deliberately left unmerged for
@@ -524,6 +531,11 @@ export const api = {
   task: (taskId: string) => req<TaskDetail>(`/api/tasks/${taskId}`),
   deleteTask: (taskId: string, removePlan?: boolean) =>
     req<{ ok: boolean }>(`/api/tasks/${taskId}${removePlan ? "?removePlan=true" : ""}`, { method: "DELETE" }),
+  bulkWontDo: (projectId: number, taskIds: string[]) =>
+    req<{ ok: boolean; updated: number }>(`/api/projects/${projectId}/tasks/bulk-wontdo`, {
+      method: "POST",
+      body: JSON.stringify({ task_ids: taskIds }),
+    }),
 
   resetTask: (taskId: string) => req<{ task: Task }>(`/api/tasks/${taskId}/reset`, { method: "POST" }),
 

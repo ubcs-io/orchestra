@@ -266,6 +266,10 @@ export function initDb(): void {
   // hasn't reached a terminal role yet).
   addColumnIfMissing(d, "tasks", "reconcile_status", "reconcile_status TEXT");
   addColumnIfMissing(d, "tasks", "reconcile_detail", "reconcile_detail TEXT");
+  // Family root's task_id: lets a task's whole decomposition tree share one
+  // worktree/branch. null on tasks that predate this column (and their
+  // future children) — they keep today's one-worktree-per-task behavior.
+  addColumnIfMissing(d, "tasks", "root_task_id", "root_task_id TEXT");
   // Set when any role step wrote/edited a real file via the guarded write/edit
   // tools (not just the PLANNING artifact). Gates auto-merge: a task that wrote
   // source code goes to reconcile_status "pending_human_merge" instead of
@@ -385,6 +389,7 @@ export interface TaskRow {
   git_worktree_path: string | null;
   reconcile_status: string | null;
   reconcile_detail: string | null;
+  root_task_id: string | null;
   wrote_source: number | null;
   github_pr_url: string | null;
   github_pushed_sha: string | null;
@@ -881,14 +886,20 @@ export function createTask(input: {
   const d = getDb();
   const ts = now();
   const taskId = genId(`${ts}-${process.hrtime.bigint()}`);
+  // A brand-new root task anchors its own family (self-reference); a child
+  // inherits its parent's already-resolved root, so lookups never need to
+  // walk the parent chain, no matter how deep decomposition nests.
+  const rootTaskId = input.parent_task_id
+    ? (getTask(input.parent_task_id)?.root_task_id ?? null)
+    : taskId;
   const info = d
     .prepare(
       `INSERT INTO tasks (task_id, name, status, model, content, project_id, stage, level, intake_kind,
          exit_kind, parent_task_id, task_type, step_number, artifact_path, refinement_plan_json,
-         network_id, origin_role_key, origin_question, acceptance_criteria, depends_on_json, created_at, updated_at)
+         network_id, origin_role_key, origin_question, acceptance_criteria, depends_on_json, root_task_id, created_at, updated_at)
        VALUES (@task_id, @name, @status, @model, @content, @project_id, @stage, @level, @intake_kind,
          @exit_kind, @parent_task_id, @task_type, @step_number, @artifact_path, @refinement_plan_json,
-         @network_id, @origin_role_key, @origin_question, @acceptance_criteria, @depends_on_json, @ts, @ts)`,
+         @network_id, @origin_role_key, @origin_question, @acceptance_criteria, @depends_on_json, @root_task_id, @ts, @ts)`,
     )
     .run({
       task_id: taskId,
@@ -911,9 +922,16 @@ export function createTask(input: {
       origin_question: input.origin_question ?? null,
       acceptance_criteria: input.acceptance_criteria ?? null,
       depends_on_json: input.depends_on_json ?? null,
+      root_task_id: rootTaskId,
       ts,
     });
   return getTask(Number(info.lastInsertRowid))!;
+}
+
+/** The task_id of a family's shared-worktree anchor: itself for a root task
+ *  or any task that predates root_task_id, otherwise its resolved root. */
+export function familyRootId(task: TaskRow): string {
+  return task.root_task_id ?? task.task_id;
 }
 
 /** Fetch a task by numeric id or by task_id hash. */
@@ -930,7 +948,9 @@ export function getTask(identifier: number | string): TaskRow | undefined {
     | undefined;
 }
 
-export function listTasks(opts: { projectId?: number; stage?: string; parentTaskId?: string } = {}): TaskRow[] {
+export function listTasks(
+  opts: { projectId?: number; stage?: string; parentTaskId?: string; rootTaskId?: string } = {},
+): TaskRow[] {
   const d = getDb();
   const where: string[] = [];
   const params: unknown[] = [];
@@ -946,10 +966,23 @@ export function listTasks(opts: { projectId?: number; stage?: string; parentTask
     where.push("parent_task_id = ?");
     params.push(opts.parentTaskId);
   }
+  if (opts.rootTaskId) {
+    // OR task_id = ? so this still returns the root's own row even if its
+    // root_task_id predates the column (null) or its root row was deleted.
+    where.push("(root_task_id = ? OR task_id = ?)");
+    params.push(opts.rootTaskId, opts.rootTaskId);
+  }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   return d
     .prepare(`SELECT * FROM tasks ${clause} ORDER BY created_at DESC, id DESC`)
     .all(...(params as never[])) as TaskRow[];
+}
+
+/** Other tasks sharing this task's worktree family (siblings/parent/children),
+ *  excluding the task itself. Used to guard against reclaiming a worktree
+ *  that's still in use by another family member. */
+export function familyMembersExcluding(task: TaskRow): TaskRow[] {
+  return listTasks({ rootTaskId: familyRootId(task) }).filter((t) => t.task_id !== task.task_id);
 }
 
 const TASK_UPDATABLE = new Set([

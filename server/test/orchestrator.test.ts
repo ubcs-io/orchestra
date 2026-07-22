@@ -544,20 +544,78 @@ describe("orchestrator loop (integration)", () => {
     expect(t.git_branch).toBeTruthy();
     expect(t.git_base_branch).toBeTruthy();
     expect(t.git_worktree_path).toBeTruthy();
-    // Reconciliation merges the task's branch back into base on completion...
-    expect(t.reconcile_status).toBe("merged");
+    // The root reached "ready" but its decomposition children share its
+    // worktree/branch and haven't run yet — reconciliation is deferred until
+    // the whole family settles (see maybeReconcileFamily), so nothing has
+    // merged into base yet and the artifact isn't in the shared checkout.
+    expect(t.reconcile_status).toBeNull();
     const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
       .toString()
       .trim();
     expect(currentBranch).toBe(t.git_base_branch);
-    // ...so the artifact is present in the shared checkout too, not just the
-    // task's own worktree, once reconciliation has run.
-    expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
+    expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(false);
     expect(fs.existsSync(path.join(t.git_worktree_path!, t.artifact_path!))).toBe(true);
-    // Decomposition produced child tasks.
-    expect(listTasks({ parentTaskId: t.task_id }).length).toBeGreaterThan(0);
+    // Decomposition produced child tasks, sharing the root's worktree family.
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBeGreaterThan(0);
+    expect(children.every((c) => c.git_worktree_path === t.git_worktree_path)).toBe(true);
+    expect(children.every((c) => c.git_branch === t.git_branch)).toBe(true);
     // INTAKE original was consumed (moved out).
     expect(fs.existsSync(path.join(repo, "PLANNING", "INTAKE", "crash.log"))).toBe(false);
+  });
+
+  it("defers family reconciliation until every descendant settles, then merges once onto the root", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    // The decomposition role produces two non-recursive "task"-level children
+    // on its first invocation only; every later decomposition call (i.e. each
+    // child's own terminal role) reports zero subtasks with a stated reason,
+    // so the tree never grows past one level.
+    let decompCalls = 0;
+    const childSubtasks: Subtask[] = [
+      makeSubtask({ local_id: "1", name: "Child A" }),
+      makeSubtask({ local_id: "2", name: "Child B" }),
+    ];
+    setRoleRunner((params) => {
+      const isDecomp = params.context.includes("**decomposition** role");
+      if (isDecomp) decompCalls += 1;
+      return decompositionRunner({
+        decompSubtasks: isDecomp && decompCalls === 1 ? childSubtasks : [],
+        noDecompositionReason: isDecomp && decompCalls > 1 ? "atomic — no further breakdown needed" : undefined,
+      })(params);
+    });
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    // Drain until the whole family (root + both children) is out of
+    // intake/refining — enough ticks for root + 2 children's full flows.
+    for (let i = 0; i < 60; i++) {
+      await tick();
+      const t = rootTask(projectId);
+      const children = t ? listTasks({ parentTaskId: t.task_id }) : [];
+      if (t && t.stage !== "intake" && t.stage !== "refining" && children.length === 2 && children.every((c) => c.stage !== "intake" && c.stage !== "refining")) {
+        break;
+      }
+    }
+
+    const t = rootTask(projectId)!;
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBe(2);
+    expect(children.every((c) => c.stage === "ready" || c.stage === "review")).toBe(true);
+    // Now that every family member has settled, exactly one merge happened,
+    // recorded only on the root's row.
+    expect(t.reconcile_status).toBe("merged");
+    expect(children.every((c) => c.reconcile_status === null)).toBe(true);
+    expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo })
+      .toString()
+      .trim();
+    expect(currentBranch).toBe(t.git_base_branch);
   });
 
   it("escalates to REVIEW when decomposition reports zero subtasks with no stated reason", async () => {
@@ -894,6 +952,68 @@ describe("orchestrator loop (integration)", () => {
     const worktrees = new Set(roots.map((t) => t.git_worktree_path));
     expect(worktrees.size).toBe(2);
     for (const t of roots) expect(fs.existsSync(t.git_worktree_path!)).toBe(true);
+  });
+
+  it("never dispatches two members of the same worktree family in the same round, even with free slots", async () => {
+    const { projectId } = setupProject();
+    const root = createProjectTask(projectId, { stage: "intake" });
+    const child = createTask({
+      name: "child",
+      project_id: projectId,
+      parent_task_id: root.task_id,
+      task_type: "child",
+      stage: "intake",
+    });
+    expect(child.root_task_id).toBe(root.task_id);
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    setRoleRunner(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight--;
+      return {
+        findings: {
+          verdict: "pass" as Verdict,
+          summary: "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\nok\n",
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    });
+
+    // Two free slots, but root+child share a worktree family — only one of
+    // them may be picked this round despite both being schedulable.
+    await tickOnce(2);
+
+    expect(maxInFlight).toBe(1);
+    const advanced = [getTask(root.task_id)!, getTask(child.task_id)!].filter(
+      (t) => t.stage !== "intake",
+    );
+    expect(advanced.length).toBe(1);
+
+    // Family locking claims the whole family for the round, not just one
+    // slot — so with a persistent family lock, later rounds keep dispatching
+    // this family one member at a time until every member has advanced.
+    for (let i = 0; i < 5; i++) {
+      await tickOnce(2);
+      expect(maxInFlight).toBe(1);
+    }
+    expect(getTask(root.task_id)!.stage).not.toBe("intake");
+    expect(getTask(child.task_id)!.stage).not.toBe("intake");
+    // Both ended up sharing the same worktree, confirming the family reuse.
+    expect(getTask(child.task_id)!.git_worktree_path).toBe(getTask(root.task_id)!.git_worktree_path);
   });
 
   it("loops back to the owner role when the counter-reviewer fails, then reaches READY", async () => {

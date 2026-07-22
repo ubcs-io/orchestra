@@ -15,6 +15,7 @@ import {
   createTask,
   deleteRoleRunsAfter,
   deleteUnconsumedInterventionsAfter,
+  familyRootId,
   getNetwork,
   getProject,
   getRole,
@@ -561,6 +562,30 @@ function taskBranchName(task: TaskRow): string {
  * per-task worktrees exist to remove.
  */
 export function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow {
+  const rootId = familyRootId(task);
+  if (rootId !== task.task_id) {
+    // Non-root family member (a decomposition child, at any depth): never
+    // creates its own worktree/branch — it just mirrors the root's, which
+    // the recursive call below guarantees exists. root_task_id is already
+    // flattened at creation time, so this recursion is always exactly depth 1.
+    let root = getTask(rootId);
+    if (!root) return task; // defensive: root row was deleted, see deleteTask route guard
+    root = ensureTaskWorkspace(root, project);
+    if (
+      task.git_worktree_path === root.git_worktree_path &&
+      task.git_branch === root.git_branch &&
+      task.git_base_branch === root.git_base_branch
+    ) {
+      return task;
+    }
+    return (
+      updateTask(task.task_id, {
+        git_worktree_path: root.git_worktree_path,
+        git_branch: root.git_branch,
+        git_base_branch: root.git_base_branch,
+      }) ?? task
+    );
+  }
   let baseBranch = task.git_base_branch ?? project.main_branch;
   if (!baseBranch) {
     baseBranch = currentBranch(project.repo_path);
@@ -1985,6 +2010,53 @@ async function maybeSecondReview(
   }
 }
 
+/** All tasks sharing `task`'s worktree family (its root plus every
+ *  descendant, including `task` itself). */
+function familyMembers(task: TaskRow): TaskRow[] {
+  return listTasks({ rootTaskId: familyRootId(task) });
+}
+
+/** A task is settled for family-reconciliation purposes once it's reached a
+ *  state where it will never write another commit onto the shared family
+ *  branch: normal completion (ready), parked for human review, or explicitly
+ *  abandoned. */
+function isTerminalForFamily(t: TaskRow): boolean {
+  return t.exit_state === "wont_do" || t.stage === "ready" || t.stage === "review";
+}
+
+/**
+ * Runs the real `git merge` of a worktree family's shared branch into base —
+ * but only once EVERY member has reached a terminal-for-family state.
+ * Members share one branch (see ensureTaskWorkspace), so merging as soon as
+ * the first one settles would pull in a sibling's still-in-flight commits.
+ * The outcome is recorded only on the family ROOT's row; for a solo/no-
+ * children family the root IS the completing task, so this is byte-for-byte
+ * today's per-task behavior. Never throws — reconcileBranch itself is
+ * best-effort and folds git errors into an "error" status instead.
+ */
+function maybeReconcileFamily(task: TaskRow, repoPath: string): void {
+  if (!task.git_branch || !task.git_base_branch) return;
+  const family = familyMembers(task);
+  const root = family.find((t) => t.task_id === familyRootId(task));
+  if (!root || !family.every(isTerminalForFamily)) return; // not everyone settled yet — defer
+  if (family.some((t) => t.wrote_source === 1)) {
+    updateTask(root.task_id, {
+      reconcile_status: "pending_human_merge",
+      reconcile_detail: "task or a family member wrote source code — merge requires manual review",
+    });
+    publish(root.task_id, "task_update", { reconcileStatus: "pending_human_merge" });
+    return;
+  }
+  const reconciled = reconcileBranch(repoPath, root.git_branch!, root.git_base_branch!);
+  updateTask(root.task_id, { reconcile_status: reconciled.status, reconcile_detail: reconciled.detail ?? null });
+  if (reconciled.status === "conflict" || reconciled.status === "error") {
+    console.warn(
+      `[git] reconciliation ${reconciled.status} for family ${root.task_id.slice(0, 8)}: ${reconciled.detail}`,
+    );
+  }
+  publish(root.task_id, "task_update", { reconcileStatus: reconciled.status });
+}
+
 async function applyGate(
   task: TaskRow,
   project: ProjectRow,
@@ -2322,6 +2394,12 @@ async function applyGate(
         }
       }
       publish(task.task_id, "task_update", { stage: "review", exit_state: "needs_merge_approval" });
+      // Doesn't merge anything itself (see the doc comment above), but may
+      // complete the family's settledness if this was the last member still
+      // outstanding — in which case maybeReconcileFamily will find every
+      // member wrote_source-checked and land on "pending_human_merge" for
+      // the whole family's shared branch, same as this task's own status.
+      maybeReconcileFamily(task, repoPath);
       return;
     }
 
@@ -2361,19 +2439,12 @@ async function applyGate(
           reconcile_detail: "task wrote source code — merge requires manual review",
         });
         publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: "pending_human_merge" });
-      } else {
-        const reconciled = reconcileBranch(repoPath, task.git_branch, task.git_base_branch);
-        updateTask(task.task_id, {
-          reconcile_status: reconciled.status,
-          reconcile_detail: reconciled.detail ?? null,
-        });
-        if (reconciled.status === "conflict" || reconciled.status === "error") {
-          console.warn(
-            `[git] reconciliation ${reconciled.status} for task ${task.task_id.slice(0, 8)}: ${reconciled.detail}`,
-          );
-        }
-        publish(task.task_id, "task_update", { stage: "ready", reconcileStatus: reconciled.status });
       }
+      // The real `git merge` into base only fires once every member of this
+      // task's worktree family (itself, for a solo/no-children task) has
+      // reached a terminal state — merging a shared branch while a sibling is
+      // still mid-flight would pull in unfinished work. See maybeReconcileFamily.
+      maybeReconcileFamily(task, repoPath);
     }
     if (task.git_base_branch) {
       try {
@@ -2573,8 +2644,9 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
         ? JSON.stringify(node.acceptance_criteria)
         : null,
     });
-    // Same isolated-worktree treatment as top-level intake — a decomposition
-    // child is its own checkpointable task, not a continuation of the parent's.
+    // Joins the parent's worktree family (root_task_id was set at
+    // createTask() above), so this reuses the family's shared worktree/branch
+    // instead of creating its own — see ensureTaskWorkspace's root-vs-child split.
     child = ensureTaskWorkspace(child, project);
     const childRepo = taskRepoPath(child, project);
 
@@ -2610,17 +2682,30 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
 // ---------------------------------------------------------------------------
 
 /**
- * Task ids with a role-step (or restore/reincorporate) currently in flight,
- * mapped to the promise doing that work. Two roles:
+ * Family lock keys (a task's `familyRootId` — its own id if it's a solo/root
+ * task) with a role-step (or restore/reincorporate) currently in flight,
+ * mapped to the promise doing that work. Keying on the family rather than the
+ * individual task is what makes tasks sharing one worktree (a root + its
+ * decomposition children) run strictly one-at-a-time, since two of them
+ * writing to the same checkout concurrently would corrupt it — while
+ * unrelated families (different worktrees) still run fully concurrently.
+ * Two roles:
  *  - `pickNextTasks` consults it so concurrent rounds (or a manual API call
- *    racing the scheduler loop) never pick the same task twice.
+ *    racing the scheduler loop) never pick two tasks from the same family.
  *  - `serializeTask` chains onto it so a restore/reincorporate can never race
- *    a step already running for that same task — each task still gets
- *    single-worker sequential semantics against *itself*, even though
- *    different tasks now run concurrently (one worktree each).
+ *    a step already running for that same family.
  */
 const inFlightTasks = new Map<string, Promise<void>>();
+/** lock key -> the specific task_id actually stepping, for activeTaskIds(). */
+const activelyRunningTaskId = new Map<string, string>();
 const taskChains = new Map<string, Promise<void>>();
+
+/** The family lock key for a task: its resolved family root id, falling back
+ *  to its own id if the row can no longer be found. */
+function familyLockKey(taskId: string): string {
+  const t = getTask(taskId);
+  return t ? familyRootId(t) : taskId;
+}
 /** Abort controllers for in-progress role runs, keyed by task id — stopScheduler()
  *  aborts every in-flight task, not just one, now that several can run at once. */
 const activeAborts = new Map<string, AbortController>();
@@ -2658,18 +2743,21 @@ export function dependenciesSatisfied(task: TaskRow): boolean {
 
 function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRow }> {
   const picked: Array<{ task: TaskRow; project: ProjectRow }> = [];
+  // Claimed incrementally (not just checked against inFlightTasks) so two
+  // siblings from the same still-unclaimed family can't both look pickable
+  // within the same round — only the first one found gets to run.
+  const claimedFamilies = new Set<string>();
   for (const project of listProjects()) {
     const candidates = listTasks({ projectId: project.id })
       .filter(
-        (t) =>
-          (t.stage === "intake" || t.stage === "refining") &&
-          (t.paused ?? 0) === 0 &&
-          !inFlightTasks.has(t.task_id) &&
-          dependenciesSatisfied(t),
+        (t) => (t.stage === "intake" || t.stage === "refining") && (t.paused ?? 0) === 0 && dependenciesSatisfied(t),
       )
       .sort((a, b) => a.updated_at.localeCompare(b.updated_at));
     for (const task of candidates) {
+      const key = familyRootId(task);
+      if (inFlightTasks.has(key) || claimedFamilies.has(key)) continue;
       picked.push({ task, project });
+      claimedFamilies.add(key);
       if (picked.length >= limit) return picked;
     }
   }
@@ -2677,14 +2765,20 @@ function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRo
 }
 
 /** Run one role-step's worth of work for `taskId` — the per-task body a round
- *  dispatches once it's picked a task. Registers/deregisters the task in
- *  `inFlightTasks` for the duration and funnels through `serializeTask` so it
- *  can never overlap a restore or answer-reincorporation for the same task. */
+ *  dispatches once it's picked a task. Registers/deregisters the task's
+ *  family lock key in `inFlightTasks` for the duration and funnels through
+ *  `serializeTask` (keyed the same way) so it can never overlap a restore,
+ *  answer-reincorporation, or another family member's step. */
 function dispatchTask(taskId: string): Promise<void> {
-  const running = serializeTask(taskId, () => runTaskStepOnce(taskId));
-  inFlightTasks.set(taskId, running);
+  const lockKey = familyLockKey(taskId);
+  const running = serializeTask(lockKey, () => runTaskStepOnce(taskId));
+  inFlightTasks.set(lockKey, running);
+  activelyRunningTaskId.set(lockKey, taskId);
   return running.finally(() => {
-    if (inFlightTasks.get(taskId) === running) inFlightTasks.delete(taskId);
+    if (inFlightTasks.get(lockKey) === running) {
+      inFlightTasks.delete(lockKey);
+      activelyRunningTaskId.delete(lockKey);
+    }
   });
 }
 
@@ -2779,11 +2873,12 @@ export function tick(): Promise<boolean> {
  * step statuses from what survives — so the task resumes right after the
  * restored-to role, as if everything after it never happened.
  *
- * Serialized through `serializeTask` so a restore can never race a step
- * already running for the same task.
+ * Serialized through `serializeTask` (keyed on the task's family lock, like
+ * every other scheduling entry point) so a restore can never race a step
+ * already running for the same task or a sibling sharing its worktree.
  */
 export function restoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
-  return serializeTask(taskId, () => doRestoreCheckpoint(taskId, roleRunId));
+  return serializeTask(familyLockKey(taskId), () => doRestoreCheckpoint(taskId, roleRunId));
 }
 
 async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<void> {
@@ -2863,11 +2958,12 @@ async function doRestoreCheckpoint(taskId: string, roleRunId: number): Promise<v
  * decomposition children spawned off this task are left untouched, just
  * flagged (`markChildrenStale`) for a human to triage.
  *
- * Serialized through `serializeTask` so this can never race a scheduler step
- * or a manual restore mutating the same task.
+ * Serialized through `serializeTask` (keyed on the task's family lock) so
+ * this can never race a scheduler step or a manual restore for the same task
+ * or a sibling sharing its worktree.
  */
 export function reincorporateAnswer(taskId: string, question: string, answer: string): Promise<void> {
-  return serializeTask(taskId, () => doReincorporateAnswer(taskId, question, answer));
+  return serializeTask(familyLockKey(taskId), () => doReincorporateAnswer(taskId, question, answer));
 }
 
 /**
@@ -3088,7 +3184,7 @@ export function isSchedulerStopping(): boolean {
 
 /** List of task IDs currently being processed by the scheduler loop. */
 export function activeTaskIds(): string[] {
-  return Array.from(inFlightTasks.keys());
+  return Array.from(activelyRunningTaskId.values());
 }
 
 function sleep(ms: number): Promise<void> {

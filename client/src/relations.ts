@@ -62,6 +62,51 @@ export function buildRelationGroups(tasks: Task[]): Map<string, RelationGroup> {
   return groups;
 }
 
+export interface WorktreeFamily {
+  rootId: string;
+  root: Task;
+  members: Task[]; // includes the root
+}
+
+/** One entry per worktree family (a root task + all its descendants sharing
+ *  one worktree/branch — see server/src/orchestrator.ts's ensureTaskWorkspace),
+ *  including solo/no-children families — unlike buildRelationGroups above,
+ *  which only returns groups with >1 member. Uses the denormalized
+ *  root_task_id when present, falling back to the parent-walk (findRoot) for
+ *  legacy tasks that predate that column. */
+export function buildWorktreeFamilies(tasks: Task[]): Map<string, WorktreeFamily> {
+  const parentOf = new Map<string, string | null>();
+  for (const t of tasks) parentOf.set(t.task_id, t.parent_task_id);
+  const byId = new Map(tasks.map((t) => [t.task_id, t]));
+
+  const families = new Map<string, WorktreeFamily>();
+  for (const t of tasks) {
+    const rootId = t.root_task_id ?? findRoot(t.task_id, parentOf);
+    let fam = families.get(rootId);
+    if (!fam) {
+      fam = { rootId, root: byId.get(rootId) ?? t, members: [] };
+      families.set(rootId, fam);
+    }
+    fam.members.push(t);
+  }
+  return families;
+}
+
+export type WorktreeColumn = "in_progress" | "ready_for_review" | "done";
+
+/** Derives a worktree family's kanban column from the aggregate state of
+ *  ALL its members, not just the root — in the common epic→story→task
+ *  decomposition shape, the root often reaches stage "ready" right after
+ *  decomposition while the human-actionable signal (stage "review") sits on
+ *  a leaf child. */
+export function familyColumn(fam: WorktreeFamily): WorktreeColumn {
+  if (fam.members.some((m) => m.stage === "intake" || m.stage === "refining")) return "in_progress";
+  if (fam.members.some((m) => m.stage === "review")) return "ready_for_review";
+  const rs = fam.root.reconcile_status;
+  if (rs === "merged" || rs === "up_to_date") return "done";
+  return "ready_for_review"; // settled but not yet reconciled/flagged — still needs eyes
+}
+
 export interface BlockedDep {
   task_id: string;
   name: string | null;

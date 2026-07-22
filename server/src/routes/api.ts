@@ -22,6 +22,7 @@ import {
   deleteTask,
   duplicateModelConfig,
   duplicateNetwork,
+  familyMembersExcluding,
   getConfigById,
   getDb,
   getGlobalConfig,
@@ -781,8 +782,10 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
     }
     // The worktree itself is a disk-consuming resource, unlike the cheap
-    // branch ref it sits on — clean it up whenever the task is deleted.
-    if (task?.git_worktree_path && project) {
+    // branch ref it sits on — clean it up whenever the task is deleted, but
+    // only once no other family member (parent/siblings/children sharing the
+    // same worktree) is still using it.
+    if (task?.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
       removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
@@ -824,8 +827,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     }
     // Same disk-cost reasoning as delete: drop the worktree now, but leave
     // the branch ref alone — ensureTaskWorkspace recreates the worktree onto
-    // it next time this task does any work.
-    if (task.git_worktree_path && project) {
+    // it next time this task does any work. Skipped if another family member
+    // (sharing the same worktree) is still relying on it.
+    if (task.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
       removeWorktree(project.repo_path, task.git_worktree_path);
     }
 
@@ -1204,6 +1208,26 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const assistantMsg = createChatMessage({ task_id: task.task_id, role: "assistant", content: replyText });
 
     return { user_message: userMsg, assistant_message: assistantMsg };
+  });
+
+  // ---- Bulk task actions (cleanup mode) ----
+  app.post("/api/projects/:id/tasks/bulk-wontdo", async (req: FastifyRequest, reply: FastifyReply) => {
+    const projectId = Number((req.params as { id: string }).id);
+    const project = getProject(projectId);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { task_ids?: string[] };
+    if (!body.task_ids || !Array.isArray(body.task_ids) || body.task_ids.length === 0) {
+      return bad(reply, 400, "task_ids must be a non-empty array");
+    }
+    // Validate all tasks belong to this project
+    const tasks = body.task_ids.map((tid) => getTask(tid)).filter((t): t is NonNullable<typeof t> => !!t);
+    for (const t of tasks) {
+      if (t.project_id !== projectId) {
+        return bad(reply, 400, `task ${t.task_id} does not belong to this project`);
+      }
+      updateTask(t.task_id, { exit_state: "wont_do", paused: 1 });
+    }
+    return { ok: true, updated: tasks.length };
   });
 
   // ---- Interventions (steering) ----
