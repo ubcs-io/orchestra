@@ -1,6 +1,16 @@
 import { useState } from "react";
-import { api, type Task, type RoleRun, type CoverageMap, type Intervention } from "../api";
+import {
+  api,
+  isEvidenceGreen,
+  parseEvidence,
+  type Task,
+  type RoleRun,
+  type CoverageMap,
+  type ExecEvidence,
+  type Intervention,
+} from "../api";
 import { QuestionDecomposeButton, DecomposedChildCard } from "./QuestionDecompose";
+import { EvidencePanel } from "./EvidencePanel";
 
 export interface ReviewCTAProps {
   taskId: string;
@@ -12,6 +22,25 @@ export interface ReviewCTAProps {
   childTasks: Task[];
   /** Call after any mutation to refresh data. */
   onMutate: () => void;
+  /** Open the task's diff modal (DiffPanel) — lifted to the parent so this
+   *  panel and the header's "review branch" pill share one instance. */
+  onOpenDiff: () => void;
+}
+
+/**
+ * The verification evidence that stands at the merge gate (PLANNING/overhaul/05):
+ * the most recent execution of each distinct command across the task's primary
+ * runs. "Most recent" matters — the developer's run and the critic's independent
+ * re-run of the same suite are two records of one question, and only the latest
+ * answer describes the code as it stands now.
+ */
+export function latestEvidenceByCommand(runs: RoleRun[]): ExecEvidence[] {
+  const latest = new Map<string, ExecEvidence>();
+  for (const run of runs) {
+    if (run.run_kind && run.run_kind !== "primary") continue;
+    for (const e of parseEvidence(run.evidence_json)) latest.set(e.name, e);
+  }
+  return [...latest.values()];
 }
 
 /** Extract action items from recap_md, coverage, and runs. */
@@ -22,24 +51,15 @@ function extractActionItems(
 ): string[] {
   const items: string[] = [];
 
-  // 1. Parse ## Action Items / ## Next Steps from recap.
+  // 1. Parse an Action Items / Next Steps / Recommendation(s) section from the
+  //    recap. The recap prompt (server/src/orchestrator.ts's generateRecap) is
+  //    deliberately free-form — it never mandates a specific heading — so this
+  //    must recognize every phrasing a model reasonably picks for "here's what
+  //    to do next", and both bullet and numbered lists (a model as often
+  //    writes "1. Implement..." as "- Implement..."). Shares its header/list
+  //    regexes with extractRecoveryCandidates below for the same reason.
   if (recapMd) {
-    const headerRe = /^##\s+(?:action\s*items?|next\s*steps?)\s*$/im;
-    const hdr = headerRe.exec(recapMd);
-    if (hdr) {
-      const afterHeader = recapMd.slice(hdr.index + hdr[0].length);
-      const nextHeader = afterHeader.search(/^##\s+/m);
-      const section =
-        nextHeader >= 0 ? afterHeader.slice(0, nextHeader) : afterHeader;
-      const bulletRe = /^[-*]\s+(.+)$/gm;
-      let bm;
-      while ((bm = bulletRe.exec(section)) !== null) {
-        const text = bm[1]!.trim();
-        if (text && !text.startsWith("---")) {
-          items.push(text.slice(0, 200));
-        }
-      }
-    }
+    items.push(...extractListSection(recapMd, ACTION_SECTION_HEADER_RE));
   }
 
   // 2. Fallback: decomposition role output. Prefer the structured subtasks_json
@@ -78,7 +98,7 @@ function extractActionItems(
   return items.slice(0, 8);
 }
 
-const RECOVERY_SECTION_HEADER_RE =
+const ACTION_SECTION_HEADER_RE =
   /^#{2,4}\s+(?:action\s*items?|next\s*steps?|recommended\s+update\s+strategy|recommendations?)\s*$/im;
 const LIST_ITEM_RE = /^(?:[-*]|\d+[.)])\s+(.+)$/gm;
 
@@ -170,7 +190,7 @@ export function extractRecoveryCandidates(
       }
     }
     if (r.output_md) {
-      const items = extractListSection(r.output_md, RECOVERY_SECTION_HEADER_RE);
+      const items = extractListSection(r.output_md, ACTION_SECTION_HEADER_RE);
       if (items.length > 0) return { roleKey: r.role_key, items: items.slice(0, 10) };
     }
   }
@@ -283,6 +303,7 @@ export function ReviewCTA({
   interventions,
   childTasks,
   onMutate,
+  onOpenDiff,
 }: ReviewCTAProps) {
   const [loading, setLoading] = useState<string | null>(null);
   const [creatingSubtaskKey, setCreatingSubtaskKey] = useState<string | null>(
@@ -333,12 +354,17 @@ export function ReviewCTA({
     }
   }
 
-  async function createSubtask(name: string) {
+  /** `executionReady` flags the child `exit_kind: "code_change"` — skipping
+   *  straight to the developer/critic execution flow instead of inheriting
+   *  this task's own "spec" and re-running the whole analysis pipeline for
+   *  a next step that's already fully scoped by this task's own recap. */
+  async function createSubtask(name: string, executionReady = false) {
     setCreatingSubtaskKey(name);
     try {
       await api.createSubtask(taskId, {
         name,
         content: name,
+        exit_kind: executionReady ? "code_change" : undefined,
       });
       onMutate();
     } catch {
@@ -535,6 +561,30 @@ export function ReviewCTA({
   }
 
   const isMergeReview = isReview && task.exit_state === "needs_merge_approval";
+  const hasPendingDiff = task.reconcile_status === "pending_human_merge";
+
+  /** Prompt to open the diff modal — the one place code changes are actually
+   *  shown/pushed. Rendered directly in this panel (not just the header's
+   *  "review branch" pill) so accepting or rejecting a change is reachable
+   *  from wherever the task landed: mid-review, or already at "ready". */
+  function renderDiffBanner() {
+    if (!hasPendingDiff) return null;
+    return (
+      <div className="review-cta-row" style={{ margin: "10px 0" }}>
+        {task.github_pr_url ? (
+          <a className="pill ok" href={task.github_pr_url} target="_blank" rel="noreferrer">
+            PR open ↗
+          </a>
+        ) : null}
+        <button type="button" className="small review-cta-primary" onClick={onOpenDiff}>
+          🔍 View diff{task.git_branch ? ` — "${task.git_branch}"` : ""}
+        </button>
+        {task.reconcile_detail && (
+          <span className="muted" style={{ fontSize: 11 }}>{task.reconcile_detail}</span>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="panel review-cta-panel">
@@ -543,11 +593,40 @@ export function ReviewCTA({
           <span className="review-cta-tag">needs merge review</span>
           <h2>Code Ready for Merge Review</h2>
           <p className="review-reason">{reviewReason}</p>
-          {task.reconcile_status === "pending_human_merge" && (
-            <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-              Review the diff via the "review branch" pill above, then push/open a PR before approving.
-            </p>
-          )}
+          {renderDiffBanner()}
+
+          {/* Grounded verification (overhaul/05): what you are approving is a
+              diff PLUS a recorded run of the project's own checks — or, when
+              this block is absent/red, a diff plus an opinion. Saying which is
+              the entire point of showing it here. */}
+          {(() => {
+            const evidence = latestEvidenceByCommand(runs);
+            if (!evidence.length) {
+              return (
+                <div className="banner warn" style={{ margin: "10px 0" }}>
+                  ⚠ No verification evidence — nothing was executed against this change.{" "}
+                  <span className="banner-why">
+                    The verdict below is model self-assessment. Run the project's checks yourself
+                    before approving, or enable command execution for this project.
+                  </span>
+                </div>
+              );
+            }
+            const failing = evidence.filter((e) => !isEvidenceGreen(e));
+            return (
+              <>
+                {failing.length > 0 && (
+                  <div className="banner bad" style={{ margin: "10px 0" }}>
+                    ⚠ {failing.length} verification command did not pass.{" "}
+                    <span className="banner-why">
+                      Approving merges code whose own checks are red.
+                    </span>
+                  </div>
+                )}
+                <EvidencePanel evidence={evidence} title="Verification evidence for this change" />
+              </>
+            );
+          })()}
 
           <div className="review-cta-row">
             <button
@@ -589,6 +668,7 @@ export function ReviewCTA({
           <span className="review-cta-tag">needs review</span>
           <h2>Human Review Required</h2>
           <p className="review-reason">{reviewReason}</p>
+          {renderDiffBanner()}
 
           <div className="review-cta-row">
             <button
@@ -675,6 +755,7 @@ export function ReviewCTA({
                 (task.recap_md.length > 300 ? "…" : "")
               : "Task is ready for implementation."}
           </p>
+          {renderDiffBanner()}
 
           {actionItems.length > 0 && (
             <>
@@ -696,9 +777,18 @@ export function ReviewCTA({
                   <button
                     className="small review-cta-secondary"
                     disabled={creatingSubtaskKey === item}
+                    title="Create a follow-up task that re-runs full analysis (requirements/architecture/etc.) before implementing"
                     onClick={() => createSubtask(item)}
                   >
                     {creatingSubtaskKey === item ? "…" : "+ subtask"}
+                  </button>
+                  <button
+                    className="small review-cta-secondary"
+                    disabled={creatingSubtaskKey === item}
+                    title="Create a task that skips straight to implementation — use when this next step is already fully scoped"
+                    onClick={() => createSubtask(item, true)}
+                  >
+                    {creatingSubtaskKey === item ? "…" : "⚡ implement"}
                   </button>
                 </div>
               ))}

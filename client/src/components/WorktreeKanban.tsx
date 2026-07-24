@@ -24,10 +24,17 @@ function WorktreeCard({
   onClick: () => void;
 }) {
   const rs = family.root.reconcile_status;
+  // Aggregate run-health across the family (overhaul/04 §2): total degraded/empty
+  // runs, and whether any member's *latest* run degraded — the latter flags the
+  // card so a human scanning the board sees exactly where trust is currently low.
+  const degradedCount = family.members.reduce((n, m) => n + (m.degraded_runs ?? 0), 0);
+  const latestDegraded = family.members.some(
+    (m) => m.latest_health === "degraded" || m.latest_health === "empty",
+  );
   return (
     <button
       type="button"
-      className={`card card--button${isActive ? " card--processing" : ""}`}
+      className={`card card--button${isActive ? " card--processing" : ""}${latestDegraded ? " card--degraded" : ""}`}
       onClick={onClick}
     >
       <div className="title">{family.root.name ?? family.root.task_id.slice(0, 8)}</div>
@@ -36,6 +43,14 @@ function WorktreeCard({
         <span className="pill dim">
           {family.members.length} task{family.members.length === 1 ? "" : "s"}
         </span>
+        {degradedCount > 0 && (
+          <span
+            className={`pill ${latestDegraded ? "bad" : "warn"}`}
+            title="Degraded/empty runs in this worktree — the output may be salvaged or incomplete"
+          >
+            {degradedCount} degraded
+          </span>
+        )}
         {rs && <span className={`pill ${RECONCILE_PILL[rs] ?? "dim"}`}>{rs.replace(/_/g, " ")}</span>}
       </div>
     </button>

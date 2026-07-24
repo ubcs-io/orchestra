@@ -3,15 +3,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
-import { closeDb, createProject, createTask, getTask, listInterventions, listRoleRuns, listTasks, resetTask, updateProject, updateTask, type TaskRow } from "../src/db";
+import { closeDb, createCandidate, createIntervention, createProject, createRoleRun, createTask, getCandidate, getProject, getTask, getTaskHealthSummaries, listCandidates, listInterventions, listRoleRuns, listTasks, resetTask, updateCandidate, updateProject, updateTask, upsertConfig, type TaskRow } from "../src/db";
 import type { RoleRunRow } from "../src/db";
 import { resetConfig } from "../src/config";
-import { scaffoldPlanning, writeArtifact } from "../src/git";
-import { flowForIntake, ROUTING_TEMPLATES } from "../src/roles";
+import { appendArtifactSection, checkoutBranch, commitArtifacts, scaffoldPlanning, writeArtifact } from "../src/git";
+import { flowForIntake, ROUTING_TEMPLATES, type Criterion } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
 import {
+  applyFamilyBudget,
   applyPlanMutation,
+  checkEvidenceCriteria,
   dependenciesSatisfied,
+  EFFORT_BUDGET,
   inferIntakeKind,
   mergeCoverageItems,
   nextPending,
@@ -22,7 +25,9 @@ import {
   resetReachabilityChecker,
   resetRoleRunner,
   abortAllInFlight,
+  materializeIntakeTask,
   resolveDecompositionSubtasks,
+  resolveFamilyBudget,
   restoreCheckpoint,
   setReachabilityChecker,
   setRoleRunner,
@@ -30,7 +35,9 @@ import {
   tickOnce,
 } from "../src/orchestrator";
 import type { RoleRunner } from "../src/orchestrator";
-import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn } from "../src/router";
+import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn, setTriageFn } from "../src/router";
+import { resetHumanActivityClock } from "../src/autonomy";
+import { tickWatchers } from "../src/watchers";
 import { freshDb, tempGitRepo } from "./helpers";
 
 // The pre-flight reachability gate would otherwise hit a real (nonexistent)
@@ -245,6 +252,100 @@ describe("resolveDecompositionSubtasks", () => {
     expect(resolveDecompositionSubtasks(undefined)).toEqual({ subtasks: [], legacy: false });
     const decomp = { subtasks_json: "[]", output_md: "no bracket tags here" } as RoleRunRow;
     expect(resolveDecompositionSubtasks(decomp)).toEqual({ subtasks: [], legacy: false });
+  });
+});
+
+describe("resolveFamilyBudget / applyFamilyBudget", () => {
+  it("looks up maxCount/maxDepth by effort_size, scaled by rigor", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const root = createProjectTask(project.id, { effort_size: "S" });
+    expect(resolveFamilyBudget(root)).toEqual(EFFORT_BUDGET.S);
+    expect(resolveFamilyBudget(root, "minimal").maxCount).toBe(Math.ceil(EFFORT_BUDGET.S.maxCount * 0.6));
+    expect(resolveFamilyBudget(root, "thorough").maxCount).toBe(Math.ceil(EFFORT_BUDGET.S.maxCount * 1.5));
+  });
+
+  it("falls back to the M budget when effort_size hasn't been set yet", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const root = createProjectTask(project.id, { effort_size: null });
+    expect(resolveFamilyBudget(root)).toEqual(EFFORT_BUDGET.M);
+  });
+
+  it("truncates a proposed subtask list once the family's existing size would exceed maxCount", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    // "S" => maxCount 4. The root itself already counts as 1 family member,
+    // leaving room for exactly 3 more before the budget is exhausted.
+    const root = createProjectTask(project.id, { effort_size: "S" });
+    const proposed = Array.from({ length: 6 }, (_, i) =>
+      makeSubtask({ local_id: String(i + 1), level: "task", name: `Task ${i + 1}` }),
+    );
+    const decision = applyFamilyBudget(root, project, proposed);
+    expect(decision.budget).toEqual(EFFORT_BUDGET.S);
+    expect(decision.depthBlocked).toBe(false);
+    expect(decision.allowedSubtasks.length).toBe(3);
+    expect(decision.truncatedCount).toBe(3);
+  });
+
+  it("blocks non-leaf children once the family is already at the depth ceiling, keeping only execution-ready leaves", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    // "S" => maxDepth 1. A story that is itself already 1 hop below the root
+    // is AT the ceiling, so any further epic/story children it proposes must
+    // be refused — only already execution-ready task leaves may pass.
+    const root = createProjectTask(project.id, { effort_size: "S", level: "epic" });
+    const story = createTask({
+      name: "story",
+      project_id: project.id,
+      parent_task_id: root.task_id,
+      level: "story",
+    });
+    const proposed = [
+      makeSubtask({ local_id: "1", level: "story", name: "Nested story (should be dropped)" }),
+      makeSubtask({ local_id: "2", level: "task", name: "Leaf A", execution_ready: true }),
+      makeSubtask({ local_id: "3", level: "task", name: "Non-leaf task (dropped: not execution_ready)" }),
+    ];
+    const decision = applyFamilyBudget(story, project, proposed);
+    expect(decision.depthBlocked).toBe(true);
+    expect(decision.allowedSubtasks.map((s) => s.name)).toEqual(["Leaf A"]);
+    expect(decision.truncatedCount).toBe(2);
+  });
+
+  it("XS gets a zero budget at every depth, so any decomposition attempt is fully refused", () => {
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const root = createProjectTask(project.id, { effort_size: "XS" });
+    const proposed = [makeSubtask({ local_id: "1", level: "task", name: "Anything" })];
+    const decision = applyFamilyBudget(root, project, proposed);
+    expect(decision.allowedSubtasks).toEqual([]);
+    expect(decision.truncatedCount).toBe(1);
+  });
+
+  it("scales the budget by the root's effective planning_rigor (task override over project default)", () => {
+    freshDb();
+    seedGlobalRoles();
+    // Project default "thorough" (×1.5); root's own task-level override
+    // "minimal" (×0.6) must win — mirrors effectiveAutonomyLevel's precedence.
+    const project = createProject({
+      name: "p",
+      repo_path: tempGitRepo(),
+      config_json: JSON.stringify({ planningRigor: "thorough" }),
+    });
+    const root = createProjectTask(project.id, { effort_size: "M", planning_rigor: "minimal" });
+    const proposed = Array.from({ length: 10 }, (_, i) =>
+      makeSubtask({ local_id: String(i + 1), level: "task", name: `Task ${i + 1}` }),
+    );
+    const decision = applyFamilyBudget(root, project, proposed);
+    // M => maxCount 12; minimal => ×0.6 => ceil(7.2) = 8; root itself counts
+    // as 1 existing family member, leaving room for 7.
+    expect(decision.budget.maxCount).toBe(8);
+    expect(decision.allowedSubtasks.length).toBe(7);
   });
 });
 
@@ -491,6 +592,50 @@ function decompositionRetryRunner(failCount: number, subtasks: Subtask[]): RoleR
   };
 }
 
+/**
+ * Every ordinary role step just passes cleanly. The new recap-decomposition
+ * call (detected via its distinct systemPrompt, not context — it's a separate
+ * ad-hoc roleRunner call, not a normal pipeline step) either proposes the
+ * given `subtasks`, or throws if `throwOnRecapDecomposition` is set (for
+ * exercising the error/timeout-swallowing path). The prose recap call (also
+ * detected via systemPrompt) just returns a trivial summary.
+ */
+function recapDecompositionRunner(
+  subtasks: Subtask[],
+  opts: { throwOnRecapDecomposition?: boolean } = {},
+): RoleRunner {
+  return async (params) => {
+    const isRecapDecomp = params.systemPrompt.includes(
+      "reviewing a just-finished task's complete history",
+    );
+    const isProseRecap = params.systemPrompt.includes(
+      "orchestration layer performing a final recap",
+    );
+    if (isRecapDecomp && opts.throwOnRecapDecomposition) {
+      throw new Error("simulated recap-decomposition failure");
+    }
+    return {
+      findings: {
+        verdict: "pass",
+        summary: isRecapDecomp ? "recap-decomposition" : isProseRecap ? "recap" : "pass from fake",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: "## role\ndone",
+        criteria_results: [],
+        subtasks: isRecapDecomp ? subtasks : undefined,
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+    };
+  };
+}
+
 function rootTask(projectId: number): TaskRow | undefined {
   return listTasks({ projectId }).find((t) => t.parent_task_id == null);
 }
@@ -572,8 +717,11 @@ describe("orchestrator loop (integration)", () => {
     );
     // The decomposition role produces two non-recursive "task"-level children
     // on its first invocation only; every later decomposition call (i.e. each
-    // child's own terminal role) reports zero subtasks with a stated reason,
-    // so the tree never grows past one level.
+    // child's own terminal role) reports zero subtasks with a stated reason —
+    // which the orchestrator now treats as "this one node is itself atomic",
+    // spinning up exactly one execution-ready grandchild per child instead of
+    // growing the subtask tree further. So the family ends up 5-deep (root +
+    // 2 children + 2 grandchildren), not 3.
     let decompCalls = 0;
     const childSubtasks: Subtask[] = [
       makeSubtask({ local_id: "1", name: "Child A" }),
@@ -592,13 +740,13 @@ describe("orchestrator loop (integration)", () => {
     const t0 = rootTask(projectId);
     if (t0) updateTask(t0.task_id, { level: "epic" });
 
-    // Drain until the whole family (root + both children) is out of
-    // intake/refining — enough ticks for root + 2 children's full flows.
-    for (let i = 0; i < 60; i++) {
+    // Drain until every family member (root, both children, and each child's
+    // own synthesized execution-ready grandchild) is out of intake/refining.
+    for (let i = 0; i < 80; i++) {
       await tick();
       const t = rootTask(projectId);
-      const children = t ? listTasks({ parentTaskId: t.task_id }) : [];
-      if (t && t.stage !== "intake" && t.stage !== "refining" && children.length === 2 && children.every((c) => c.stage !== "intake" && c.stage !== "refining")) {
+      const family = t ? listTasks({ rootTaskId: t.task_id }).filter((m) => m.task_id !== t.task_id) : [];
+      if (t && t.stage !== "intake" && t.stage !== "refining" && family.length === 4 && family.every((m) => m.stage !== "intake" && m.stage !== "refining")) {
         break;
       }
     }
@@ -607,8 +755,20 @@ describe("orchestrator loop (integration)", () => {
     const children = listTasks({ parentTaskId: t.task_id });
     expect(children.length).toBe(2);
     expect(children.every((c) => c.stage === "ready" || c.stage === "review")).toBe(true);
+    const grandchildren = children.flatMap((c) => listTasks({ parentTaskId: c.task_id }));
+    expect(grandchildren.length).toBe(2);
+    expect(grandchildren.every((g) => g.exit_kind === "code_change")).toBe(true);
+    // A code_change leaf always finishes at review/needs_merge_approval, with
+    // reconcile_status set directly on its own row (unlike the family root's,
+    // which maybeReconcileFamily computes once every member has settled).
+    expect(grandchildren.every((g) => g.stage === "review")).toBe(true);
+    expect(grandchildren.every((g) => g.exit_state === "needs_merge_approval")).toBe(true);
+    expect(grandchildren.every((g) => g.reconcile_status === "pending_human_merge")).toBe(true);
     // Now that every family member has settled, exactly one merge happened,
-    // recorded only on the root's row.
+    // recorded only on the root's row — the grandchildren's own
+    // "pending_human_merge" above doesn't block this: nothing in this stubbed
+    // run actually wrote source (see wrote_source), so maybeReconcileFamily
+    // still finds the family clean to auto-merge.
     expect(t.reconcile_status).toBe("merged");
     expect(children.every((c) => c.reconcile_status === null)).toBe(true);
     expect(fs.existsSync(path.join(repo, t.artifact_path!))).toBe(true);
@@ -724,13 +884,20 @@ describe("orchestrator loop (integration)", () => {
     expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
   });
 
-  it("finalizes normally (no escalation, no children) when decomposition states an intentional no_decomposition_reason", async () => {
+  it("spins up a single execution-ready child (no escalation) when decomposition states an intentional no_decomposition_reason", async () => {
+    // Zero subtasks + a stated reason means decomposition judged the *whole
+    // task* atomic — the same judgement `execution_ready: true` expresses on
+    // an individual subtask node, just applied to the task as a whole. That
+    // must not dead-end at spec-ready with nothing but prose recommendations
+    // and no code ever written — it should synthesize exactly one
+    // execution-ready child carrying the reason forward as its brief.
     const { repo, projectId } = setupProject();
     writeArtifact(
       path.join(repo, "PLANNING", "INTAKE", "crash.log"),
       "Traceback (most recent call last):\nValueError: boom",
     );
-    setRoleRunner(decompositionRunner({ noDecompositionReason: "Already one atomic, independently-actionable unit." }));
+    const reason = "Already one atomic, independently-actionable unit.";
+    setRoleRunner(decompositionRunner({ noDecompositionReason: reason }));
 
     await tick();
     const t0 = rootTask(projectId);
@@ -741,7 +908,286 @@ describe("orchestrator loop (integration)", () => {
     const t = rootTask(projectId)!;
     expect(t.stage).toBe("ready");
     expect(t.exit_state).toBe("ready_for_work");
-    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBe(1);
+    const child = children[0]!;
+    expect(child.exit_kind).toBe("code_change");
+    expect(child.content).toContain(reason);
+    expect(child.git_worktree_path).toBe(t.git_worktree_path);
+    expect(child.git_branch).toBe(t.git_branch);
+
+    // Drive the synthesized child to completion with a plain passing runner —
+    // if it were re-entering the normal planning/decomposition flow instead
+    // of skipping straight to execution, intake_triage/requirements_analyst/
+    // decomposition would show up in its role_runs too.
+    setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: [] }));
+    for (let i = 0; i < 20; i++) {
+      await tick();
+      if (getTask(child.task_id)!.stage !== "intake" && getTask(child.task_id)!.stage !== "refining") break;
+    }
+    const finishedChild = getTask(child.task_id)!;
+    expect(finishedChild.stage).toBe("review");
+    expect(finishedChild.exit_state).toBe("needs_merge_approval");
+    expect(listRoleRuns(child.task_id).map((r) => r.role_key)).toEqual(["developer", "critic"]);
+  });
+
+  it("does NOT promote level to 'story' for a synthesized no_decomposition_reason leaf — 'no children, already atomic' is a clean pass, not a decomposition", async () => {
+    // Left at the default "task" level (unlike the test above, which forces
+    // "epic" beforehand): the synthesized single execution-ready child must
+    // still be spawned (decompositionSynthesized bypasses the old
+    // level==="epic"||"story" gate), but the parent's own level must stay
+    // "task" — promoting it to "story" here would misrepresent a genuinely
+    // atomic task as a multi-child story it never became.
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    setRoleRunner(decompositionRunner({ noDecompositionReason: "Already one atomic unit." }));
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    expect(t.level).toBe("task");
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(1);
+  });
+
+  it("truncates real decomposition output to the family's effort_size budget and records a steer_note intervention", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    // "S" => maxCount 4; the root itself counts as 1 family member, leaving
+    // room for exactly 3 of the 6 proposed children.
+    const proposed = Array.from({ length: 6 }, (_, i) =>
+      makeSubtask({ local_id: String(i + 1), level: "task", name: `Subtask ${i + 1}` }),
+    );
+    setRoleRunner(decompositionRunner({ decompSubtasks: proposed }));
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic", effort_size: "S" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.length).toBe(3);
+    const notes = listInterventions(t.task_id)
+      .filter((i) => i.kind === "steer_note")
+      .map((i) => JSON.parse(i.payload_json ?? "{}").text as string);
+    expect(notes.some((text) => text.includes("[orchestrator·budget]"))).toBe(true);
+  });
+
+  it("gives decomposition children family-wide sibling awareness, and skips re-running intake_triage/explorer on them", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+
+    // Keyed by task name (from the "# Task: ..." header) -> the raw context
+    // text seen by that task's OWN decomposition-role call.
+    const decompContexts: Record<string, string> = {};
+    const runner: RoleRunner = async (params) => {
+      const isReviewer = params.context.includes("Acceptance criteria to verify");
+      const roleMatches = [...params.context.matchAll(/You are the \*\*([a-zA-Z_]+)\*\* role/g)];
+      const role = roleMatches.length ? roleMatches[roleMatches.length - 1]![1]! : "";
+      const taskName = params.context.match(/# Task: (.+)/)?.[1] ?? "?";
+      const criteria: CriteriaResult[] = isReviewer
+        ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => ({ id: m[1]!, status: "met" as const }))
+        : [];
+
+      let subtasks: Subtask[] | undefined;
+      let noDecompositionReason: string | undefined;
+      if (role === "decomposition") {
+        decompContexts[taskName] = params.context;
+        if (taskName === "First Task" || taskName === "Second Task") {
+          // Each child judges itself already atomic — terminates in one hop
+          // (a synthesized execution-ready grandchild) instead of splitting further.
+          noDecompositionReason = "Already one atomic, independently-actionable unit.";
+        } else {
+          // The root: split into two sibling "task"-level (non-execution-ready)
+          // children so each goes through its own full spec pipeline.
+          subtasks = [
+            makeSubtask({ local_id: "1", level: "task", name: "First Task", brief: "Do the first thing." }),
+            makeSubtask({ local_id: "2", level: "task", name: "Second Task", brief: "Do the second thing." }),
+          ];
+        }
+      }
+      return {
+        findings: {
+          verdict: "pass",
+          summary: role === "decomposition" ? "decomposition done" : "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: role === "decomposition" ? "## Decomposition\n(see structured subtasks)" : "## role\ndone",
+          criteria_results: criteria,
+          subtasks,
+          no_decomposition_reason: noDecompositionReason,
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    };
+    setRoleRunner(runner);
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("ready");
+    const children = listTasks({ parentTaskId: t.task_id });
+    expect(children.map((c) => c.name).sort()).toEqual(["First Task", "Second Task"]);
+
+    // Drive both children forward until each has reached its own
+    // decomposition step (no need to run them to full completion).
+    for (let i = 0; i < 150; i++) {
+      await tick();
+      const bothDecomposed = children.every((c) =>
+        listRoleRuns(c.task_id).some((r) => r.role_key === "decomposition"),
+      );
+      if (bothDecomposed) break;
+    }
+
+    // §6: a decomposition child already inherited its content from the
+    // parent's decomposition output — intake_triage/explorer never re-run.
+    for (const c of children) {
+      const roleKeys = listRoleRuns(c.task_id).map((r) => r.role_key);
+      expect(roleKeys).not.toContain("intake_triage");
+      expect(roleKeys).not.toContain("explorer");
+    }
+
+    // §5: both children exist (created together) before either reaches its
+    // own decomposition step, so each one's decomposition context should
+    // list the OTHER as an existing family member.
+    expect(decompContexts["First Task"]).toContain("Already exists in this family");
+    expect(decompContexts["First Task"]).toContain("Second Task");
+    expect(decompContexts["Second Task"]).toContain("Already exists in this family");
+    expect(decompContexts["Second Task"]).toContain("First Task");
+  });
+
+  it("XS fast path: routes straight to developer/critic once explorer reports effort_size XS, skipping architecture_review/test_strategy/bug_review/decomposition entirely", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    const runner: RoleRunner = async (params) => {
+      const isReviewer = params.context.includes("Acceptance criteria to verify");
+      const isExplorer = params.context.includes("You are the **explorer** role");
+      const criteria: CriteriaResult[] = isReviewer
+        ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => ({ id: m[1]!, status: "met" as const }))
+        : [];
+      return {
+        findings: {
+          verdict: "pass",
+          summary: "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\ndone",
+          criteria_results: criteria,
+          effort_size: isExplorer ? "XS" : undefined,
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    };
+    setRoleRunner(runner);
+
+    await drainTicks(projectId, (t) => t.stage === "review" || t.stage === "ready", 40);
+
+    const t = rootTask(projectId)!;
+    expect(t.effort_size).toBe("XS");
+    expect(t.exit_kind).toBe("code_change");
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_merge_approval");
+    // error_file's normal flow is intake_triage/explorer/bug_investigator/
+    // architecture_review/test_strategy/bug_review/decomposition — the fast
+    // path must skip straight from explorer to developer/critic, never
+    // touching any of the roles in between.
+    expect(listRoleRuns(t.task_id).map((r) => r.role_key)).toEqual([
+      "intake_triage",
+      "explorer",
+      "developer",
+      "critic",
+    ]);
+  });
+
+  it("does NOT take the XS fast path when planning_rigor is 'thorough', even with effort_size XS", async () => {
+    // Project-level default set up front (rather than a task-level override
+    // applied mid-run) so it's already in effect the first time explorer
+    // runs — a task-level override can't be set before the task exists.
+    const repo = tempGitRepo();
+    freshDb();
+    seedGlobalRoles();
+    const project = createProject({
+      name: "p",
+      repo_path: repo,
+      config_json: JSON.stringify({ planningRigor: "thorough" }),
+    });
+    scaffoldPlanning(repo, "PLANNING");
+    const projectId = project.id;
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+
+    setRoleRunner(async (params) => {
+      const isReviewer = params.context.includes("Acceptance criteria to verify");
+      const isExplorer = params.context.includes("You are the **explorer** role");
+      const isDecomp = params.context.includes("**decomposition** role");
+      const criteria: CriteriaResult[] = isReviewer
+        ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => ({ id: m[1]!, status: "met" as const }))
+        : [];
+      return {
+        findings: {
+          verdict: "pass",
+          summary: "pass from fake",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\ndone",
+          criteria_results: criteria,
+          effort_size: isExplorer ? "XS" : undefined,
+          no_decomposition_reason: isDecomp ? "Already atomic." : undefined,
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+      };
+    });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 40);
+
+    const t = rootTask(projectId)!;
+    expect(t.effort_size).toBe("XS");
+    // Rigor "thorough" opts out of the fast path — normal spec pipeline
+    // still runs all the way to decomposition's own no-op termination.
+    expect(t.exit_kind).toBe("spec");
+    expect(listRoleRuns(t.task_id).map((r) => r.role_key)).toContain("decomposition");
   });
 
   it("seeds decomposition children with brief/acceptance-criteria/carried-forward context and resolved dependencies, and the scheduler holds a dependent child until its dependency is ready", async () => {
@@ -881,6 +1327,436 @@ describe("orchestrator loop (integration)", () => {
     expect(listRoleRuns(execChild.task_id).map((r) => r.role_key)).toEqual(["developer", "critic"]);
   });
 
+  describe("autonomy level (plan / edit / auto)", () => {
+    function setProjectAutonomyLevel(projectId: number, level: "plan" | "edit" | "auto"): void {
+      updateProject(projectId, { config_json: JSON.stringify({ autonomyLevel: level }) });
+    }
+
+    /** Writes a real file to the role's own worktree on its first call only
+     *  (a code-change leaf's plan is always exactly [developer, critic], so
+     *  the first call is always the developer step) and reports it via
+     *  filesWritten, so the orchestrator commits a real change worth merging. */
+    function developerWritesFileRunner(fileName: string, content: string): RoleRunner {
+      let calls = 0;
+      return async (params) => {
+        calls += 1;
+        const isDeveloper = calls === 1;
+        if (isDeveloper) fs.writeFileSync(path.join(params.repoPath, fileName), content);
+        return {
+          findings: {
+            verdict: "pass",
+            summary: "pass from fake",
+            open_questions: [],
+            coverage: ALL_CONSIDERED,
+            section_md: "## role\ndone",
+            criteria_results: [],
+          },
+          toolCalls: [],
+          transcriptJsonl: "",
+          tokens: 1,
+          model: "fake",
+          fallback: false,
+          stalled: false,
+          thinkingText: "",
+          filesWritten: isDeveloper ? [fileName] : [],
+        };
+      };
+    }
+
+    it('"plan" never promotes a real decomposition subtask to code_change, even when flagged execution_ready', async () => {
+      const { repo, projectId } = setupProject();
+      setProjectAutonomyLevel(projectId, "plan");
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true })],
+        }),
+      );
+
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const root = rootTask(projectId)!;
+      const child = listTasks({ parentTaskId: root.task_id })[0]!;
+      expect(child.exit_kind).not.toBe("code_change");
+      expect(child.exit_kind).toBe("spec");
+    });
+
+    it('"plan" also blocks the whole-task atomic-synthesis path (zero subtasks + reason)', async () => {
+      const { repo, projectId } = setupProject();
+      setProjectAutonomyLevel(projectId, "plan");
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(decompositionRunner({ noDecompositionReason: "Atomic fix, no further decomposition needed." }));
+
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const root = rootTask(projectId)!;
+      expect(root.stage).toBe("ready");
+      const children = listTasks({ parentTaskId: root.task_id });
+      expect(children.length).toBe(1);
+      expect(children[0]!.exit_kind).not.toBe("code_change");
+    });
+
+    it('"auto" auto-merges a clean code_change leaf instead of parking at needs_merge_approval', async () => {
+      const { repo, projectId } = setupProject();
+      // Set BEFORE decomposition runs — a child snapshots its parent's
+      // resolved effective level onto its own autonomy_level column at
+      // creation time (Gate 1), not a live re-read of the project default.
+      setProjectAutonomyLevel(projectId, "auto");
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true })],
+        }),
+      );
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const execChild = listTasks({ parentTaskId: rootTask(projectId)!.task_id })[0]!;
+      expect(execChild.exit_kind).toBe("code_change");
+      expect(execChild.autonomy_level).toBe("auto");
+
+      setRoleRunner(developerWritesFileRunner("feature.txt", "hello\n"));
+      for (let i = 0; i < 20; i++) {
+        await tick();
+        const c = getTask(execChild.task_id)!;
+        if (c.stage !== "intake" && c.stage !== "refining") break;
+      }
+
+      const finished = getTask(execChild.task_id)!;
+      expect(finished.stage).toBe("ready");
+      expect(finished.exit_state).toBe("ready_for_work");
+      expect(finished.status).toBe("complete");
+      expect(["merged", "up_to_date"]).toContain(finished.reconcile_status);
+    });
+
+    it('"auto" falls back to needs_merge_approval on a genuine merge conflict instead of swallowing it', async () => {
+      const { repo, projectId } = setupProject();
+      setProjectAutonomyLevel(projectId, "auto"); // before decomposition — see Gate 1 snapshot note above
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true })],
+        }),
+      );
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const root = rootTask(projectId)!;
+      const execChild = listTasks({ parentTaskId: root.task_id })[0]!;
+
+      // Seed a conflicting commit on base, touching the same file the
+      // developer step is about to write, before the auto-merge is attempted.
+      checkoutBranch(repo, root.git_base_branch!);
+      writeArtifact(path.join(repo, "feature.txt"), "base version\n");
+      commitArtifacts(repo, ["feature.txt"], "base: conflicting change");
+
+      setRoleRunner(developerWritesFileRunner("feature.txt", "task version\n"));
+      for (let i = 0; i < 20; i++) {
+        await tick();
+        const c = getTask(execChild.task_id)!;
+        if (c.stage !== "intake" && c.stage !== "refining") break;
+      }
+
+      const finished = getTask(execChild.task_id)!;
+      expect(finished.stage).toBe("review");
+      expect(finished.exit_state).toBe("needs_merge_approval");
+      expect(finished.reconcile_status).toBe("conflict");
+    });
+
+    it('"auto" also auto-merges via the generic family wrote_source path (non-code_change), falling back to a recorded conflict on divergence', async () => {
+      const { projectId: projectIdClean } = setupProject();
+      setProjectAutonomyLevel(projectIdClean, "auto");
+      materializeIntakeTask(getProject(projectIdClean)!, {
+        name: "Should we cache this lookup?",
+        content: "Investigate caching options.",
+        intakeKind: "question",
+      });
+      setRoleRunner(
+        (() => {
+          let calls = 0;
+          return async (params) => {
+            calls += 1;
+            const isFirst = calls === 1;
+            if (isFirst) fs.writeFileSync(path.join(params.repoPath, "note.txt"), "hello\n");
+            return {
+              findings: {
+                verdict: "pass" as const,
+                summary: "pass from fake",
+                open_questions: [],
+                coverage: ALL_CONSIDERED,
+                section_md: "## role\ndone",
+                criteria_results: [],
+              },
+              toolCalls: [],
+              transcriptJsonl: "",
+              tokens: 1,
+              model: "fake",
+              fallback: false,
+              stalled: false,
+              thinkingText: "",
+              filesWritten: isFirst ? ["note.txt"] : [],
+            };
+          };
+        })(),
+      );
+      await drainTicks(projectIdClean, (t) => t.stage === "ready" || t.stage === "review", 40);
+      const cleanRoot = rootTask(projectIdClean)!;
+      expect(cleanRoot.wrote_source).toBe(1);
+      expect(["merged", "up_to_date"]).toContain(cleanRoot.reconcile_status);
+
+      // Conflicting variant: seed a diverging commit on base first.
+      const { projectId, repo } = setupProject();
+      setProjectAutonomyLevel(projectId, "auto");
+      const project = getProject(projectId)!;
+      const task = materializeIntakeTask(project, {
+        name: "Should we cache this lookup?",
+        content: "Investigate caching options.",
+        intakeKind: "question",
+      });
+      checkoutBranch(repo, task.git_base_branch!);
+      writeArtifact(path.join(repo, "note.txt"), "base version\n");
+      commitArtifacts(repo, ["note.txt"], "base: conflicting change");
+      setRoleRunner(
+        (() => {
+          let calls = 0;
+          return async (params) => {
+            calls += 1;
+            const isFirst = calls === 1;
+            if (isFirst) fs.writeFileSync(path.join(params.repoPath, "note.txt"), "task version\n");
+            return {
+              findings: {
+                verdict: "pass" as const,
+                summary: "pass from fake",
+                open_questions: [],
+                coverage: ALL_CONSIDERED,
+                section_md: "## role\ndone",
+                criteria_results: [],
+              },
+              toolCalls: [],
+              transcriptJsonl: "",
+              tokens: 1,
+              model: "fake",
+              fallback: false,
+              stalled: false,
+              thinkingText: "",
+              filesWritten: isFirst ? ["note.txt"] : [],
+            };
+          };
+        })(),
+      );
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 40);
+      const conflictedRoot = rootTask(projectId)!;
+      expect(conflictedRoot.wrote_source).toBe(1);
+      expect(conflictedRoot.reconcile_status).toBe("conflict");
+    });
+
+    it("a task-level override takes effect over the project default", async () => {
+      const { repo, projectId } = setupProject();
+      // Project default left at "edit" — the override alone must be what refuses code_change.
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true })],
+        }),
+      );
+      await tick();
+      const t0 = rootTask(projectId)!;
+      updateTask(t0.task_id, { level: "epic", autonomy_level: "plan" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const root = rootTask(projectId)!;
+      const child = listTasks({ parentTaskId: root.task_id })[0]!;
+      expect(child.exit_kind).not.toBe("code_change");
+    });
+
+    it("a spawned child inherits the parent's resolved effective autonomy level", async () => {
+      const { repo, projectId } = setupProject();
+      setProjectAutonomyLevel(projectId, "auto");
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [
+            makeSubtask({ local_id: "1", name: "Child A" }),
+            makeSubtask({ local_id: "2", name: "Child B" }),
+          ],
+        }),
+      );
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const root = rootTask(projectId)!;
+      const children = listTasks({ parentTaskId: root.task_id });
+      expect(children.length).toBe(2);
+      expect(children.every((c) => c.autonomy_level === "auto")).toBe(true);
+    });
+  });
+
+  describe("recap-driven decomposition", () => {
+    it("recap proposes a follow-up subtask for a research_brief-exit task (no pipeline decomposition step at all in this flow), tagging it origin_role_key: 'recap', sharing the family worktree/branch, and the family reconciles once it settles", async () => {
+      const { projectId } = setupProject();
+      const project = getProject(projectId)!;
+      // "question" intake → exit_kind research_brief, terminal role
+      // research_synthesis — this flow has no "decomposition" step at all, so
+      // any child that appears must come from the new mechanism, not the
+      // pre-existing pipeline gate.
+      materializeIntakeTask(project, {
+        name: "Does the cache need eviction?",
+        content: "Investigate whether the cache needs an eviction policy.",
+        intakeKind: "question",
+      });
+      setRoleRunner(
+        recapDecompositionRunner([
+          makeSubtask({ local_id: "1", name: "Add a regression test for the eviction check", execution_ready: true }),
+        ]),
+      );
+
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 40);
+
+      const root = rootTask(projectId)!;
+      expect(root.exit_kind).toBe("research_brief");
+      expect(root.stage).toBe("ready");
+      const children = listTasks({ parentTaskId: root.task_id });
+      expect(children.length).toBe(1);
+      expect(children[0]!.origin_role_key).toBe("recap");
+      expect(children[0]!.exit_kind).toBe("code_change");
+      expect(children[0]!.git_worktree_path).toBe(root.git_worktree_path);
+      expect(children[0]!.git_branch).toBe(root.git_branch);
+      // Family hasn't merged yet — the recap-spawned child is still at intake.
+      expect(getTask(root.task_id)!.reconcile_status).not.toBe("merged");
+
+      // Drive the recap-spawned child to completion.
+      setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: [] }));
+      for (let i = 0; i < 20; i++) {
+        await tick();
+        const c = getTask(children[0]!.task_id)!;
+        if (c.stage !== "intake" && c.stage !== "refining") break;
+      }
+      const finishedChild = getTask(children[0]!.task_id)!;
+      expect(finishedChild.stage).toBe("review");
+      expect(finishedChild.exit_state).toBe("needs_merge_approval");
+
+      // One more tick lets the root's own family-reconciliation re-check fire
+      // now that every member (root + recap-spawned child) has settled.
+      await tick();
+      expect(getTask(root.task_id)!.reconcile_status).toBe("merged");
+    });
+
+    it("a recap-spawned child's own recap never proposes further children — the recursion bound caps every lineage at one hop", async () => {
+      const { projectId } = setupProject();
+      const project = getProject(projectId)!;
+      materializeIntakeTask(project, {
+        name: "Should we cache this lookup?",
+        content: "Investigate caching options for this lookup.",
+        intakeKind: "question",
+      });
+      // Always willing to propose a subtask, no matter which task's recap is asking.
+      setRoleRunner(
+        recapDecompositionRunner([
+          makeSubtask({ local_id: "1", name: "Follow-up work", execution_ready: true }),
+        ]),
+      );
+
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 40);
+      const root = rootTask(projectId)!;
+      const children = listTasks({ parentTaskId: root.task_id });
+      expect(children.length).toBe(1);
+      expect(children[0]!.origin_role_key).toBe("recap");
+
+      // Drive the recap-spawned child through completion with the SAME
+      // always-propose runner — if the recursion bound didn't hold, this
+      // child would spawn its own grandchild too.
+      for (let i = 0; i < 20; i++) {
+        await tick();
+        const c = getTask(children[0]!.task_id)!;
+        if (c.stage !== "intake" && c.stage !== "refining") break;
+      }
+      expect(listTasks({ parentTaskId: children[0]!.task_id }).length).toBe(0);
+    });
+
+    it("swallows a recap-decomposition call failure without escalating or blocking the task from reaching ready", async () => {
+      const { projectId } = setupProject();
+      const project = getProject(projectId)!;
+      materializeIntakeTask(project, {
+        name: "Should we cache this lookup?",
+        content: "Investigate caching options for this lookup.",
+        intakeKind: "question",
+      });
+      setRoleRunner(recapDecompositionRunner([], { throwOnRecapDecomposition: true }));
+
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 40);
+
+      const root = rootTask(projectId)!;
+      expect(root.stage).toBe("ready");
+      expect(root.exit_state).toBe("ready_for_work");
+      expect(listTasks({ parentTaskId: root.task_id }).length).toBe(0);
+    });
+
+    it("does not propose follow-ups for a code_change-exit task awaiting merge approval", async () => {
+      const { repo, projectId } = setupProject();
+      writeArtifact(
+        path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+        "Traceback (most recent call last):\nValueError: boom",
+      );
+      setRoleRunner(
+        decompositionRunner({
+          decompSubtasks: [makeSubtask({ local_id: "1", name: "Atomic fix", execution_ready: true })],
+        }),
+      );
+      await tick();
+      const t0 = rootTask(projectId);
+      if (t0) updateTask(t0.task_id, { level: "epic" });
+      await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+      const execChild = listTasks({ parentTaskId: rootTask(projectId)!.task_id })[0]!;
+      // Always willing to propose a subtask — if the code_change branch wired
+      // this up (it must not), this would spawn a grandchild.
+      setRoleRunner(
+        recapDecompositionRunner([
+          makeSubtask({ local_id: "1", name: "Add a regression test", execution_ready: true }),
+        ]),
+      );
+      for (let i = 0; i < 20; i++) {
+        await tick();
+        const c = getTask(execChild.task_id)!;
+        if (c.stage !== "intake" && c.stage !== "refining") break;
+      }
+      const finished = getTask(execChild.task_id)!;
+      expect(finished.stage).toBe("review");
+      expect(finished.exit_state).toBe("needs_merge_approval");
+      expect(listTasks({ parentTaskId: execChild.task_id }).length).toBe(0);
+    });
+  });
+
   it("escalates to REVIEW when a role returns needs_human", async () => {
     const { repo, projectId } = setupProject();
     writeArtifact(path.join(repo, "PLANNING", "INTAKE", "vague.md"), "make it better somehow");
@@ -1006,9 +1882,16 @@ describe("orchestrator loop (integration)", () => {
     // Family locking claims the whole family for the round, not just one
     // slot — so with a persistent family lock, later rounds keep dispatching
     // this family one member at a time until every member has advanced.
-    for (let i = 0; i < 5; i++) {
+    // Round budget generous on purpose: `pickNextTasks` breaks ties in
+    // `updated_at` (second-precision — db.ts's now()) by insertion order, so
+    // the untouched sibling only overtakes the recently-touched one once a
+    // real wall-clock second boundary has passed; a tight round count is
+    // flaky under system load for reasons unrelated to what this test checks
+    // (family-exclusive dispatch), so it errs generous rather than racy.
+    for (let i = 0; i < 30; i++) {
       await tickOnce(2);
       expect(maxInFlight).toBe(1);
+      if (getTask(root.task_id)!.stage !== "intake" && getTask(child.task_id)!.stage !== "intake") break;
     }
     expect(getTask(root.task_id)!.stage).not.toBe("intake");
     expect(getTask(child.task_id)!.stage).not.toBe("intake");
@@ -1133,6 +2016,337 @@ describe("orchestrator loop (integration)", () => {
     expect(first.stop_reason).toBe("length");
     expect(first.thinking_md).toBe("the model was thinking hard");
   });
+
+  it("persists phase / failed_tool_calls / artifact_bytes and derives degraded health (overhaul/04)", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // A twoPhase run that truncated in phase 1, had a failed tool call, streamed
+    // nothing to the artifact, and fell back on its verdict.
+    setRoleRunner(async () => ({
+      findings: {
+        verdict: "needs_more",
+        summary: "truncated",
+        open_questions: [],
+        coverage: ALL_CONSIDERED,
+        section_md: "partial answer",
+        criteria_results: [],
+      },
+      toolCalls: [{ tool: "read_file", args: undefined, isError: true, error: "denied" }],
+      transcriptJsonl: "",
+      tokens: 42,
+      model: "fake",
+      fallback: true,
+      stalled: false,
+      stopReason: "length",
+      phase: 1,
+      thinkingText: "reasoning",
+      artifactBytesAppended: 0,
+      verdictSource: "fallback",
+      filesWritten: [],
+    }));
+
+    await drainTicks(projectId, () => listRoleRuns(rootTask(projectId)!.task_id).length > 0, 5);
+
+    const first = listRoleRuns(rootTask(projectId)!.task_id)[0]!;
+    expect(first.phase).toBe(1);
+    expect(first.failed_tool_calls).toBe(1);
+    expect(first.artifact_bytes).toBe(0);
+    expect(first.verdict_source).toBe("fallback");
+    // fallback + non-blank prose ("partial answer") → degraded, not empty.
+    const summary = getTaskHealthSummaries([first.task_id]).get(first.task_id)!;
+    expect(summary.degraded_runs).toBeGreaterThanOrEqual(1);
+    expect(summary.latest_health).toBe("degraded");
+  });
+
+  it("counter-reviewer distrust: a degraded reviewer run's criteria are unverified, so the gate loops back (overhaul/04 §4)", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // The reviewer reports "pass" with every criterion met, but ITS OWN run is
+    // degraded (fallback) — so its criteria_results are not trustworthy evidence.
+    // Producers stay healthy; only the reviewer is degraded.
+    setRoleRunner(async (params) => {
+      const isReviewer = params.context.includes("Acceptance criteria to verify");
+      const ids = isReviewer
+        ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => m[1]!)
+        : [];
+      return {
+        findings: {
+          verdict: "pass",
+          summary: isReviewer ? "reviewer pass" : "producer pass",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: "## role\ndone",
+          criteria_results: ids.map((id) => ({ id, status: "met" as const })),
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: isReviewer,
+        stalled: false,
+        verdictSource: isReviewer ? "fallback" : "tool",
+        thinkingText: "",
+        filesWritten: [],
+      };
+    });
+
+    await drainTicks(projectId, (t) => t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    // The reviewer re-ran because its evidence was never trusted (loop-backs then
+    // escalation) rather than passing on the first degraded self-report.
+    const reviewerRuns = listRoleRuns(t.task_id).filter(
+      (r) => r.role_key === "bug_review" && (r.run_kind === "primary" || !r.run_kind),
+    );
+    expect(reviewerRuns.length).toBeGreaterThanOrEqual(2);
+    expect(t.review_reason?.toLowerCase()).toContain("unverified");
+  });
+
+  it("READY health gate blocks promotion when the terminal run is degraded (overhaul/04 §4)", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    // Enable the gate (new projects get this by default; existing ones opt in).
+    updateProject(projectId, { config_json: JSON.stringify({ requireHealthyTerminal: true }) });
+    // Reviewer + producers healthy; the terminal decomposition run is degraded
+    // but still emits subtasks — so only the health gate (not the zero-subtask
+    // check) can hold it back. Without the gate this reaches ready with children.
+    const subtasks = [makeSubtask({ local_id: "1", name: "Only task" })];
+    setRoleRunner(async (params) => {
+      const isReviewer = params.context.includes("Acceptance criteria to verify");
+      const isDecomp = params.context.includes("**decomposition** role");
+      const ids = isReviewer
+        ? [...params.context.matchAll(/`([a-z_]+\.[a-z_]+)`/gi)].map((m) => m[1]!)
+        : [];
+      return {
+        findings: {
+          verdict: "pass",
+          summary: isDecomp ? "decomposition done" : "pass",
+          open_questions: [],
+          coverage: ALL_CONSIDERED,
+          section_md: isDecomp ? "## Decomposition\n(structured)" : "## role\ndone",
+          criteria_results: ids.map((id) => ({ id, status: "met" as const })),
+          subtasks: isDecomp ? subtasks : undefined,
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: isDecomp,
+        stalled: false,
+        verdictSource: isDecomp ? "fallback" : "tool",
+        thinkingText: "",
+        filesWritten: [],
+      };
+    });
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    const t = rootTask(projectId)!;
+    expect(t.stage).toBe("review");
+    expect(t.review_reason?.toLowerCase()).toContain("degraded");
+    // The degraded terminal never promoted → no decomposition children spawned.
+    expect(listTasks({ parentTaskId: t.task_id }).length).toBe(0);
+  });
+});
+
+describe("priority-aware scheduling (PLANNING/overhaul/08 §3)", () => {
+  it("a human-origin task is dispatched; a watcher-origin task is left untouched while autonomy is disabled", async () => {
+    const { projectId } = setupProject();
+    const watcherTask = createProjectTask(projectId, { origin: "watcher:test-suite", priority: 5 });
+    const humanTask = createProjectTask(projectId, { origin: "human", priority: 1 });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(humanTask.task_id)!.stage).toBe("refining");
+    expect(getTask(watcherTask.task_id)!.stage).toBe("intake"); // never eligible — autonomy off
+  });
+
+  it("among two watcher-origin tasks with autonomy enabled, the higher-priority one is dispatched first", async () => {
+    const { projectId } = setupProject();
+    updateProject(projectId, { config_json: JSON.stringify({ autonomy: { enabled: true } }) });
+    const low = createProjectTask(projectId, { origin: "watcher:test-suite", priority: 1 });
+    const high = createProjectTask(projectId, { origin: "watcher:test-suite", priority: 5 });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(high.task_id)!.stage).toBe("refining");
+    expect(getTask(low.task_id)!.stage).toBe("intake");
+  });
+
+  it("a watcher-origin task with a human-authored intervention is promoted to the human class, preempting a plain (higher-priority) watcher task", async () => {
+    const { projectId } = setupProject();
+    updateProject(projectId, { config_json: JSON.stringify({ autonomy: { enabled: true } }) });
+    const touched = createProjectTask(projectId, { origin: "watcher:test-suite", priority: 1 });
+    const untouched = createProjectTask(projectId, { origin: "watcher:test-suite", priority: 5 });
+    createIntervention({
+      task_id: touched.task_id,
+      kind: "steer_note",
+      payload_json: JSON.stringify({ text: "please look into this" }),
+      created_by: "user",
+    });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(touched.task_id)!.stage).toBe("refining"); // promoted despite lower priority
+    expect(getTask(untouched.task_id)!.stage).toBe("intake");
+  });
+
+  it("preserves the existing same-class fairness tie-break (oldest updated_at first)", async () => {
+    const { projectId } = setupProject();
+    const first = createProjectTask(projectId, { origin: "human", priority: 3 });
+    await new Promise((r) => setTimeout(r, 5));
+    const second = createProjectTask(projectId, { origin: "human", priority: 3 });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(first.task_id)!.stage).toBe("refining");
+    expect(getTask(second.task_id)!.stage).toBe("intake");
+  });
+});
+
+describe("materializeIntakeTask (PLANNING/overhaul/08 §2)", () => {
+  it("defaults to origin human / priority 3 — the same behavior ingestProject's own call site relies on", () => {
+    const { projectId } = setupProject();
+    const project = getProject(projectId)!;
+    const task = materializeIntakeTask(project, { name: "x", content: "hello", intakeKind: "manual" });
+    expect(task.origin).toBe("human");
+    expect(task.priority).toBe(3);
+    expect(fs.existsSync(task.git_worktree_path!)).toBe(true);
+  });
+
+  it("threads a watcher origin/priority through to the created task and writes the artifact into its own worktree", () => {
+    const { projectId } = setupProject();
+    const project = getProject(projectId)!;
+    const task = materializeIntakeTask(project, {
+      name: "candidate",
+      content: "boom failure output",
+      intakeKind: "error_file",
+      origin: "watcher:test-suite",
+      priority: 5,
+    });
+    expect(task.origin).toBe("watcher:test-suite");
+    expect(task.priority).toBe(5);
+    expect(task.artifact_path).not.toBeNull();
+    const artifactAbs = path.join(task.git_worktree_path!, task.artifact_path!);
+    expect(fs.existsSync(artifactAbs)).toBe(true);
+    expect(fs.readFileSync(artifactAbs, "utf8")).toContain("boom failure output");
+  });
+});
+
+describe("watcher-task suppression on wont_do (PLANNING/overhaul/08 §2)", () => {
+  it("suppresses the linked candidate when a wont_do intervention closes a watcher-origin task", async () => {
+    const { projectId } = setupProject();
+    const task = createProjectTask(projectId, { origin: "watcher:test-suite", stage: "refining" });
+    const candidate = createCandidate({
+      project_id: projectId,
+      watcher: "test-suite",
+      kind: "error_file",
+      fingerprint: "fp1",
+      payload_json: "{}",
+    });
+    updateCandidate(candidate.id, { task_id: task.task_id, status: "queued" });
+    createIntervention({ task_id: task.task_id, kind: "wont_do", payload_json: "{}", created_by: "user" });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getCandidate(candidate.id)?.status).toBe("suppressed");
+  });
+
+  it("is a no-op (never throws) for a human-origin task with no linked candidate", async () => {
+    const { projectId } = setupProject();
+    const task = createProjectTask(projectId, { origin: "human", stage: "refining" });
+    createIntervention({ task_id: task.task_id, kind: "wont_do", payload_json: "{}", created_by: "user" });
+    setRoleRunner(fakeRunner("pass"));
+    await expect(tickOnce(1)).resolves.not.toThrow();
+    expect(getTask(task.task_id)!.exit_state).toBe("wont_do");
+  });
+});
+
+describe("opportunistic companion dogfood (PLANNING/overhaul/08 — end-to-end)", () => {
+  it("watcher detects → triage queues (badged) → the existing flow/gate machinery carries it to READY unchanged", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({
+        harness: { allowExec: true, execAllowlist: [{ name: "test", argv: ["node", "-e", "process.exit(1)"] }] },
+        autonomy: {
+          enabled: true,
+          idleAfterMinutes: 0,
+          watchers: [{ name: "test-suite", enabled: true, cadenceMinutes: 0, perWatcherDailyCap: 5, commands: ["test"] }],
+        },
+        router: { enabled: true, candidateTriage: true },
+      }),
+    });
+    resetHumanActivityClock();
+    setTriageFn(async () => ({
+      worth_doing: true,
+      priority: 4,
+      rationale: "a real, reproducible test failure",
+      suggested_kind: "error_file",
+    }));
+
+    // First scan: the flake-guard requires the same failure fingerprint twice
+    // before proposing anything — no candidate, no task yet.
+    expect(await tickWatchers()).toBe(true);
+    expect(listCandidates({ projectId })).toHaveLength(0);
+    expect(rootTask(projectId)).toBeUndefined();
+
+    // Second scan: confirmed — triage approves, a badged task is materialized.
+    expect(await tickWatchers()).toBe(true);
+    const candidates = listCandidates({ projectId });
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.status).toBe("queued");
+    const created = rootTask(projectId)!;
+    expect(created.origin).toBe("watcher:test-suite");
+    expect(created.priority).toBe(4);
+    expect(created.intake_kind).toBe("error_file");
+
+    // A later scan of the same still-failing suite must not spawn a duplicate.
+    expect(await tickWatchers()).toBe(true);
+    expect(listCandidates({ projectId })).toHaveLength(1);
+
+    // From here on, this is an ordinary task: the exact same tick()/drainTicks
+    // machinery every human-filed error_file task goes through, with no
+    // watcher-aware special-casing anywhere in the flow/gate logic.
+    setRoleRunner(fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: allMet("error_file") }));
+    await tick();
+    updateTask(created.task_id, { level: "epic" }); // allow decomposition to spawn children
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review");
+
+    const finished = getTask(created.task_id)!;
+    expect(finished.stage).toBe("ready");
+    expect(finished.exit_state).toBe("ready_for_work");
+    expect(finished.origin).toBe("watcher:test-suite"); // origin survives the whole run
+    // Reached the terminal state with zero human interventions of any kind —
+    // "never block, batch the rest for the morning report" etiquette, satisfied
+    // by simply never needing to escalate in the first place on a clean run.
+    expect(listInterventions(created.task_id).filter((iv) => iv.created_by === "user")).toHaveLength(0);
+  });
+
+  it("etiquette: outside the configured active-hours window, repeated scans never touch the exec harness", async () => {
+    const { projectId } = setupProject();
+    // A 5-minute window starting 5 minutes from now — guaranteed to exclude
+    // the current instant without any wall-clock-timing flakiness.
+    const now = new Date();
+    const fmt = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const start = fmt(new Date(now.getTime() + 5 * 60_000));
+    const end = fmt(new Date(now.getTime() + 10 * 60_000));
+    updateProject(projectId, {
+      config_json: JSON.stringify({
+        harness: { allowExec: true, execAllowlist: [{ name: "test", argv: ["node", "-e", "process.exit(1)"] }] },
+        autonomy: {
+          enabled: true,
+          idleAfterMinutes: 0,
+          activeHours: { start, end, weekendsAllDay: false },
+          watchers: [{ name: "test-suite", enabled: true, cadenceMinutes: 0, perWatcherDailyCap: 5, commands: ["test"] }],
+        },
+      }),
+    });
+    resetHumanActivityClock();
+
+    for (let i = 0; i < 3; i++) expect(await tickWatchers()).toBe(false);
+    expect(listCandidates({ projectId })).toHaveLength(0);
+    expect(rootTask(projectId)).toBeUndefined();
+  });
 });
 
 describe("role-call idle watchdog", () => {
@@ -1183,6 +2397,46 @@ describe("role-call idle watchdog", () => {
     // matching the JSON-parse-error / empty-subtasks retry contract.
     const firstStepRuns = listRoleRuns(t.task_id).filter((r) => r.role_key === "intake_triage");
     expect(firstStepRuns.length).toBe(1);
+  });
+
+  it("resumes (not cold-restarts) the step after a timeout and records the attempt index", async () => {
+    // overhaul/03 §2: a dead-air timeout re-enters the step as a RESUME — the
+    // retry's context carries the resume steering, and the eventual successful
+    // run row records attempt=2.
+    const { repo, projectId } = setupProject();
+    writeArtifact(
+      path.join(repo, "PLANNING", "INTAKE", "crash.log"),
+      "Traceback (most recent call last):\nValueError: boom",
+    );
+    const contexts: string[] = [];
+    let calls = 0;
+    setRoleRunner((params) => {
+      calls += 1;
+      if (calls === 1) {
+        // First attempt hangs until the idle watchdog aborts it.
+        return new Promise<RoleRunResult>((_, reject) => {
+          params.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+      }
+      contexts.push(params.context);
+      return fakeRunner("pass", { coverage: ALL_CONSIDERED, criteria: allMet("error_file") })(params);
+    });
+
+    await tick();
+    const t0 = rootTask(projectId);
+    if (t0) updateTask(t0.task_id, { level: "epic" });
+
+    await drainTicks(projectId, (t) => t.stage === "ready" || t.stage === "review", 60);
+
+    // The first successful call is the intake_triage RESUME (attempt 2).
+    expect(contexts[0]).toContain("RESUMING");
+    expect(contexts[0]).toContain("previous attempt");
+
+    const firstStepRuns = listRoleRuns(rootTask(projectId)!.task_id).filter(
+      (r) => r.role_key === "intake_triage",
+    );
+    expect(firstStepRuns.length).toBe(1);
+    expect(firstStepRuns[0]!.attempt).toBe(2);
   });
 
   it("escalates to REVIEW after exhausting timeout retries, without reading as a user abort", async () => {
@@ -1704,5 +2958,576 @@ describe("role feed-forward (buildRoleContext)", () => {
     const t = rootTask(projectId)!;
     expect(contexts[1]).toContain(t.artifact_path);
     expect(contexts[1]).toContain("read it with your `read` tool");
+  });
+});
+
+describe("context budgeting (PLANNING/overhaul/07)", () => {
+  /** A minimal, valid RoleRunResult with a given verdict/findings override. */
+  function minimalResult(
+    overrides: Partial<RoleRunResult["findings"]> = {},
+  ): RoleRunResult {
+    return {
+      findings: {
+        verdict: "pass",
+        summary: "short summary",
+        open_questions: [],
+        coverage: [{ concern: "security", status: "considered" }],
+        section_md: "## role\nfindings\n",
+        criteria_results: [],
+        ...overrides,
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 3,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+    };
+  }
+
+  it("carries an earlier role's carry_forward handoff into the next role's context and persists it on the run row", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    const contexts: string[] = [];
+    let calls = 0;
+    setRoleRunner(async (params) => {
+      calls += 1;
+      contexts.push(params.context);
+      return minimalResult(
+        calls === 1
+          ? { carry_forward: "the auth middleware caches tokens for 5 min — don't assume live checks" }
+          : {},
+      );
+    });
+
+    await tick(); // intake_triage
+    await tick(); // explorer
+
+    const t = rootTask(projectId)!;
+    const runs = listRoleRuns(t.task_id);
+    expect(runs[0]!.carry_forward).toBe(
+      "the auth middleware caches tokens for 5 min — don't assume live checks",
+    );
+    expect(contexts[1]).toContain("Carry forward for later roles:");
+    expect(contexts[1]).toContain("the auth middleware caches tokens for 5 min");
+  });
+
+  it("caps an oversize carry_forward at 300 chars before persisting it", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    const huge = "z".repeat(500);
+    setRoleRunner(async () => minimalResult({ carry_forward: huge }));
+
+    await tick();
+
+    const t = rootTask(projectId)!;
+    expect(listRoleRuns(t.task_id)[0]!.carry_forward?.length).toBe(300);
+  });
+
+  // Just under INTAKE_COMPACTION_THRESHOLD_CHARS (8000) so ingest-time
+  // compaction (§3) does NOT kick in — these tests are exercising the
+  // separate per-run Tier-3 runtime degradation (§1) that buildRoleContext
+  // applies on top, so the fixture has to reach buildRoleContext un-condensed.
+  const BIG_INTAKE = "y".repeat(7900);
+
+  it("shadow mode (default, no contextBudget flag): records context_degraded but still sends the full, undegraded prompt", async () => {
+    const { repo, projectId } = setupProject();
+    // A window far too small for this task's content — proves the allocator
+    // WOULD have needed to degrade, without actually being enforced.
+    upsertConfig({ project_id: projectId, context_window: 2000, max_tokens: 200 });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), `Error: boom\n${BIG_INTAKE}`);
+    const contexts: string[] = [];
+    setRoleRunner(async (params) => {
+      contexts.push(params.context);
+      return minimalResult();
+    });
+
+    await tick(); // ingest + intake_triage
+
+    const t = rootTask(projectId)!;
+    const run = listRoleRuns(t.task_id)[0]!;
+    expect(run.context_degraded).toBe(1);
+    expect(run.context_tokens_est).toBeGreaterThan(0);
+    // Shadow mode: the actual prompt sent to the model still has the full,
+    // uncondensed intake — nothing was actually cut.
+    expect(contexts[0]).toContain(BIG_INTAKE);
+  });
+
+  it("enforced mode (project config contextBudget:true): actually sends the degraded, condensed prompt", async () => {
+    const { repo, projectId } = setupProject();
+    updateProject(projectId, { config_json: JSON.stringify({ contextBudget: true }) });
+    // Sized so the always-kept content (task header/instruction + the role's
+    // own system prompt reservation) leaves enough room for the condensed
+    // intake rendering to fit, but not the full one — degrades to "condensed",
+    // not a full drop (see the shadow-mode test above for the drop case).
+    upsertConfig({ project_id: projectId, context_window: 4000, max_tokens: 300 });
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), `Error: boom\n${BIG_INTAKE}`);
+    const contexts: string[] = [];
+    setRoleRunner(async (params) => {
+      contexts.push(params.context);
+      return minimalResult();
+    });
+
+    await tick();
+
+    const t = rootTask(projectId)!;
+    const run = listRoleRuns(t.task_id)[0]!;
+    expect(run.context_degraded).toBe(1);
+    // Enforced: the huge intake was NOT sent in full, but the condensation is
+    // stated in the prompt (the doc's "state every drop/collapse" rule).
+    expect(contexts[0]).not.toContain(BIG_INTAKE);
+    expect(contexts[0]).toContain("condensed — head + tail");
+    expect(contexts[0]!.length).toBeLessThan(BIG_INTAKE.length);
+  });
+
+  it("compacts oversize intake at ingest, preserving the full original in a sidecar file referenced by path", async () => {
+    const { repo, projectId } = setupProject();
+    const bigLog = "Traceback (most recent call last):\n" + "at foo.js:1:1\n".repeat(1000); // > 8000 chars
+    expect(bigLog.length).toBeGreaterThan(8000);
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), bigLog);
+    setRoleRunner(async () => minimalResult());
+
+    await tick(); // ingest (+ first role step)
+
+    const t = rootTask(projectId)!;
+    // The DB row's content is compacted, not the full multi-KB log.
+    expect(t.content!.length).toBeLessThan(bigLog.length);
+    expect(t.content).toContain("condensed at intake");
+    expect(t.content).toContain("raw-intake.txt");
+    // The full original is preserved on disk in the task's own worktree.
+    const sidecarMatch = /full text at `([^`]+)`/.exec(t.content!);
+    expect(sidecarMatch).not.toBeNull();
+    const sidecarRel = sidecarMatch![1]!;
+    const sidecarAbs = path.join(t.git_worktree_path!, sidecarRel);
+    expect(fs.existsSync(sidecarAbs)).toBe(true);
+    expect(fs.readFileSync(sidecarAbs, "utf8")).toBe(bigLog);
+  });
+
+  it("leaves small intake untouched at ingest (no sidecar, no condensation)", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "crash.log"), "Error: boom");
+    setRoleRunner(async () => minimalResult());
+
+    await tick();
+
+    const t = rootTask(projectId)!;
+    expect(t.content).toBe("Error: boom");
+    expect(t.content).not.toContain("condensed at intake");
+  });
+});
+
+describe("artifact-first output (overhaul/01)", () => {
+  const STREAMED = "## Streamed Section\n\nprose saved via report_section";
+
+  /** Mimics a run that streamed its whole report to the artifact via
+   *  report_section during the run: the prose is already on disk when the
+   *  runner returns, and artifactResidualMd says there is nothing left to
+   *  append. */
+  function streamingRunner(): RoleRunner {
+    return async (params) => {
+      appendArtifactSection(params.artifactAbsPath, STREAMED);
+      return {
+        findings: {
+          verdict: "pass",
+          summary: "pass from streaming fake",
+          open_questions: [],
+          coverage: [{ concern: "security", status: "considered" }],
+          section_md: STREAMED,
+          criteria_results: [],
+        },
+        toolCalls: [],
+        transcriptJsonl: "",
+        tokens: 1,
+        model: "fake",
+        fallback: false,
+        stalled: false,
+        thinkingText: "",
+        filesWritten: [],
+        artifactBytesAppended: Buffer.byteLength(STREAMED, "utf8"),
+        verdictSource: "tool",
+        artifactResidualMd: "",
+      };
+    };
+  }
+
+  it("does not re-append prose the run already streamed to the artifact", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "note.md"), "please do a thing");
+    setRoleRunner(streamingRunner());
+
+    await tick(); // ingest + first role run
+
+    const t = rootTask(projectId)!;
+    const runs = listRoleRuns(t.task_id);
+    expect(runs.length).toBe(1);
+    // The run row still carries the complete report...
+    expect(runs[0]!.output_md).toContain("prose saved via report_section");
+    expect(runs[0]!.verdict_source).toBe("tool");
+    // ...but the artifact holds it exactly once (streamed copy only, no
+    // post-run duplicate append).
+    const content = fs.readFileSync(path.join(t.git_worktree_path!, t.artifact_path!), "utf8");
+    expect(content.split("prose saved via report_section").length - 1).toBe(1);
+  });
+
+  it("keeps appending section_md post-run for runners without the artifact-first fields (v1 parity)", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "note.md"), "please do a thing");
+    setRoleRunner(fakeRunner("pass"));
+
+    await tick();
+
+    const t = rootTask(projectId)!;
+    expect(listRoleRuns(t.task_id).length).toBe(1);
+    const content = fs.readFileSync(path.join(t.git_worktree_path!, t.artifact_path!), "utf8");
+    expect(content.split("implement the fix").length - 1).toBe(1);
+  });
+
+  it("marks the checkpoint commit and persists verdict_source when the verdict was synthesized", async () => {
+    const { repo, projectId } = setupProject();
+    writeArtifact(path.join(repo, "PLANNING", "INTAKE", "note.md"), "please do a thing");
+    setRoleRunner(async () => ({
+      findings: {
+        verdict: "needs_more" as Verdict,
+        summary: "Output was truncated before the role recorded a verdict.",
+        open_questions: [],
+        coverage: [],
+        section_md: "partial prose that must still reach the artifact",
+        criteria_results: [],
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: true,
+      stalled: false,
+      stopReason: "length",
+      thinkingText: "",
+      filesWritten: [],
+      artifactBytesAppended: 0,
+      verdictSource: "fallback" as const,
+      artifactResidualMd: "partial prose that must still reach the artifact",
+    }));
+
+    await tick();
+
+    const t = rootTask(projectId)!;
+    const run = listRoleRuns(t.task_id)[0]!;
+    expect(run.verdict_source).toBe("fallback");
+    expect(run.fallback).toBe(1);
+    // Prose preserved on disk even though the verdict was synthesized...
+    const content = fs.readFileSync(path.join(t.git_worktree_path!, t.artifact_path!), "utf8");
+    expect(content).toContain("partial prose that must still reach the artifact");
+    // ...and the checkpoint commit is visibly flagged as degraded.
+    const log = execFileSync("git", ["log", "--format=%s"], { cwd: t.git_worktree_path! }).toString();
+    expect(log).toContain("[degraded: fallback verdict]");
+  });
+});
+// ---------------------------------------------------------------------------
+// Grounded verification (PLANNING/overhaul/05)
+// ---------------------------------------------------------------------------
+
+describe("grounded verification (overhaul/05)", () => {
+  const TEST_CRITERION: Criterion = {
+    id: "exec.tests_pass",
+    text: "tests pass",
+    ownerRole: "developer",
+    severity: "must",
+    evidence: { command: "test", mustExitZero: true },
+  };
+
+  function evidenceJson(exitCode: number, name = "test"): string {
+    return JSON.stringify([
+      {
+        name,
+        argv: ["npm", "test"],
+        exitCode,
+        durationMs: 1200,
+        outputTail: exitCode === 0 ? "42 passing" : "1 failing",
+        truncated: false,
+        timedOut: false,
+        startedAt: new Date().toISOString(),
+      },
+    ]);
+  }
+
+  describe("checkEvidenceCriteria", () => {
+    it("is unmet when the command was never run", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      createRoleRun({ task_id: t.task_id, role_key: "developer", verdict: "pass" });
+      const [check] = checkEvidenceCriteria(t.task_id, [TEST_CRITERION]);
+      expect(check!.met).toBe(false);
+      expect(check!.detail).toContain("never run");
+    });
+
+    it("is met when the owner's own run recorded a green execution", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      createRoleRun({
+        task_id: t.task_id,
+        role_key: "developer",
+        verdict: "pass",
+        evidence_json: evidenceJson(0),
+      });
+      const [check] = checkEvidenceCriteria(t.task_id, [TEST_CRITERION]);
+      expect(check!.met).toBe(true);
+      expect(check!.latest?.exitCode).toBe(0);
+    });
+
+    it("is unmet when the recorded execution was red", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      createRoleRun({
+        task_id: t.task_id,
+        role_key: "developer",
+        verdict: "pass",
+        evidence_json: evidenceJson(1),
+      });
+      const [check] = checkEvidenceCriteria(t.task_id, [TEST_CRITERION]);
+      expect(check!.met).toBe(false);
+    });
+
+    it("prefers a later reviewer re-run over the owner's own earlier result", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      createRoleRun({ task_id: t.task_id, role_key: "developer", verdict: "pass", evidence_json: evidenceJson(0) });
+      createRoleRun({ task_id: t.task_id, role_key: "critic", verdict: "pass", evidence_json: evidenceJson(1) });
+      const [check] = checkEvidenceCriteria(t.task_id, [TEST_CRITERION]);
+      // The critic's independent re-run is the newest answer, and it is red.
+      expect(check!.met).toBe(false);
+    });
+
+    it("treats evidence from before the owner's latest run as stale", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      // Attempt 1: developer ran the suite green.
+      createRoleRun({ task_id: t.task_id, role_key: "developer", verdict: "pass", evidence_json: evidenceJson(0) });
+      createRoleRun({ task_id: t.task_id, role_key: "critic", verdict: "needs_more" });
+      // Attempt 2 (loop-back): developer edited code and never re-ran anything.
+      createRoleRun({ task_id: t.task_id, role_key: "developer", verdict: "pass", attempt: 2 });
+      const [check] = checkEvidenceCriteria(t.task_id, [TEST_CRITERION]);
+      expect(check!.met).toBe(false);
+      expect(check!.detail).toContain("has not been run since");
+    });
+
+    it("ignores evidence recorded on non-primary (critique) runs", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      const primary = createRoleRun({ task_id: t.task_id, role_key: "developer", verdict: "pass" });
+      createRoleRun({
+        task_id: t.task_id,
+        role_key: "critic",
+        run_kind: "critique",
+        target_run_id: primary.id,
+        evidence_json: evidenceJson(0),
+      });
+      expect(checkEvidenceCriteria(t.task_id, [TEST_CRITERION])[0]!.met).toBe(false);
+    });
+
+    it("a fallback/repaired verdict cannot satisfy an evidence criterion", () => {
+      // The doc's negative case: repair reconstructs a *verdict* from prose and
+      // can never mint an evidence row, so a repaired "pass" still fails here.
+      freshDb();
+      const t = createTask({ name: "t" });
+      createRoleRun({
+        task_id: t.task_id,
+        role_key: "developer",
+        verdict: "pass",
+        verdict_source: "repair",
+        fallback: 0,
+      });
+      expect(checkEvidenceCriteria(t.task_id, [TEST_CRITERION])[0]!.met).toBe(false);
+    });
+
+    it("returns nothing when there are no evidence criteria", () => {
+      freshDb();
+      const t = createTask({ name: "t" });
+      expect(checkEvidenceCriteria(t.task_id, [])).toEqual([]);
+    });
+  });
+
+  // ---- Flow wiring -------------------------------------------------------
+
+  /** A code-change leaf sitting at the developer step, as decomposition creates it. */
+  function codeChangeTask(projectId: number): TaskRow {
+    return createTask({
+      name: "impl",
+      project_id: projectId,
+      stage: "refining",
+      exit_kind: "code_change",
+      intake_kind: "feature",
+      level: "task",
+      refinement_plan_json: JSON.stringify({
+        steps: [
+          { role: "developer", status: "pending", depth: 1 },
+          { role: "critic", status: "pending", depth: 1 },
+        ],
+      }),
+    });
+  }
+
+  function enableExec(projectId: number): void {
+    updateProject(projectId, {
+      config_json: JSON.stringify({
+        harness: {
+          allowExec: true,
+          execAllowlist: [{ name: "test", argv: ["npm", "test"] }],
+        },
+      }),
+    });
+  }
+
+  /** A runner that passes every step and attaches the given evidence to the
+   *  `developer` step only (the critic here does not re-run anything).
+   *  RunRoleParams carries no role key, so the developer is identified by the
+   *  opening line of its seeded persona. */
+  const DEVELOPER_PERSONA = "You implement the refined work";
+  function runnerWithEvidence(exitCode: number | null): RoleRunner {
+    return async (params) => ({
+      findings: {
+        verdict: "pass" as Verdict,
+        summary: "implemented",
+        open_questions: [],
+        coverage: [],
+        section_md: "## step\ndone\n",
+        criteria_results: [],
+      },
+      toolCalls: [],
+      transcriptJsonl: "",
+      tokens: 1,
+      model: "fake",
+      fallback: false,
+      stalled: false,
+      thinkingText: "",
+      filesWritten: [],
+      verdictSource: "tool" as const,
+      evidence:
+        exitCode == null || !params.systemPrompt.includes(DEVELOPER_PERSONA)
+          ? []
+          : [
+              {
+                name: "test",
+                argv: ["npm", "test"],
+                exitCode,
+                durationMs: 900,
+                outputTail: exitCode === 0 ? "ok" : "FAIL",
+                truncated: false,
+                timedOut: false,
+                startedAt: new Date().toISOString(),
+              },
+            ],
+    });
+  }
+
+  it("persists harness-recorded evidence onto the run row", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(0));
+
+    await tick();
+
+    const devRun = listRoleRuns(task.task_id).find((r) => r.role_key === "developer")!;
+    expect(JSON.parse(devRun.evidence_json!)[0].exitCode).toBe(0);
+  });
+
+  it("reaches merge review when the required command ran green", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(0));
+
+    await drainTicks(projectId, (t) => t.stage === "review" || t.stage === "ready");
+
+    const t = getTask(task.task_id)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_merge_approval");
+  });
+
+  it("blocks the gate on a red run even though every role reported pass", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(1));
+
+    await drainTicks(projectId, (t) => t.stage === "review" || t.stage === "ready");
+
+    const t = getTask(task.task_id)!;
+    // Loop-backs exhausted → parked for a human, NOT promoted to merge review.
+    expect(t.exit_state).not.toBe("needs_merge_approval");
+    expect(t.stage).toBe("review");
+    expect(t.review_reason ?? "").toMatch(/verification did not pass/i);
+  });
+
+  it("blocks the gate when nothing was executed at all", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(null)); // every role passes, none verifies
+
+    await drainTicks(projectId, (t) => t.stage === "review" || t.stage === "ready");
+
+    const t = getTask(task.task_id)!;
+    expect(t.exit_state).not.toBe("needs_merge_approval");
+    expect(t.review_reason ?? "").toMatch(/never run/i);
+  });
+
+  it("re-opens the developer (the criterion's owner), not just the reviewer", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(1));
+
+    await tick(); // developer
+    await tick(); // critic → gate fails on the red run → loop-back
+
+    const runs = listRoleRuns(task.task_id).map((r) => r.role_key);
+    expect(runs).toEqual(["developer", "critic"]);
+    const plan = JSON.parse(getTask(task.task_id)!.refinement_plan_json!) as {
+      steps: { role: string; status: string }[];
+    };
+    expect(plan.steps.find((s) => s.role === "developer")!.status).toBe("pending");
+
+    // And the re-run developer is told what actually happened, not just "unmet".
+    const notes = listInterventions(task.task_id)
+      .map((i) => JSON.parse(i.payload_json ?? "{}").text ?? "")
+      .join("\n");
+    expect(notes).toContain("exec.tests_pass");
+    expect(notes).toMatch(/exit 1/);
+  });
+
+  it("stays a no-op for a project that has not enabled exec", async () => {
+    const { projectId } = setupProject();
+    // No enableExec() — the flow carries no evidence criteria at all, so the
+    // execution flow behaves exactly as it did before overhaul/05.
+    const task = codeChangeTask(projectId);
+    setRoleRunner(runnerWithEvidence(null));
+
+    await drainTicks(projectId, (t) => t.stage === "review" || t.stage === "ready");
+
+    const t = getTask(task.task_id)!;
+    expect(t.stage).toBe("review");
+    expect(t.exit_state).toBe("needs_merge_approval");
+  });
+
+  it("feeds recorded evidence forward into the next role's context", async () => {
+    const { projectId } = setupProject();
+    enableExec(projectId);
+    const task = codeChangeTask(projectId);
+    const contexts: string[] = [];
+    const inner = runnerWithEvidence(1);
+    setRoleRunner(async (params) => {
+      contexts.push(params.context);
+      return inner(params);
+    });
+
+    await tick(); // developer records a red run
+    await tick(); // critic sees it
+
+    expect(contexts[1]).toContain("Verification evidence");
+    expect(contexts[1]).toContain("npm test");
+    expect(contexts[1]).toContain("Automatically verified");
   });
 });

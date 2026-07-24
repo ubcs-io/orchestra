@@ -19,10 +19,8 @@ import {
   deleteModelConfig,
   deleteNetwork,
   deleteProject,
-  deleteTask,
   duplicateModelConfig,
   duplicateNetwork,
-  familyMembersExcluding,
   getConfigById,
   getDb,
   getGlobalConfig,
@@ -32,6 +30,8 @@ import {
   getProject,
   getRole,
   getRoleStats,
+  getHealthStats,
+  getTaskHealthSummaries,
   getTask,
   listChatMessages,
   listInterventions,
@@ -42,19 +42,26 @@ import {
   listRoleRuns,
   listTasks,
   reorderModelConfigs,
-  resetTask,
   setDefaultModelConfig,
   setDefaultNetwork,
+  suppressCandidateForTask,
   updateModelConfig,
   updateNetwork,
   updateProject,
   updateTask,
   upsertConfig,
   upsertRole,
+  listCandidates,
   type ProjectRow,
   type TaskRow,
 } from "../db.js";
-import { resolveHarnessPolicy, validateToolsJson } from "../harness-policy.js";
+import { resolveAutonomyConfig, validateAutonomyConfig, getOrResetIdleWindowBudget, recordHumanActivity } from "../autonomy.js";
+import { resolveAutonomyLevel, validateAutonomyLevel } from "../autonomy-level.js";
+import { resolvePlanningRigor, validatePlanningRigor } from "../planning-rigor.js";
+import { abortWatcherScan } from "../watchers.js";
+import type { HealthStatGroupBy, RoleRunRow } from "../db.js";
+import { computeRunHealth, runHealthReason, roleRunHealthInput } from "../health.js";
+import { resolveHarnessPolicy, validateExecAllowlist, validateToolsJson } from "../harness-policy.js";
 import {
   commitArtifacts,
   diffFilePatch,
@@ -62,33 +69,52 @@ import {
   headSha,
   isGitRepo,
   pushBranchToGithub,
-  removeFile,
-  removeWorktree,
   sanitizePath,
   scaffoldPlanning,
   writeArtifact,
 } from "../git.js";
 import { createPullRequest, resolveGithubToken, resolveOwnerRepo } from "../github.js";
 import { checkReachable, discoverModels } from "../providers.js";
+import { probeStructuredOutputs } from "../probe.js";
 import {
+  buildProfileFromProbes,
+  deleteProfile,
+  deriveProfile,
+  effectiveDecisions,
+  listProfiles,
+  loadProfile,
+  PROBE_STEPS,
+  profileConnectionSig,
+  refreshProfile,
+  runModelProbes,
+  saveProfile,
+  type DerivedDecisions,
+  type ModelProfile,
+  type ProfileOverrides,
+} from "../profiles.js";
+import {
+  connectionFromConfigRow,
   envTokenForModel,
+  importedOverridesForConnection,
   locationLabel,
   resolveConnection,
   resolveConnectionForModel,
   THINKING_FORMATS,
 } from "../settings.js";
-import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind } from "../roles.js";
+import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind, type ExitKind } from "../roles.js";
   import {
     activeTaskIds,
     approveCodeChangeMerge,
     artifactName,
     buildParentDigest,
+    deleteTaskAndWorktree,
     ensureTaskWorkspace,
     ingestProject,
     isSchedulerRunning,
     isSchedulerStopping,
     reincorporateAnswer,
     requestCodeChanges,
+    resetTaskAndWorktree,
     restoreCheckpoint,
     startScheduler,
     stopScheduler,
@@ -112,10 +138,17 @@ function projectResponse(p: ProjectRow): Omit<ProjectRow, "github_token"> & { ha
   return { ...rest, repo_path: sanitizePath(p.repo_path), has_github_token: !!github_token };
 }
 
+/** Attach the derived run-health enum + human reason (overhaul/04) to a run row
+ *  so the client renders badges/banners without re-deriving the taxonomy. */
+function withHealth(run: RoleRunRow): RoleRunRow & { health: string; health_reason: string } {
+  const input = roleRunHealthInput(run);
+  return { ...run, health: computeRunHealth(input), health_reason: runHealthReason(input) };
+}
+
 function taskDetail(taskId: string) {
   const task = getTask(taskId);
   if (!task) return null;
-  const runs = listRoleRuns(task.task_id);
+  const runs = listRoleRuns(task.task_id).map(withHealth);
   const interventions = listInterventions(task.task_id);
   const children = listTasks({ parentTaskId: task.task_id });
   let coverage: unknown = null;
@@ -211,6 +244,14 @@ async function discoverModelsFrom(baseUrl: string, apiKey?: string): Promise<str
 }
 
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
+  // "No human API activity" idle signal (PLANNING/overhaul/08 §3): only
+  // mutating requests count. The client polls GET /api/tasks and /api/summary
+  // continuously whenever any tab is open — counting those as "activity" would
+  // mean an idle dashboard left open permanently suppresses autonomy.
+  app.addHook("onRequest", async (req) => {
+    if (req.method !== "GET" && req.url.startsWith("/api/")) recordHumanActivity();
+  });
+
   app.get("/api/health", async () => ({ ok: true }));
 
   app.get("/api/models", async () => ({ models: await discoverModels() }));
@@ -291,6 +332,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         thinkingFormat: resolved.thinkingFormat,
         textMode: resolved.textMode,
         compat: resolved.compat,
+        structuredOutputs: resolved.structuredOutputs,
         has_api_key: !!resolved.apiKey,
       },
       env_overrides: {
@@ -354,6 +396,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const row = getGlobalConfig();
     const { api_key: _k, ...safe } = row ?? {};
     return { config: { ...safe, has_api_key: !!(_k && _k.length) } };
+  });
+
+  // Probe the global default connection's endpoint for server-side structured-
+  // decoding support (PLANNING/overhaul/02) and persist the result.
+  app.post("/api/config/probe-structured-outputs", async (_req: FastifyRequest, reply: FastifyReply) => {
+    const resolved = resolveConnection();
+    if (!resolved.baseUrl) return bad(reply, 400, "No base URL configured");
+    const result = await probeStructuredOutputs(resolved.baseUrl, resolved.apiKey, resolved.defaultModelId);
+    upsertConfig({ project_id: null, key: "default", structured_outputs_json: JSON.stringify(result) });
+    return { result };
   });
 
   // ---- Model Configs (named connection profiles) ----
@@ -652,6 +704,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       repo_path: canonicalRoot,
       planning_dir: body.planning_dir,
       default_model: body.default_model ?? null,
+      // Health-gate READY promotion on by default for new projects (overhaul/04
+      // §4); existing projects keep today's behavior until they opt in.
+      config_json: JSON.stringify({ requireHealthyTerminal: true }),
     });
     scaffoldPlanning(project.repo_path, project.planning_dir);
     return { project: projectResponse(project) };
@@ -679,6 +734,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   // ---- Role stats (aggregated across all projects) ----
   app.get("/api/roles/stats", async () => {
     return { stats: getRoleStats() };
+  });
+
+  // ---- Run-health reliability rollups (overhaul/04 §3, feeds overhaul/06) ----
+  // groupBy=model|role|mode (default model). "mode" buckets by verdict_source —
+  // the delivery mechanism actually used (tool/fence/constrained/repair/fallback).
+  app.get("/api/stats/health", async (req: FastifyRequest) => {
+    const raw = (req.query as { groupBy?: string }).groupBy;
+    const groupBy: HealthStatGroupBy =
+      raw === "role" || raw === "mode" || raw === "model" ? raw : "model";
+    return { groupBy, stats: getHealthStats(groupBy) };
   });
 
   // ---- Roles (per project, merged with globals) ----
@@ -725,15 +790,66 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const id = Number((req.params as { id: string }).id);
     const project = getProject(id);
     if (!project) return bad(reply, 404, "project not found");
-    const body = (req.body ?? {}) as { allowWrite?: boolean };
-    if (typeof body.allowWrite !== "boolean") return bad(reply, 400, "allowWrite (boolean) is required");
+    const body = (req.body ?? {}) as {
+      allowWrite?: boolean;
+      allowExec?: boolean;
+      execAllowlist?: unknown;
+      execTimeoutMs?: number;
+      execMaxOutputBytes?: number;
+      execMaxRuns?: number;
+      execEnv?: unknown;
+    };
+
+    // Partial patch: send only the fields you're changing. Every field is
+    // optional but at least one must be present, so an empty body can't
+    // silently "succeed" while changing nothing.
+    const patch: Record<string, unknown> = {};
+    if (body.allowWrite !== undefined) {
+      if (typeof body.allowWrite !== "boolean") return bad(reply, 400, "allowWrite must be a boolean");
+      patch.allowWrite = body.allowWrite;
+    }
+    if (body.allowExec !== undefined) {
+      if (typeof body.allowExec !== "boolean") return bad(reply, 400, "allowExec must be a boolean");
+      patch.allowExec = body.allowExec;
+    }
+    if (body.execAllowlist !== undefined) {
+      const validation = validateExecAllowlist(body.execAllowlist);
+      if (!validation.ok) return bad(reply, 400, validation.error);
+      patch.execAllowlist = validation.commands;
+    }
+    for (const [key, min, max] of [
+      ["execTimeoutMs", 1_000, 3_600_000],
+      ["execMaxOutputBytes", 1_024, 1_048_576],
+      ["execMaxRuns", 1, 50],
+    ] as const) {
+      const v = body[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
+        return bad(reply, 400, `${key} must be a number between ${min} and ${max}`);
+      }
+      patch[key] = Math.floor(v);
+    }
+    if (body.execEnv !== undefined) {
+      if (!body.execEnv || typeof body.execEnv !== "object" || Array.isArray(body.execEnv)) {
+        return bad(reply, 400, "execEnv must be an object of string values");
+      }
+      for (const [k, v] of Object.entries(body.execEnv as Record<string, unknown>)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) return bad(reply, 400, `invalid env var name "${k}"`);
+        if (typeof v !== "string") return bad(reply, 400, `env var "${k}" must be a string`);
+      }
+      patch.execEnv = body.execEnv;
+    }
+    if (Object.keys(patch).length === 0) {
+      return bad(reply, 400, "no harness policy fields provided");
+    }
 
     // Merge into the existing config_json.harness sub-key, preserving any other
     // top-level keys (e.g. router) already present — same merge-not-clobber
     // approach the roles PUT above uses for tools_json. Deliberately not the
     // generic PATCH /api/projects/:id (which accepts arbitrary config_json with
-    // no shape validation) — a policy gating real filesystem writes must not be
-    // silently disabled by a malformed/blank config_json PATCH.
+    // no shape validation) — a policy gating real filesystem writes and command
+    // execution must not be silently changed by a malformed/blank config_json
+    // PATCH.
     let existing: Record<string, unknown> = {};
     try {
       existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
@@ -742,19 +858,149 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     }
     const nextConfig = {
       ...existing,
-      harness: { ...(existing.harness as object | undefined), allowWrite: body.allowWrite },
+      harness: { ...(existing.harness as object | undefined), ...patch },
     };
     const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
     return { policy: resolveHarnessPolicy(updated?.config_json ?? null) };
   });
 
+  // ---- Autonomy (PLANNING/overhaul/08) ----
+  app.get("/api/projects/:id/autonomy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { config: resolveAutonomyConfig(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/autonomy", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = req.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return bad(reply, 400, "request body must be an object");
+    }
+    // Partial patch merged over the currently-resolved config (not the raw
+    // stored config_json) before validation, so a patch of just `{enabled}`
+    // can't clobber a previously-set watchers array via a shallow merge.
+    const merged = { ...resolveAutonomyConfig(project.config_json), ...(body as Record<string, unknown>) };
+    const validation = validateAutonomyConfig(merged);
+    if (!validation.ok) return bad(reply, 400, validation.error);
+
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = { ...existing, autonomy: validation.config };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+
+    // Kill-switch etiquette: disabling autonomy must halt an in-progress scan
+    // for this project within one tick, not just stop future ticks from
+    // starting one.
+    if (!validation.config.enabled) abortWatcherScan(id);
+
+    return { config: resolveAutonomyConfig(updated?.config_json ?? null) };
+  });
+
+  // "plan" | "edit" | "auto" — how far a task's own pipeline may progress
+  // unattended. Distinct from (and unrelated to) the /autonomy route above,
+  // which governs watcher-dispatch scheduling — see autonomy-level.ts.
+  app.get("/api/projects/:id/autonomy-level", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { level: resolveAutonomyLevel(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/autonomy-level", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { level?: unknown };
+    const validation = validateAutonomyLevel(body.level);
+    if (!validation.ok) return bad(reply, 400, validation.error);
+
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = { ...existing, autonomyLevel: validation.level };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    return { level: resolveAutonomyLevel(updated?.config_json ?? null) };
+  });
+
+  // "minimal" | "standard" | "thorough" — scales the family-wide decomposition
+  // budget (orchestrator.ts's resolveFamilyBudget) relative to a task's
+  // effort_size. Named "planning-rigor" (not "rigor") to avoid colliding with
+  // the unrelated fixed FLOW_TEMPLATES rigor tag and the counter-reviewer
+  // gate rigor exposed elsewhere — see planning-rigor.ts.
+  app.get("/api/projects/:id/planning-rigor", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { rigor: resolvePlanningRigor(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/planning-rigor", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { rigor?: unknown };
+    const validation = validatePlanningRigor(body.rigor);
+    if (!validation.ok) return bad(reply, 400, validation.error);
+
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = { ...existing, planningRigor: validation.rigor };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    return { rigor: resolvePlanningRigor(updated?.config_json ?? null) };
+  });
+
+  app.get("/api/projects/:id/candidates", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const q = req.query as { status?: string; limit?: string };
+    const limit = q.limit ? Number(q.limit) : undefined;
+    return {
+      candidates: listCandidates({
+        projectId: id,
+        status: q.status,
+        limit: Number.isFinite(limit) ? limit : undefined,
+      }),
+    };
+  });
+
+  app.get("/api/projects/:id/autonomy/budget", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const cfg = resolveAutonomyConfig(project.config_json);
+    return getOrResetIdleWindowBudget(id, cfg);
+  });
+
   // ---- Tasks ----
   app.get("/api/tasks", async (req: FastifyRequest) => {
     const q = req.query as { projectId?: string; stage?: string };
+    const tasks = listTasks({
+      projectId: q.projectId ? Number(q.projectId) : undefined,
+      stage: q.stage,
+    });
+    // Attach per-task run-health rollups (overhaul/04 §2) so board cards can show
+    // a "N degraded" chip + a distinct state when the latest run is degraded.
+    const summaries = getTaskHealthSummaries(tasks.map((t) => t.task_id));
     return {
-      tasks: listTasks({
-        projectId: q.projectId ? Number(q.projectId) : undefined,
-        stage: q.stage,
+      tasks: tasks.map((t) => {
+        const s = summaries.get(t.task_id);
+        return { ...t, degraded_runs: s?.degraded_runs ?? 0, latest_health: s?.latest_health ?? null };
       }),
     };
   });
@@ -768,27 +1014,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   app.delete("/api/tasks/:id", async (req: FastifyRequest) => {
     const taskId = (req.params as { id: string }).id;
     const q = req.query as { removePlan?: string };
-
-    // Resolve artifact/worktree paths before deletion so we know what to
-    // clean up on disk.
-    const task = getTask(taskId);
-    const artifactRel = task?.artifact_path ?? null;
-    const project = task?.project_id != null ? getProject(task.project_id) : undefined;
-
-    deleteTask(taskId);
-
-    // Optionally remove the .md plan/output file from disk.
-    if (q.removePlan === "true" && artifactRel && project) {
-      removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
-    }
-    // The worktree itself is a disk-consuming resource, unlike the cheap
-    // branch ref it sits on — clean it up whenever the task is deleted, but
-    // only once no other family member (parent/siblings/children sharing the
-    // same worktree) is still using it.
-    if (task?.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
-      removeWorktree(project.repo_path, task.git_worktree_path);
-    }
-
+    // Serialized against any in-flight scheduler step for this task's family
+    // (see deleteTaskAndWorktree) so worktree cleanup can't race a running role.
+    await deleteTaskAndWorktree(taskId, q.removePlan === "true");
     return { ok: true };
   });
 
@@ -817,23 +1045,10 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   // Reset a task to intake state — clears all history, moves back to intake.
   app.post("/api/tasks/:id/reset", async (req: FastifyRequest, reply: FastifyReply) => {
     const taskId = (req.params as { id: string }).id;
-    const task = getTask(taskId);
-    if (!task) return bad(reply, 404, "task not found");
-    const project = task.project_id != null ? getProject(task.project_id) : undefined;
-
-    // Remove the output .md file from disk if one exists.
-    if (task.artifact_path && project) {
-      removeFile(path.join(task.git_worktree_path ?? project.repo_path, task.artifact_path));
-    }
-    // Same disk-cost reasoning as delete: drop the worktree now, but leave
-    // the branch ref alone — ensureTaskWorkspace recreates the worktree onto
-    // it next time this task does any work. Skipped if another family member
-    // (sharing the same worktree) is still relying on it.
-    if (task.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
-      removeWorktree(project.repo_path, task.git_worktree_path);
-    }
-
-    const updated = resetTask(taskId);
+    if (!getTask(taskId)) return bad(reply, 404, "task not found");
+    // Serialized against any in-flight scheduler step for this task's family
+    // (see resetTaskAndWorktree) so worktree cleanup can't race a running role.
+    const updated = await resetTaskAndWorktree(taskId);
     if (!updated) return bad(reply, 500, "reset failed");
     return { task: updated };
   });
@@ -1043,20 +1258,28 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   });
 
   // ---- Subtasks (create child tasks from next-step actions) ----
+  const VALID_EXIT_KINDS: ExitKind[] = ["spec", "research_brief", "code_change"];
   app.post("/api/tasks/:id/subtasks", async (req: FastifyRequest, reply: FastifyReply) => {
     const taskId = (req.params as { id: string }).id;
     const parent = getTask(taskId);
     if (!parent) return bad(reply, 404, "task not found");
-    const body = (req.body ?? {}) as { name?: string; content?: string };
+    const body = (req.body ?? {}) as { name?: string; content?: string; exit_kind?: string };
     if (!body.name) return bad(reply, 400, "name is required");
+    if (body.exit_kind && !VALID_EXIT_KINDS.includes(body.exit_kind as ExitKind)) {
+      return bad(reply, 400, `exit_kind must be one of: ${VALID_EXIT_KINDS.join(", ")}`);
+    }
     const child = createTask({
       name: body.name,
       content: body.content ?? body.name,
       project_id: parent.project_id,
       stage: "intake",
       level: "task",
-      intake_kind: parent.intake_kind ?? "manual",
-      exit_kind: parent.exit_kind ?? "spec",
+      // Explicit override lets a human flag a recap recommendation as already
+      // fully scoped (e.g. "implement the change") — skipping straight to the
+      // developer/critic execution flow (see flowForTask) instead of
+      // inheriting the parent's "spec" and re-running the whole analysis
+      // pipeline for something that's already been analyzed.
+      exit_kind: (body.exit_kind as ExitKind | undefined) ?? parent.exit_kind ?? "spec",
       parent_task_id: parent.task_id,
       task_type: "child",
     });
@@ -1226,6 +1449,9 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         return bad(reply, 400, `task ${t.task_id} does not belong to this project`);
       }
       updateTask(t.task_id, { exit_state: "wont_do", paused: 1 });
+      if ((t.origin ?? "human").startsWith("watcher:")) {
+        suppressCandidateForTask(t.task_id, "closed as wont_do (bulk)");
+      }
     }
     return { ok: true, updated: tasks.length };
   });
@@ -1241,6 +1467,26 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     // consumes the intervention row on its next pass.
     if (body.kind === "pause") updateTask(task.task_id, { paused: 1 });
     if (body.kind === "resume" || body.kind === "run_now") updateTask(task.task_id, { paused: 0 });
+    if (body.kind === "set_autonomy_level") {
+      const p = (body.payload ?? {}) as { level?: unknown };
+      if (p.level === null || p.level === undefined) {
+        updateTask(task.task_id, { autonomy_level: null }); // clear override → inherit project default
+      } else {
+        const validation = validateAutonomyLevel(p.level);
+        if (!validation.ok) return bad(reply, 400, validation.error);
+        updateTask(task.task_id, { autonomy_level: validation.level });
+      }
+    }
+    if (body.kind === "set_planning_rigor") {
+      const p = (body.payload ?? {}) as { rigor?: unknown };
+      if (p.rigor === null || p.rigor === undefined) {
+        updateTask(task.task_id, { planning_rigor: null }); // clear override → inherit project default
+      } else {
+        const validation = validatePlanningRigor(p.rigor);
+        if (!validation.ok) return bad(reply, 400, validation.error);
+        updateTask(task.task_id, { planning_rigor: validation.rigor });
+      }
+    }
     const iv = createIntervention({
       task_id: task.task_id,
       kind: body.kind,
@@ -1980,6 +2226,197 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     const authKey = cfg.api_key?.trim() || envTokenForModel(cfg.name);
     const reach = await checkReachable(baseUrl, authKey, 8_000);
     return { config_id: id, available: reach.ok, error: reach.error };
+  });
+
+  // Probe a named model config's endpoint for server-side structured-decoding
+  // support (PLANNING/overhaul/02) and persist the result on that config row.
+  app.post(
+    "/api/model-configs/:id/probe-structured-outputs",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const id = Number((req.params as Record<string, string>).id);
+      if (!id || isNaN(id)) return bad(reply, 400, "Missing or invalid :id");
+      const cfg = getConfigById(id);
+      if (!cfg) return bad(reply, 404, "Config not found");
+
+      const baseUrl = (cfg.base_url ?? "").trim();
+      if (!baseUrl) return bad(reply, 400, "No base URL configured for this connection");
+      const authKey = cfg.api_key?.trim() || envTokenForModel(cfg.name) || "";
+      const modelId = cfg.default_model?.trim() || "";
+      const result = await probeStructuredOutputs(baseUrl, authKey, modelId);
+      updateModelConfig(id, { structured_outputs_json: JSON.stringify(result) });
+      return { config_id: id, result };
+    },
+  );
+
+  // ---- Model capability profiles (PLANNING/overhaul/06) ----
+  // One measured record per (connection signature, model id): behavioral probes
+  // bootstrap it, live run-health aggregates refine it, `overrides` is the
+  // human escape hatch. Reads recompute live/derived (the doc's "simplest
+  // viable" calibration job); resolution (settings.ts) reads the stored blob.
+
+  /** Resolve a config row to the probe target its profile is keyed by. */
+  function profileTargetForConfig(id: number):
+    | { cfg: NonNullable<ReturnType<typeof getConfigById>>; baseUrl: string; apiKey: string; modelId: string; sig: string }
+    | { error: string; code: number } {
+    if (!id || isNaN(id)) return { error: "Missing or invalid :id", code: 400 };
+    const cfg = getConfigById(id);
+    if (!cfg) return { error: "Config not found", code: 404 };
+    const conn = connectionFromConfigRow(cfg);
+    const baseUrl = conn.baseUrl.trim();
+    if (!baseUrl) return { error: "No base URL configured for this connection", code: 400 };
+    const modelId = conn.defaultModelId.trim();
+    if (!modelId) return { error: "No model id configured for this connection", code: 400 };
+    const apiKey = cfg.api_key?.trim() || envTokenForModel(cfg.name) || "";
+    return { cfg, baseUrl, apiKey, modelId, sig: profileConnectionSig(baseUrl) };
+  }
+
+  /** The response shape every profile route returns: the stored record plus the
+   *  merged decisions consumers act on (derived ⊕ overrides). */
+  function profileResponse(profile: ModelProfile) {
+    return { profile, effective: effectiveDecisions(profile) };
+  }
+
+  // All stored profiles (across connections), refreshed against live data.
+  app.get("/api/model-profiles", async () => {
+    return { profiles: listProfiles().map(profileResponse) };
+  });
+
+  // The profile for one model config, refreshed on read. `profile: null` (not
+  // a 404) when the pair was never probed — the UI treats that as "unprobed".
+  app.get("/api/model-configs/:id/profile", async (req: FastifyRequest, reply: FastifyReply) => {
+    const target = profileTargetForConfig(Number((req.params as Record<string, string>).id));
+    if ("error" in target) return bad(reply, target.code, target.error);
+    const profile = loadProfile(target.sig, target.modelId);
+    if (!profile) return { profile: null, effective: null };
+    return profileResponse(refreshProfile(profile));
+  });
+
+  // Run the behavioral probe suite (~20 small requests, 1–2 min on a local
+  // box) with SSE progress, then derive + persist the profile. GET because
+  // EventSource can't POST — same convention as the ping streams above.
+  //
+  // Override handling implements the doc's rollout steps:
+  //  - first probe: the connection's current hand flags are imported as
+  //    `overrides`, so profile-first resolution changes nothing on day one;
+  //  - re-probe: existing overrides are carried forward;
+  //  - ?reset=1: overrides are discarded — fully measured decisions.
+  app.get(
+    "/api/model-configs/:id/probe-profile/stream",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const target = profileTargetForConfig(Number((req.params as Record<string, string>).id));
+      if ("error" in target) return bad(reply, target.code, target.error);
+      const reset = (req.query as { reset?: string }).reset === "1";
+
+      reply.raw.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      const send = (event: string, data: unknown) => {
+        reply.raw.write(`event: ${event}\n`);
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      send("init", { model: target.modelId, base_url: target.baseUrl, steps: PROBE_STEPS });
+      try {
+        // Snapshot BEFORE probing: which overrides the new profile carries.
+        const existing = loadProfile(target.sig, target.modelId);
+        const overrides: ProfileOverrides = reset
+          ? {}
+          : existing
+            ? existing.overrides
+            : importedOverridesForConnection(connectionFromConfigRow(target.cfg));
+
+        const probes = await runModelProbes(target.baseUrl, target.apiKey, target.modelId, (ev) =>
+          send("step", ev),
+        );
+        // Keep the endpoint-level structured-outputs cache (overhaul/02) in
+        // sync — the suite already paid for those four requests.
+        updateModelConfig(target.cfg.id, {
+          structured_outputs_json: JSON.stringify({
+            probedAt: new Date().toISOString(),
+            baseUrl: target.baseUrl,
+            modelId: target.modelId,
+            modes: probes.structured,
+          }),
+        });
+        const profile = buildProfileFromProbes(target.baseUrl, target.modelId, probes, overrides);
+        send("done", profileResponse(profile));
+      } catch (err) {
+        send("error", { message: (err as Error).message });
+      }
+      reply.raw.end();
+    },
+  );
+
+  // Replace the profile's override bag (null/{} clears it — rollout step 3's
+  // "remove imported overrides model-by-model"), then re-derive and persist.
+  app.patch(
+    "/api/model-configs/:id/profile/overrides",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const target = profileTargetForConfig(Number((req.params as Record<string, string>).id));
+      if ("error" in target) return bad(reply, target.code, target.error);
+      const profile = loadProfile(target.sig, target.modelId);
+      if (!profile) return bad(reply, 404, "No profile for this connection/model — probe it first");
+
+      const body = (req.body ?? {}) as { overrides?: Record<string, unknown> | null };
+      const raw = body.overrides ?? {};
+      if (typeof raw !== "object" || Array.isArray(raw)) return bad(reply, 400, "overrides must be an object");
+      const overrides: ProfileOverrides = {};
+      const RUN_SHAPES = ["single-turn", "two-turn", "text"];
+      const DELIVERIES = ["json_schema", "guided_json", "grammar", "tool_call", "fence"];
+      const MAX_TOKENS_FIELDS = ["max_completion_tokens", "max_tokens"];
+      for (const [k, v] of Object.entries(raw)) {
+        if (v === undefined || v === null) continue;
+        switch (k) {
+          case "runShape":
+            if (!RUN_SHAPES.includes(v as string)) return bad(reply, 400, `invalid runShape '${String(v)}'`);
+            overrides.runShape = v as DerivedDecisions["runShape"];
+            break;
+          case "verdictDelivery":
+            if (!DELIVERIES.includes(v as string)) return bad(reply, 400, `invalid verdictDelivery '${String(v)}'`);
+            overrides.verdictDelivery = v as DerivedDecisions["verdictDelivery"];
+            break;
+          case "toolCapable":
+          case "reasoning":
+          case "supportsDeveloperRole":
+          case "supportsReasoningEffort":
+            if (typeof v !== "boolean") return bad(reply, 400, `${k} must be a boolean`);
+            overrides[k] = v;
+            break;
+          case "maxTokensField":
+            if (!MAX_TOKENS_FIELDS.includes(v as string)) return bad(reply, 400, `invalid maxTokensField '${String(v)}'`);
+            overrides.maxTokensField = v as DerivedDecisions["maxTokensField"];
+            break;
+          default:
+            return bad(reply, 400, `unknown override field '${k}'`);
+        }
+      }
+
+      const live = profile.live;
+      const res = deriveProfile(profile.probes, live, profile.modeState);
+      const next: ModelProfile = {
+        ...profile,
+        overrides,
+        derived: res.derived,
+        rationale: res.rationale,
+        suggestion: res.suggestion,
+        modeState: res.modeState,
+      };
+      saveProfile(next);
+      return profileResponse(next);
+    },
+  );
+
+  // Forget a profile entirely — resolution falls back to hand flags until the
+  // next probe (the recovery path for a profile invalidated by a silent
+  // quantization/server change).
+  app.delete("/api/model-configs/:id/profile", async (req: FastifyRequest, reply: FastifyReply) => {
+    const target = profileTargetForConfig(Number((req.params as Record<string, string>).id));
+    if ("error" in target) return bad(reply, target.code, target.error);
+    deleteProfile(target.sig, target.modelId);
+    return { ok: true };
   });
 
   // ---- Ping network: SSE stream — sends full list immediately, then updates as each ping returns ----

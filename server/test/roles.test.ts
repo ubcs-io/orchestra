@@ -3,11 +3,14 @@ import { closeDb, countGlobalRoles, getMeta, getRole, setMeta } from "../src/db"
 import {
   buildRoleSystemPrompt,
   DEFAULT_ROLES,
+  EXEC_EVIDENCE_CRITERIA,
+  EXECUTION_FLOW_TEMPLATE,
   EXIT_KIND_BY_INTAKE,
   OUTPUT_CONTRACT,
   ROUTING_TEMPLATES,
   seedGlobalRoles,
   TERMINAL_ROLE,
+  withEvidenceCriteria,
 } from "../src/roles";
 import { freshDb } from "./helpers";
 
@@ -90,5 +93,46 @@ describe("seedGlobalRoles", () => {
     expect(getMeta("roles_seed_hash")).toBe(freshHash);
     const role = getRole(null, DEFAULT_ROLES[0].key);
     expect(role?.system_prompt).toBe(buildRoleSystemPrompt(DEFAULT_ROLES[0].persona, DEFAULT_ROLES[0].tools));
+  });
+});
+
+describe("withEvidenceCriteria (overhaul/05)", () => {
+  it("is a no-op when the project has approved no commands", () => {
+    expect(withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, [])).toBe(EXECUTION_FLOW_TEMPLATE);
+  });
+
+  it("is a no-op when the approved commands don't include a gating one", () => {
+    expect(withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, ["lint", "build"])).toBe(
+      EXECUTION_FLOW_TEMPLATE,
+    );
+  });
+
+  it("attaches only the criteria whose command this project can actually run", () => {
+    const flow = withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, ["test", "lint"]);
+    expect(flow.criteria.map((c) => c.id)).toEqual(["exec.tests_pass"]);
+    const both = withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, ["test", "typecheck"]);
+    expect(both.criteria.map((c) => c.id)).toEqual(["exec.tests_pass", "exec.typecheck"]);
+  });
+
+  it("attaches them as must-criteria owned by the developer (the loop-back target)", () => {
+    const flow = withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, ["test"]);
+    const c = flow.criteria[0]!;
+    expect(c.severity).toBe("must");
+    expect(c.ownerRole).toBe("developer");
+    expect(c.evidence).toEqual({ command: "test", mustExitZero: true });
+  });
+
+  it("never mutates the shared template", () => {
+    withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, ["test", "typecheck"]);
+    expect(EXECUTION_FLOW_TEMPLATE.criteria).toEqual([]);
+  });
+
+  it("does not duplicate a criterion a custom flow already declares", () => {
+    const custom = {
+      ...EXECUTION_FLOW_TEMPLATE,
+      criteria: [EXEC_EVIDENCE_CRITERIA[0]!],
+    };
+    const flow = withEvidenceCriteria(custom, ["test", "typecheck"]);
+    expect(flow.criteria.map((c) => c.id)).toEqual(["exec.tests_pass", "exec.typecheck"]);
   });
 });

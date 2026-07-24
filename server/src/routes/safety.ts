@@ -17,7 +17,13 @@ import {
 import { getGlobalConfig, getMeta, listProjects, listRoles, setMeta } from "../db.js";
 import { resolveConnection } from "../settings.js";
 import { getConfig } from "../config.js";
-import { DEFAULT_HARNESS_POLICY, WRITE_TOOL_NAMES, resolveHarnessPolicy } from "../harness-policy.js";
+import {
+  DEFAULT_HARNESS_POLICY,
+  EXEC_TOOL_NAME,
+  WRITE_TOOL_NAMES,
+  execEnabled,
+  resolveHarnessPolicy,
+} from "../harness-policy.js";
 
 function resolveRoleToolBudget(): number {
   const meta = getMeta("safety.role_tool_budget");
@@ -90,17 +96,38 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
     // touching the global catalog.
     const writeToolSet = new Set<string>(WRITE_TOOL_NAMES);
     let projectsWithWrite = 0;
+    let projectsWithExec = 0;
     const projectSummaries = listProjects().map((p) => {
       const policy = resolveHarnessPolicy(p.config_json);
-      const rolesWithWrite = listRoles(p.id)
-        .filter((r) => {
-          if (!r.enabled || !r.tools_json) return false;
-          const roleTools = JSON.parse(r.tools_json) as string[];
-          return roleTools.some((t) => writeToolSet.has(t));
-        })
+      const projectRoles = listRoles(p.id).filter((r) => r.enabled && r.tools_json);
+      const roleTools = (r: (typeof projectRoles)[number]): string[] => {
+        try {
+          return JSON.parse(r.tools_json!) as string[];
+        } catch {
+          return [];
+        }
+      };
+      const rolesWithWrite = projectRoles
+        .filter((r) => roleTools(r).some((t) => writeToolSet.has(t)))
         .map((r) => r.key);
+      // A live exec grant needs BOTH halves — the policy switch with a non-empty
+      // command menu, and a role that actually asked for the tool. Reporting the
+      // conjunction (rather than the switch alone) is what keeps this panel an
+      // honest answer to "can this thing run commands right now?".
+      const rolesWithExec = execEnabled(policy)
+        ? projectRoles.filter((r) => roleTools(r).includes(EXEC_TOOL_NAME)).map((r) => r.key)
+        : [];
       if (rolesWithWrite.length > 0) projectsWithWrite++;
-      return { id: p.id, name: p.name, allow_write: policy.allowWrite, roles_with_write: rolesWithWrite };
+      if (rolesWithExec.length > 0) projectsWithExec++;
+      return {
+        id: p.id,
+        name: p.name,
+        allow_write: policy.allowWrite,
+        roles_with_write: rolesWithWrite,
+        allow_exec: policy.allowExec,
+        exec_commands: (policy.execAllowlist ?? []).map((c) => ({ name: c.name, argv: c.argv })),
+        roles_with_exec: rolesWithExec,
+      };
     });
 
     return {
@@ -110,7 +137,16 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
           projectsWithWrite > 0
             ? "PLANNING/ (always, via write_artifact) plus source files inside the task's git worktree for roles granted write/edit"
             : "PLANNING/ only (sandboxed artifact writes via write_artifact tool)",
+        // Not a shell — `run_command` (PLANNING/overhaul/05) executes fixed,
+        // pre-approved argv with no shell interpretation. But it does run
+        // project code with this process's privileges, so anything short of
+        // saying so plainly here would be misleading.
         shell_access: false,
+        command_execution: projectsWithExec > 0,
+        command_execution_note:
+          projectsWithExec > 0
+            ? "allowlisted commands only (fixed argv, no shell), inside the task worktree, with a scrubbed environment — but executing project code runs it with this daemon's OS privileges"
+            : "no project has approved command execution",
         cross_repo_access: false,
         source_code_writes: projectsWithWrite > 0,
         git_history_available: gitHistoryCount > 0,

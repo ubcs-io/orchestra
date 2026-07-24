@@ -23,7 +23,15 @@ function FileDiffLoader({ taskId, file }: { taskId: string; file: DiffFile }) {
 
 /** A family member currently parked in review, with the detail data
  *  ReviewCTA needs to render its accept/merge or request-changes actions. */
-function PendingReview({ taskId, onMutate }: { taskId: string; onMutate: () => void }) {
+function PendingReview({
+  taskId,
+  onMutate,
+  onOpenDiff,
+}: {
+  taskId: string;
+  onMutate: () => void;
+  onOpenDiff: () => void;
+}) {
   const detailQ = useQuery({ queryKey: ["task", taskId], queryFn: () => api.task(taskId) });
   if (!detailQ.data) return null;
   const { task, recap_md, coverage, runs, interventions, children } = detailQ.data;
@@ -37,6 +45,7 @@ function PendingReview({ taskId, onMutate }: { taskId: string; onMutate: () => v
       interventions={interventions}
       childTasks={children}
       onMutate={onMutate}
+      onOpenDiff={onOpenDiff}
     />
   );
 }
@@ -54,6 +63,10 @@ export function WorktreeDetailPane({
   const diffQ = useQuery({ queryKey: ["taskDiff", rootId], queryFn: () => api.taskDiff(rootId) });
   const tree = useMemo(() => (diffQ.data ? buildFileTree(diffQ.data.files) : null), [diffQ.data]);
   const [selectedFile, setSelectedFile] = useState<DiffFile | null>(null);
+  const diffSectionId = `worktree-diff-${rootId}`;
+  const scrollToDiff = () => {
+    document.getElementById(diffSectionId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   // Per the "stack all pending reviews" decision: a decomposed family can
   // have more than one member simultaneously awaiting a human decision, so
@@ -77,7 +90,7 @@ export function WorktreeDetailPane({
       {diffQ.isError && <p className="pill bad" style={{ margin: "12px 0" }}>Failed to load diff.</p>}
 
       {diffQ.data && (
-        <div className="worktree-detail-body">
+        <div id={diffSectionId} className="worktree-detail-body">
           <div className="panel worktree-detail-tree">
             {tree && <FileTree tree={tree} selectedPath={selectedFile?.path} onSelect={setSelectedFile} />}
           </div>
@@ -94,7 +107,7 @@ export function WorktreeDetailPane({
       {pendingReviewIds.length > 0 && (
         <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
           {pendingReviewIds.map((taskId) => (
-            <PendingReview key={taskId} taskId={taskId} onMutate={onMutate} />
+            <PendingReview key={taskId} taskId={taskId} onMutate={onMutate} onOpenDiff={scrollToDiff} />
           ))}
         </div>
       )}

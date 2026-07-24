@@ -10,5 +10,52 @@
   "requestTimeoutMs": 300000,
   "schedulerIdleMs": 3000,
   "roleToolBudget": 40,
-  "maxConcurrentTasks": 3
+  "maxConcurrentTasks": 3,
+
+  "//harnessPolicy": [
+    "The per-project harness policy is NOT set here — it lives on each project",
+    "(projects.config_json -> harness) and is edited from that project's Roles",
+    "Editor. The examples below are reference menus to paste into the exec",
+    "allowlist there. Both switches default OFF; nothing runs until you opt in.",
+    "",
+    "allowExec turns on the `run_command` tool, which executes ONLY the fixed",
+    "argv you list here — a menu, not a shell. It runs inside the task's own git",
+    "worktree with a scrubbed environment. It is NOT a sandbox: executing your",
+    "project's tests runs your project's code (and its dependencies' lifecycle",
+    "scripts) with this daemon's OS privileges. Enable it on repos you would run",
+    "`npm test` in yourself, and not on ones you wouldn't."
+  ],
+  "//harnessPolicyExample": {
+    "harness": {
+      "allowWrite": true,
+      "allowExec": true,
+      "execTimeoutMs": 120000,
+      "execMaxOutputBytes": 65536,
+      "execMaxRuns": 5,
+      "execEnv": { "NODE_ENV": "test" },
+      "execAllowlist": [
+        { "name": "test", "argv": ["npm", "test"], "description": "the full test suite" },
+        { "name": "typecheck", "argv": ["npx", "tsc", "--noEmit"] },
+        { "name": "lint", "argv": ["npm", "run", "lint"] },
+        { "name": "build", "argv": ["npm", "run", "build"], "timeoutMs": 300000 }
+      ]
+    }
+  },
+  "//harnessPolicyExamplesByEcosystem": {
+    "python": [
+      { "name": "test", "argv": ["pytest", "-q"], "allowArgs": true, "argPattern": "^[A-Za-z0-9._/:-]+$", "description": "optionally pass a single test path to narrow the run" },
+      { "name": "typecheck", "argv": ["mypy", "."] },
+      { "name": "lint", "argv": ["ruff", "check", "."] }
+    ],
+    "rust": [
+      { "name": "test", "argv": ["cargo", "test"] },
+      { "name": "typecheck", "argv": ["cargo", "check"] },
+      { "name": "lint", "argv": ["cargo", "clippy", "--", "-D", "warnings"] }
+    ],
+    "go": [
+      { "name": "test", "argv": ["go", "test", "./..."] },
+      { "name": "typecheck", "argv": ["go", "build", "./..."] },
+      { "name": "lint", "argv": ["go", "vet", "./..."] }
+    ]
+  }
 }

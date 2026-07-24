@@ -11,13 +11,15 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph, type NetworkPingTarget } from "../api";
+import { api, displayModelName, isEvidenceGreen, parseEvidence, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph, type NetworkPingTarget } from "../api";
 import { blockedDeps } from "../relations";
 import { rolesWithWriteTools, taskWriteCapability } from "../writeCapability";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
 import { DiffPanel, RunDiffSection } from "../components/DiffPanel";
 import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
+import { HealthBadge } from "../components/HealthBadge";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
 import { CollapsibleCard } from "../components/CollapsibleCard";
 
@@ -1048,8 +1050,28 @@ function RefinementNetworkPanel({
                     {planStep.status}
                   </span>
                 ) : null}
+                {displayRun && (
+                  <HealthBadge health={displayRun.health} reason={displayRun.health_reason} />
+                )}
+                {displayRun?.verdict_source && (
+                  <span className="pill dim" title="How the structured verdict was obtained">
+                    via {displayRun.verdict_source}
+                  </span>
+                )}
                 {displayRun?.tokens != null && (
                   <span className="pill dim">{displayRun.tokens.toLocaleString()} tok</span>
+                )}
+                {displayRun?.context_tokens_est != null && (
+                  <span
+                    className={`pill ${displayRun.context_degraded ? "warn" : "dim"}`}
+                    title={
+                      displayRun.context_degraded
+                        ? "This run's context needed tier degradation to fit the model's budget (overhaul/07)"
+                        : "Estimated size of the context this run was given (overhaul/07)"
+                    }
+                  >
+                    ctx ~{displayRun.context_tokens_est.toLocaleString()} tok{displayRun.context_degraded ? " (degraded)" : ""}
+                  </span>
                 )}
                 {displayRun?.depth && displayRun.depth > 1 && (
                   <span className="pill dim">depth {displayRun.depth}</span>
@@ -1169,6 +1191,90 @@ function NetworkSelector({ taskId, projectId, intakeKind, onChanged }: { taskId:
           {n.name} {n.is_system ? "" : "✦"}
         </option>
       ))}
+    </select>
+  );
+}
+
+/** Task-level override for how far this task's own pipeline may progress
+ *  unattended, or "(project default: X)" when unset. Rendered unconditionally
+ *  (unlike NetworkSelector, which is intake-only) since a task can be
+ *  re-leveled at any stage. Goes through the interventions route rather than
+ *  api.updateTask — the generic task PATCH route only recognizes intake-stage
+ *  fields (name/content/intake_kind), so it wouldn't actually persist this. */
+function AutonomyLevelSelector({
+  taskId,
+  projectId,
+  taskLevel,
+  onChanged,
+}: {
+  taskId: string;
+  projectId: number;
+  taskLevel: string | null;
+  onChanged: () => void;
+}) {
+  const projLevelQ = useQuery({ queryKey: ["autonomy-level", projectId], queryFn: () => api.autonomyLevel(projectId) });
+  const setLevel = useMutation({
+    mutationFn: (level: string | null) => api.intervene(taskId, "set_autonomy_level", { level }),
+    onSuccess: () => onChanged(),
+  });
+  const projDefault = projLevelQ.data?.level ?? "edit";
+
+  return (
+    <select
+      className="pill dim"
+      style={{ width: "auto", fontSize: 11, padding: "2px 6px" }}
+      value={taskLevel ?? ""}
+      disabled={setLevel.isPending}
+      onChange={(e) => setLevel.mutate(e.target.value || null)}
+      title="How far this task's own pipeline may progress unattended"
+    >
+      <option value="">autonomy: {projDefault} (project default)</option>
+      <option value="plan">autonomy: plan</option>
+      <option value="edit">autonomy: edit</option>
+      <option value="auto">autonomy: auto</option>
+    </select>
+  );
+}
+
+/** Task-level override for how much the family-wide decomposition budget is
+ *  scaled relative to this task's effort_size, or "(project default: X)" when
+ *  unset — mirrors AutonomyLevelSelector above exactly. Labeled "planning
+ *  depth" in the UI (not "rigor") to avoid colliding with the unrelated
+ *  counter-reviewer gate rigor pill shown elsewhere on this page. */
+function PlanningRigorSelector({
+  taskId,
+  projectId,
+  taskRigor,
+  onChanged,
+}: {
+  taskId: string;
+  projectId: number;
+  taskRigor: string | null;
+  onChanged: () => void;
+}) {
+  const projRigorQ = useQuery({
+    queryKey: ["planning-rigor", projectId],
+    queryFn: () => api.planningRigor(projectId),
+  });
+  const setRigor = useMutation({
+    mutationFn: (rigor: string | null) => api.intervene(taskId, "set_planning_rigor", { rigor }),
+    onSuccess: () => onChanged(),
+  });
+  const projDefault = projRigorQ.data?.rigor ?? "standard";
+
+  return (
+    <select
+      className="pill dim"
+      style={{ width: "auto", fontSize: 11, padding: "2px 6px" }}
+      value={taskRigor ?? ""}
+      disabled={setRigor.isPending}
+      onChange={(e) => setRigor.mutate(e.target.value || null)}
+      title="How much the family-wide decomposition budget is scaled for this task"
+    >
+      <option value="">planning depth: {projDefault} (project default)</option>
+      <option value="minimal">planning depth: minimal</option>
+      <option value="standard">planning depth: standard</option>
+      <option value="thorough">planning depth: thorough</option>
     </select>
   );
 }
@@ -1631,6 +1737,23 @@ export function TaskDetail() {
         {t.exit_state === "network_unavailable" && <span className="pill bad">network unavailable</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
+        {t.project_id != null && (
+          <AutonomyLevelSelector
+            taskId={t.task_id}
+            projectId={t.project_id}
+            taskLevel={t.autonomy_level}
+            onChanged={refresh}
+          />
+        )}
+        {t.project_id != null && (
+          <PlanningRigorSelector
+            taskId={t.task_id}
+            projectId={t.project_id}
+            taskRigor={t.planning_rigor}
+            onChanged={refresh}
+          />
+        )}
+        {t.effort_size && <span className="pill dim">size: {t.effort_size}</span>}
         {t.paused === 1 && <span className="pill warn">paused</span>}
         {t.reconcile_status === "pending_human_merge" && (
           t.github_pr_url ? (
@@ -1863,9 +1986,32 @@ export function TaskDetail() {
                   <span className="collapse-caret">{isCollapsed ? "▸" : "▾"}</span>
                   <h2 style={{ margin: 0, cursor: "pointer" }}>{r.role_key}</h2>
                   <span className={`pill ${verdictClass(r.verdict)}`}>{r.verdict ?? "?"}</span>
+                  <HealthBadge health={r.health} reason={r.health_reason} />
                   {r.fallback === 1 && <span className="pill warn" title="Model never called record_findings — output was salvaged">no verdict</span>}
                   {r.stop_reason === "length" && <span className="pill bad" title="Output hit the token limit before finishing">truncated</span>}
                   {r.stalled === 1 && <span className="pill warn" title="Model narrated calling record_findings instead of invoking it — auto-aborted and retried">stalled</span>}
+                  {r.verdict_source && <span className="pill dim" title="How the structured verdict was obtained">via {r.verdict_source}</span>}
+                  {r.context_degraded === 1 && (
+                    <span className="pill warn" title="This run's context needed tier degradation to fit the model's budget (overhaul/07)">
+                      ctx degraded
+                    </span>
+                  )}
+                  {(() => {
+                    // Verification evidence at a glance (overhaul/05) — visible
+                    // even while the run is collapsed, because "did the tests
+                    // pass" is the first thing a reviewer scans for.
+                    const ev = parseEvidence(r.evidence_json);
+                    if (!ev.length) return null;
+                    const green = ev.every(isEvidenceGreen);
+                    return (
+                      <span
+                        className={`pill ${green ? "ok" : "bad"}`}
+                        title={ev.map((e) => `${e.name}: exit ${e.exitCode ?? "killed"}`).join(", ")}
+                      >
+                        {green ? "✓" : "✗"} {ev.length} run{ev.length === 1 ? "" : "s"}
+                      </span>
+                    );
+                  })()}
                   {r.tokens != null && <span className="muted">{r.tokens} tok</span>}
                   {r.depth > 1 && <span className="pill dim">depth {r.depth}</span>}
                   <div style={{ flex: 1 }} />
@@ -1921,6 +2067,20 @@ export function TaskDetail() {
                   )}
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
+                {!isCollapsed && r.carry_forward && (
+                  <p className="muted" style={{ margin: "6px 0", fontSize: 13 }} title="Handoff contract for the next role (overhaul/07 §4)">
+                    <strong>Carry forward:</strong> {r.carry_forward}
+                  </p>
+                )}
+                {!isCollapsed && (r.health === "degraded" || r.health === "empty") && (
+                  <div className={`banner ${r.health === "empty" ? "bad" : "warn"}`} style={{ margin: "8px 0" }}>
+                    ⚠ Distrust this output — <strong>{r.health}</strong> run.{" "}
+                    <span className="banner-why">
+                      {r.health_reason || "The verdict may be synthesized or the report incomplete."}
+                    </span>
+                  </div>
+                )}
+                {!isCollapsed && <EvidencePanel evidence={parseEvidence(r.evidence_json)} />}
                 {!isCollapsed && r.output_md && (
                   <div className="section-md rendered-md" dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }} />
                 )}
@@ -1998,6 +2158,7 @@ export function TaskDetail() {
               interventions={d.interventions}
               childTasks={d.children}
               onMutate={refresh}
+              onOpenDiff={() => setDiffOpen(true)}
             />
           )}
 

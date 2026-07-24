@@ -14,6 +14,7 @@ import {
   refineCommitMessage,
   removeWorktree,
   resolveInPlanning,
+  resolveRef,
   scaffoldPlanning,
   scanIntake,
   worktreePath,
@@ -180,6 +181,29 @@ describe("worktrees", () => {
     // The branch (and its commit) survives — only the worktree checkout was removed.
     ensureWorktree(r, dir, "orchestra/task-1", base);
     expect(fs.existsSync(path.join(dir, "work.md"))).toBe(true);
+  });
+});
+
+describe("resolveRef (PLANNING/overhaul/08 — scan worktree reset)", () => {
+  it("resolves a branch name and HEAD to the same full SHA", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const headViaBranch = resolveRef(r, base);
+    const headViaHead = resolveRef(r, "HEAD");
+    expect(headViaBranch).toBe(headViaHead);
+    expect(headViaBranch).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("does not touch what is checked out at repoPath", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    resolveRef(r, base);
+    expect(currentBranch(r)).toBe(base);
+  });
+
+  it("throws on an unknown ref", () => {
+    const r = repo();
+    expect(() => resolveRef(r, "refs/heads/does-not-exist")).toThrow();
   });
 });
 

@@ -1,8 +1,16 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, displayModelName } from "../api";
-import type { ModelConfig, ModelStat, Project } from "../api";
+import type {
+  ModelConfig,
+  ModelStat,
+  Project,
+  HealthGroupBy,
+  ModelProfileView,
+  DerivedDecisions,
+  ProfileProbeProgress,
+} from "../api";
 
 const THINKING_FORMAT_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "qwen-chat-template", label: "Qwen (vLLM / llama.cpp)" },
@@ -16,6 +24,55 @@ const THINKING_FORMAT_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "chat-template", label: "Chat template" },
   { value: "ant-ling", label: "Ant Ling" },
 ];
+
+/** Ordered probe steps + labels, mirroring server/src/profiles.ts's PROBE_STEPS. */
+const PROBE_STEP_LABELS: Array<[string, string]> = [
+  ["structured", "structured decoding"],
+  ["customToolCall", "custom tool call"],
+  ["builtinToolCall", "built-in tool call"],
+  ["jsonFence", "fenced JSON"],
+  ["thinkingDialect", "thinking dialect"],
+  ["params", "param acceptance"],
+  ["effectiveContext", "context length"],
+];
+
+const RUN_SHAPE_LABEL: Record<string, string> = {
+  "single-turn": "Single-turn (custom tool call)",
+  "two-turn": "Two-turn (explore + formalize)",
+  text: "Text mode (fenced JSON)",
+};
+const RUN_SHAPE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "single-turn", label: RUN_SHAPE_LABEL["single-turn"] },
+  { value: "two-turn", label: RUN_SHAPE_LABEL["two-turn"] },
+  { value: "text", label: RUN_SHAPE_LABEL.text },
+];
+const VERDICT_DELIVERY_LABEL: Record<string, string> = {
+  json_schema: "json_schema (constrained)",
+  guided_json: "guided_json (constrained, vLLM)",
+  grammar: "grammar (constrained, GBNF)",
+  tool_call: "custom tool call",
+  fence: "fenced JSON",
+};
+const VERDICT_DELIVERY_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "json_schema", label: VERDICT_DELIVERY_LABEL.json_schema },
+  { value: "guided_json", label: VERDICT_DELIVERY_LABEL.guided_json },
+  { value: "grammar", label: VERDICT_DELIVERY_LABEL.grammar },
+  { value: "tool_call", label: VERDICT_DELIVERY_LABEL.tool_call },
+  { value: "fence", label: VERDICT_DELIVERY_LABEL.fence },
+];
+const MAX_TOKENS_FIELD_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "max_completion_tokens", label: "max_completion_tokens" },
+  { value: "max_tokens", label: "max_tokens (legacy)" },
+];
+
+function pct(x: number): string {
+  return `${Math.round(x * 100)}%`;
+}
+
+function trialLabel(t?: { attempts: number; successes: number }): string {
+  if (!t || t.attempts === 0) return "not probed";
+  return `${t.successes}/${t.attempts} (${pct(t.successes / t.attempts)})`;
+}
 
 function ctxLabel(n: number | null | undefined, def: number): string {
   const v = n ?? def;
@@ -514,6 +571,108 @@ function StatsTable({ stats: rawStats }: { stats: ModelStat[]; configs: ModelCon
   );
 }
 
+// ---------------------------------------------------------------------------
+// Reliability rollup (PLANNING/overhaul/04 §3) — the tuning cockpit.
+// ---------------------------------------------------------------------------
+
+/** A 0..1 rate as a red/amber/green cell; higher = worse for degradation rates,
+ *  better for repair-success (pass `invert`). */
+function RateCell({ rate, invert = false }: { rate: number; invert?: boolean }) {
+  const bad = invert ? rate < 0.5 : rate > 0.25;
+  const warn = invert ? rate < 0.8 : rate > 0.1;
+  const cls = bad ? "bad" : warn ? "warn" : "ok";
+  return <span className={`pill ${cls}`} style={{ fontSize: 10 }}>{Math.round(rate * 100)}%</span>;
+}
+
+const HEALTH_GROUPS: Array<{ key: HealthGroupBy; label: string }> = [
+  { key: "model", label: "by model" },
+  { key: "mode", label: "by output mode" },
+  { key: "role", label: "by role" },
+];
+
+/** Per-bucket reliability rollup answering "which mode should this model use?".
+ *  Degradation is normalized against runs, so a healthy:degraded ratio is
+ *  visible at a glance; repair-success shows how often the cheap repair call
+ *  rescued a run that would otherwise have fallen back. */
+function HealthReliabilityTable() {
+  const [groupBy, setGroupBy] = useState<HealthGroupBy>("model");
+  const { data } = useQuery({
+    queryKey: ["health-stats", groupBy],
+    queryFn: () => api.healthStats(groupBy),
+    staleTime: 30_000,
+  });
+  const stats = data?.stats ?? [];
+
+  return (
+    <div className="panel" style={{ marginBottom: 16, overflowX: "auto", minHeight: 120 }}>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <h3 style={{ margin: 0, color: "var(--brass)", fontSize: 13, textTransform: "uppercase", letterSpacing: 1 }}>
+          Run Reliability
+        </h3>
+        <span>
+          {HEALTH_GROUPS.map((g) => (
+            <button
+              key={g.key}
+              className={`small${groupBy === g.key ? " primary" : ""}`}
+              style={{ marginLeft: 6 }}
+              onClick={() => setGroupBy(g.key)}
+            >
+              {g.label}
+            </button>
+          ))}
+        </span>
+      </div>
+      {stats.length === 0 ? (
+        <p className="muted" style={{ fontSize: 12 }}>
+          No runs recorded yet. Reliability appears here once tasks have run — it answers "which
+          output mode should this model use?" at a glance.
+        </p>
+      ) : (
+        <table className="stats-table">
+          <thead>
+            <tr>
+              <th style={{ whiteSpace: "nowrap" }}>{groupBy === "mode" ? "Output mode" : groupBy === "role" ? "Role" : "Model"}</th>
+              <th title="Total primary runs in this bucket">Runs</th>
+              <th title="Clean run whose verdict is backed by green harness-recorded command runs">Verified</th>
+              <th title="Clean verdict, no stall/truncation, first attempt">Healthy</th>
+              <th title="Real verdict, but only after a repair pass or resume">Recovered</th>
+              <th title="Synthesized verdict, or truncated/stalled without recovery">Degraded</th>
+              <th title="Degraded and produced no durable output">Empty</th>
+              <th title="Fraction of runs that stalled">Stall</th>
+              <th title="Fraction of runs truncated at the token limit">Trunc</th>
+              <th title="Of runs that reached the repair pass, the fraction it rescued">Repair✓</th>
+              <th title="Median tokens per run">Med tok</th>
+              <th title="Average wall-clock duration per run">Avg dur</th>
+              <th title="p95 assembled role-context size (overhaul/07) — chars/4 estimate">p95 ctx</th>
+              <th title="Fraction of runs whose context needed tier degradation to fit budget (shadow mode: would have needed to)">Ctx degr.</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stats.map((s) => (
+              <tr key={s.group}>
+                <td><strong>{groupBy === "model" ? displayModelName(s.group) : s.group}</strong></td>
+                <td>{s.runs}</td>
+                <td>{s.verified > 0 ? <span className="pill ok" style={{ fontSize: 10 }}>{s.verified}</span> : "—"}</td>
+                <td><span className="pill ok" style={{ fontSize: 10 }}>{s.healthy}</span></td>
+                <td>{s.recovered > 0 ? <span className="pill accent" style={{ fontSize: 10 }}>{s.recovered}</span> : "—"}</td>
+                <td>{s.degraded > 0 ? <span className="pill warn" style={{ fontSize: 10 }}>{s.degraded}</span> : "—"}</td>
+                <td>{s.empty > 0 ? <span className="pill bad" style={{ fontSize: 10 }}>{s.empty}</span> : "—"}</td>
+                <td><RateCell rate={s.stall_rate} /></td>
+                <td><RateCell rate={s.truncation_rate} /></td>
+                <td>{s.repair_attempted > 0 ? <RateCell rate={s.repair_success_rate} invert /> : "—"}</td>
+                <td>{s.median_tokens > 0 ? s.median_tokens.toLocaleString() : "—"}</td>
+                <td>{s.avg_duration_ms > 0 ? `${(s.avg_duration_ms / 1000).toFixed(1)}s` : "—"}</td>
+                <td>{s.p95_context_tokens_est > 0 ? s.p95_context_tokens_est.toLocaleString() : "—"}</td>
+                <td>{s.context_degraded_count > 0 ? <RateCell rate={s.context_degraded_rate} /> : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 export function Models() {
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({
@@ -927,6 +1086,7 @@ export function Models() {
                 </div>
               </div>
               <StatsTable stats={filteredStats} configs={configs} />
+              <HealthReliabilityTable />
             </div>
           </div>
 
@@ -1124,6 +1284,415 @@ export function Models() {
 }
 
 // ---------------------------------------------------------------------------
+// Measured capability profile (PLANNING/overhaul/06)
+// ---------------------------------------------------------------------------
+
+function OverrideSelect({
+  value,
+  options,
+  onChange,
+  disabled,
+}: {
+  value: string | undefined;
+  options: Array<{ value: string; label: string }>;
+  onChange: (v: string | undefined) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <select
+      value={value ?? ""}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value || undefined)}
+      style={{ fontSize: 10, padding: "1px 4px" }}
+    >
+      <option value="">(measured)</option>
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function OverrideBoolSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: boolean | undefined;
+  onChange: (v: boolean | undefined) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <select
+      value={value === undefined ? "" : value ? "true" : "false"}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value === "true")}
+      style={{ fontSize: 10, padding: "1px 4px" }}
+    >
+      <option value="">(measured)</option>
+      <option value="true">Yes</option>
+      <option value="false">No</option>
+    </select>
+  );
+}
+
+function DecisionRow({
+  label,
+  effective,
+  overridden,
+  rationale,
+  editor,
+}: {
+  label: string;
+  effective: string;
+  overridden: boolean;
+  rationale?: string;
+  editor: React.ReactNode;
+}) {
+  return (
+    <tr style={{ borderTop: "1px solid var(--border, rgba(255,255,255,0.08))" }}>
+      <td style={{ padding: "4px 8px 4px 0", whiteSpace: "nowrap", color: "var(--muted)" }}>{label}</td>
+      <td style={{ padding: "4px 8px", whiteSpace: "nowrap" }}>
+        {effective}
+        {overridden && (
+          <span className="pill warn" style={{ marginLeft: 6, fontSize: 9 }}>
+            overridden
+          </span>
+        )}
+      </td>
+      <td style={{ padding: "4px 8px" }}>{editor}</td>
+      <td style={{ padding: "4px 0", fontSize: 10, color: "var(--muted)" }}>{rationale ?? ""}</td>
+    </tr>
+  );
+}
+
+/**
+ * Probe UI + derived-decision display with rationale + override editors
+ * (PLANNING/overhaul/06 §4 — "Models.tsx becomes: probe status, measured
+ * rates, derived decisions with 'why', and override editors"). Every override
+ * change PATCHes the full merged override bag so partial edits never clobber
+ * sibling overrides; leaving a field on "(measured)" omits it from the bag,
+ * which is how a field goes back to being fully measured.
+ */
+function ModelCapabilityProfile({ configId, isNew }: { configId: number | null; isNew: boolean }) {
+  const qc = useQueryClient();
+  const profileQ = useQuery({
+    queryKey: ["model-profile", configId],
+    queryFn: () => api.modelProfile(configId!),
+    enabled: !isNew && configId != null,
+  });
+  const [probing, setProbing] = useState(false);
+  const [steps, setSteps] = useState<Record<string, ProfileProbeProgress>>({});
+  const [probeError, setProbeError] = useState("");
+  const esRef = useRef<EventSource | null>(null);
+
+  const closeStream = useCallback(() => {
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+  }, []);
+  useEffect(() => () => closeStream(), [closeStream]);
+
+  function runProbe(reset: boolean) {
+    if (configId == null) return;
+    closeStream();
+    setProbing(true);
+    setProbeError("");
+    setSteps({});
+    const es = new EventSource(api.modelProfileProbeStreamUrl(configId, reset));
+    esRef.current = es;
+    es.addEventListener("step", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as ProfileProbeProgress;
+      setSteps((prev) => ({ ...prev, [data.step]: data }));
+    });
+    es.addEventListener("done", () => {
+      setProbing(false);
+      closeStream();
+      qc.invalidateQueries({ queryKey: ["model-profile", configId] });
+    });
+    es.addEventListener("error", (e) => {
+      const raw = (e as MessageEvent).data as string | undefined;
+      let msg = "Connection to the probe stream was lost.";
+      if (raw) {
+        try {
+          msg = (JSON.parse(raw) as { message: string }).message;
+        } catch {
+          /* keep default message */
+        }
+      }
+      setProbeError(msg);
+      setProbing(false);
+      closeStream();
+    });
+  }
+
+  const overridesM = useMutation({
+    mutationFn: (overrides: Partial<DerivedDecisions>) => api.updateModelProfileOverrides(configId!, overrides),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["model-profile", configId] }),
+  });
+  const forgetM = useMutation({
+    mutationFn: () => api.deleteModelProfile(configId!),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["model-profile", configId] }),
+  });
+
+  function setOverride<K extends keyof DerivedDecisions>(key: K, value: DerivedDecisions[K] | undefined) {
+    const base = profile?.overrides ?? {};
+    const next: Partial<DerivedDecisions> = { ...base };
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+    overridesM.mutate(next);
+  }
+
+  if (isNew) {
+    return (
+      <div style={{ marginTop: 16 }}>
+        <strong style={{ fontSize: 13, color: "var(--brass)" }}>Measured Capability Profile</strong>
+        <p className="muted" style={{ fontSize: 11, margin: "4px 0 0" }}>
+          Save this config first, then probe it.
+        </p>
+      </div>
+    );
+  }
+
+  const profile: ModelProfileView | null = profileQ.data?.profile ?? null;
+  const effective: DerivedDecisions | null = profileQ.data?.effective ?? null;
+  const hasOverride = (k: keyof DerivedDecisions) => profile?.overrides?.[k] !== undefined;
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <strong style={{ fontSize: 13, color: "var(--brass)" }}>Measured Capability Profile</strong>
+      <p className="muted" style={{ fontSize: 11, margin: "4px 0 8px" }}>
+        Replaces hand-tuned text-mode / two-phase / compat guessing with behavioral probes (~20 small
+        requests, 1–2 min) plus live run reliability. Any decision below can still be pinned with an
+        override.
+      </p>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <button className="small" disabled={probing} onClick={() => runProbe(false)}>
+          {probing ? "Probing…" : profile ? "Re-probe" : "Probe model"}
+        </button>
+        {profile && (
+          <button
+            className="small"
+            disabled={probing}
+            onClick={() => runProbe(true)}
+            title="Re-probe and discard existing overrides"
+          >
+            Re-probe (discard overrides)
+          </button>
+        )}
+        {profile && (
+          <button
+            className="small"
+            disabled={forgetM.isPending}
+            onClick={() => forgetM.mutate()}
+            title="Forget this profile — resolution falls back to hand-tuned flags above"
+          >
+            Forget profile
+          </button>
+        )}
+      </div>
+
+      {probing && (
+        <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {PROBE_STEP_LABELS.map(([key, label]) => {
+            const s = steps[key];
+            const cls = !s ? "dim" : s.status === "start" ? "warn" : "ok";
+            return (
+              <span key={key} className={`pill ${cls}`}>
+                {label}
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {probeError && <p style={{ fontSize: 11, color: "var(--bad)", marginTop: 6 }}>Probe failed: {probeError}</p>}
+
+      {profileQ.isLoading && !probing && (
+        <p className="muted" style={{ fontSize: 11 }}>
+          Loading…
+        </p>
+      )}
+
+      {!profile && !probing && !profileQ.isLoading && (
+        <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          Never probed — this connection is running on the hand-tuned flags above (text mode / two-phase /
+          compat overrides).
+        </p>
+      )}
+
+      {profile && effective && (
+        <div style={{ marginTop: 10 }}>
+          <p className="muted" style={{ fontSize: 10 }}>
+            Last probed {profile.probedAt ? new Date(profile.probedAt).toLocaleString() : "never"}
+            {profile.live &&
+              ` · ${profile.live.runs} live run${profile.live.runs === 1 ? "" : "s"} in the last ${profile.live.window}`}
+          </p>
+
+          {profile.suggestion && (
+            <p
+              style={{
+                fontSize: 11,
+                background: "var(--panel-2, rgba(255,255,255,0.05))",
+                padding: "6px 8px",
+                borderRadius: 4,
+                marginTop: 6,
+              }}
+            >
+              {profile.suggestion}
+            </p>
+          )}
+
+          <table style={{ width: "100%", fontSize: 11, marginTop: 8, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ textAlign: "left", color: "var(--muted)", fontSize: 10 }}>
+                <th style={{ fontWeight: "normal", padding: "0 8px 4px 0" }}>Decision</th>
+                <th style={{ fontWeight: "normal", padding: "0 8px 4px" }}>Effective</th>
+                <th style={{ fontWeight: "normal", padding: "0 8px 4px" }}>Override</th>
+                <th style={{ fontWeight: "normal", padding: "0 0 4px" }}>Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              <DecisionRow
+                label="Run shape"
+                effective={RUN_SHAPE_LABEL[effective.runShape] ?? effective.runShape}
+                overridden={hasOverride("runShape")}
+                rationale={profile.rationale.runShape}
+                editor={
+                  <OverrideSelect
+                    value={profile.overrides.runShape}
+                    options={RUN_SHAPE_OPTIONS}
+                    disabled={overridesM.isPending}
+                    onChange={(v) => setOverride("runShape", v as DerivedDecisions["runShape"] | undefined)}
+                  />
+                }
+              />
+              <DecisionRow
+                label="Verdict delivery"
+                effective={VERDICT_DELIVERY_LABEL[effective.verdictDelivery] ?? effective.verdictDelivery}
+                overridden={hasOverride("verdictDelivery")}
+                rationale={profile.rationale.verdictDelivery}
+                editor={
+                  <OverrideSelect
+                    value={profile.overrides.verdictDelivery}
+                    options={VERDICT_DELIVERY_OPTIONS}
+                    disabled={overridesM.isPending}
+                    onChange={(v) =>
+                      setOverride("verdictDelivery", v as DerivedDecisions["verdictDelivery"] | undefined)
+                    }
+                  />
+                }
+              />
+              {profile.derived.toolCapable !== undefined && (
+                <DecisionRow
+                  label="Tool-capable"
+                  effective={effective.toolCapable ? "Yes" : "No"}
+                  overridden={hasOverride("toolCapable")}
+                  rationale={profile.rationale.toolCapable}
+                  editor={
+                    <OverrideBoolSelect
+                      value={profile.overrides.toolCapable}
+                      disabled={overridesM.isPending}
+                      onChange={(v) => setOverride("toolCapable", v)}
+                    />
+                  }
+                />
+              )}
+              {profile.derived.reasoning !== undefined && (
+                <DecisionRow
+                  label="Reasoning model"
+                  effective={effective.reasoning ? "Yes" : "No"}
+                  overridden={hasOverride("reasoning")}
+                  rationale={profile.rationale.reasoning}
+                  editor={
+                    <OverrideBoolSelect
+                      value={profile.overrides.reasoning}
+                      disabled={overridesM.isPending}
+                      onChange={(v) => setOverride("reasoning", v)}
+                    />
+                  }
+                />
+              )}
+              {profile.derived.supportsDeveloperRole !== undefined && (
+                <DecisionRow
+                  label="Developer role"
+                  effective={effective.supportsDeveloperRole ? "Accepted" : "Rejected"}
+                  overridden={hasOverride("supportsDeveloperRole")}
+                  rationale={profile.rationale.supportsDeveloperRole}
+                  editor={
+                    <OverrideBoolSelect
+                      value={profile.overrides.supportsDeveloperRole}
+                      disabled={overridesM.isPending}
+                      onChange={(v) => setOverride("supportsDeveloperRole", v)}
+                    />
+                  }
+                />
+              )}
+              {profile.derived.supportsReasoningEffort !== undefined && (
+                <DecisionRow
+                  label="reasoning_effort param"
+                  effective={effective.supportsReasoningEffort ? "Accepted" : "Rejected"}
+                  overridden={hasOverride("supportsReasoningEffort")}
+                  rationale={profile.rationale.supportsReasoningEffort}
+                  editor={
+                    <OverrideBoolSelect
+                      value={profile.overrides.supportsReasoningEffort}
+                      disabled={overridesM.isPending}
+                      onChange={(v) => setOverride("supportsReasoningEffort", v)}
+                    />
+                  }
+                />
+              )}
+              {profile.derived.maxTokensField && (
+                <DecisionRow
+                  label="Max-tokens field"
+                  effective={effective.maxTokensField ?? profile.derived.maxTokensField}
+                  overridden={hasOverride("maxTokensField")}
+                  rationale={profile.rationale.maxTokensField}
+                  editor={
+                    <OverrideSelect
+                      value={profile.overrides.maxTokensField}
+                      options={MAX_TOKENS_FIELD_OPTIONS}
+                      disabled={overridesM.isPending}
+                      onChange={(v) => setOverride("maxTokensField", v as DerivedDecisions["maxTokensField"] | undefined)}
+                    />
+                  }
+                />
+              )}
+            </tbody>
+          </table>
+
+          <details style={{ marginTop: 10 }}>
+            <summary className="muted" style={{ fontSize: 11, cursor: "pointer" }}>
+              Raw probe evidence
+            </summary>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 6 }}>
+              <span className="pill dim">custom tool: {trialLabel(profile.probes.customToolCall)}</span>
+              <span className="pill dim">built-in tool: {trialLabel(profile.probes.builtinToolCall)}</span>
+              <span className="pill dim">fenced JSON: {trialLabel(profile.probes.jsonFence)}</span>
+              <span className="pill dim">dialect: {profile.probes.thinkingDialect ?? "unprobed"}</span>
+              {profile.probes.effectiveContext != null && (
+                <span className="pill dim">context: {ctxLabel(profile.probes.effectiveContext, 0)}</span>
+              )}
+            </div>
+            {profile.live && (
+              <p className="muted" style={{ fontSize: 10, marginTop: 6 }}>
+                Live (last {profile.live.runs}): fallback {pct(profile.live.fallbackRate)} · stall{" "}
+                {pct(profile.live.stallRate)} · truncation {pct(profile.live.truncationRate)} · repair{" "}
+                {pct(profile.live.repairRate)}
+              </p>
+            )}
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Full-size editor card
 // ---------------------------------------------------------------------------
 
@@ -1182,6 +1751,9 @@ function ModelEditor({
   const [nudgeThresholdCharsTextMode, setNudgeThresholdCharsTextMode] = useState(
     String(compatRaw.nudgeThresholdCharsTextMode ?? ""),
   );
+  const [structuredOutputsOverride, setStructuredOutputsOverride] = useState<string>(
+    (compatRaw.structuredOutputsOverride as string) ?? "",
+  );
   const [apiKeyTouched, setApiKeyTouched] = useState(false);
   const [parameterCountB, setParameterCountB] = useState(String(extras.parameter_count_b ?? ""));
   const [quantization, setQuantization] = useState(String(extras.quantization ?? ""));
@@ -1216,7 +1788,8 @@ function ModelEditor({
         maxTokensField !== "" ||
         chatTemplateKwargs !== "" ||
         nudgeThresholdChars !== "" ||
-        nudgeThresholdCharsTextMode !== "",
+        nudgeThresholdCharsTextMode !== "" ||
+        structuredOutputsOverride !== "",
       );
       return;
     }
@@ -1247,6 +1820,7 @@ function ModelEditor({
       : "";
     const initNudgeThresholdChars = String(compatInit.nudgeThresholdChars ?? "");
     const initNudgeThresholdCharsTextMode = String(compatInit.nudgeThresholdCharsTextMode ?? "");
+    const initStructuredOutputsOverride = (compatInit.structuredOutputsOverride as string) ?? "";
 
     onDirtyChange(
       name !== initName ||
@@ -1269,7 +1843,8 @@ function ModelEditor({
       maxTokensField !== initMaxTokensField ||
       chatTemplateKwargs !== initChatKwargs ||
       nudgeThresholdChars !== initNudgeThresholdChars ||
-      nudgeThresholdCharsTextMode !== initNudgeThresholdCharsTextMode,
+      nudgeThresholdCharsTextMode !== initNudgeThresholdCharsTextMode ||
+      structuredOutputsOverride !== initStructuredOutputsOverride,
     );
   });
 
@@ -1330,6 +1905,7 @@ function ModelEditor({
       if (nudgeThresholdCharsTextMode) {
         compat.nudgeThresholdCharsTextMode = Number(nudgeThresholdCharsTextMode);
       }
+      if (structuredOutputsOverride) compat.structuredOutputsOverride = structuredOutputsOverride;
       const compatJson = Object.keys(compat).length > 0 ? JSON.stringify(compat) : undefined;
 
       // Build thinking_budgets JSON string
@@ -1367,6 +1943,24 @@ function ModelEditor({
       if (isNew) onDone();
     },
   });
+
+  // Probe this connection's endpoint for server-side structured-decoding support
+  // (PLANNING/overhaul/02) — persisted server-side on this config row; refetching
+  // the list is what makes the badges below reflect the new result.
+  const probe = useMutation({
+    mutationFn: () => api.probeModelStructuredOutputs(configId!),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["model-configs"] }),
+  });
+  const probeResult = initialData?.structured_outputs_json
+    ? (parseExtras(initialData.structured_outputs_json) as unknown as {
+        probedAt: string;
+        modes: { json_object: boolean; json_schema: boolean; guided_json: boolean; grammar: boolean };
+      })
+    : null;
+  // A cached probe is only usable if it was taken against this connection's
+  // current base URL + model id (server-side resolution ignores stale probes);
+  // mirror that here so the badges reflect what will actually be used.
+  const anyConstrainedMode = !!probeResult && (probeResult.modes.json_schema || probeResult.modes.guided_json || probeResult.modes.grammar);
 
   // ---- derive live preview values ----
   const displayName = name.trim() || "Unnamed";
@@ -1662,6 +2256,68 @@ function ModelEditor({
               Used with thinkingFormat "chat-template" — e.g. for DeepSeek V3.x on vLLM. Leave empty to omit.
             </span>
           </div>
+
+          <div style={{ marginTop: 16 }}>
+            <strong style={{ fontSize: 13, color: "var(--brass)" }}>Structured Outputs (Constrained Decoding)</strong>
+            <p className="muted" style={{ fontSize: 11, margin: "4px 0 8px" }}>
+              Some endpoints (vLLM, Ollama, LM Studio, llama.cpp) can guarantee valid JSON server-side instead
+              of hoping the model emits it. Probe this connection to find out, or override the rung manually.
+            </p>
+          </div>
+
+          <div className="field-grid" style={{ marginTop: 4 }}>
+            <div>
+              <label>Probe result</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button
+                  className="small"
+                  disabled={isNew || probe.isPending}
+                  onClick={() => probe.mutate()}
+                  title={isNew ? "Save this config first" : "Probe endpoint for structured-output support"}
+                >
+                  {probe.isPending ? "Probing…" : "Probe endpoint"}
+                </button>
+                {probeResult && (
+                  <span style={{ display: "flex", gap: 4 }}>
+                    <span className={`pill ${probeResult.modes.json_schema ? "ok" : "dim"}`}>json_schema</span>
+                    <span className={`pill ${probeResult.modes.guided_json ? "ok" : "dim"}`}>guided_json</span>
+                    <span className={`pill ${probeResult.modes.grammar ? "ok" : "dim"}`}>grammar</span>
+                  </span>
+                )}
+              </div>
+              {probeResult && (
+                <span className="muted" style={{ fontSize: 10 }}>
+                  Last probed {new Date(probeResult.probedAt).toLocaleString()}
+                  {anyConstrainedMode
+                    ? " — the verdict trailer and router calls will use it automatically."
+                    : " — no supported mode found; falls back to the existing text/tool-call path."}
+                </span>
+              )}
+              {probe.isError && (
+                <span className="muted" style={{ fontSize: 10, color: "var(--bad)" }}>
+                  Probe failed: {(probe.error as Error).message}
+                </span>
+              )}
+            </div>
+            <div>
+              <label>Manual override</label>
+              <select
+                value={structuredOutputsOverride}
+                onChange={(e) => setStructuredOutputsOverride(e.target.value)}
+              >
+                <option value="">(auto — use probe result)</option>
+                <option value="json_schema">Force json_schema</option>
+                <option value="guided_json">Force guided_json (vLLM)</option>
+                <option value="grammar">Force grammar (llama.cpp GBNF)</option>
+                <option value="off">Off — always use text/tool-call path</option>
+              </select>
+              <span className="muted" style={{ fontSize: 10 }}>
+                Overrides the probe result. Use "off" if a probe false-positives on this endpoint.
+              </span>
+            </div>
+          </div>
+
+          <ModelCapabilityProfile configId={configId} isNew={isNew} />
 
           <div style={{ marginTop: 16 }}>
             <strong style={{ fontSize: 13, color: "var(--brass)" }}>Stall / Nudge Thresholds</strong>

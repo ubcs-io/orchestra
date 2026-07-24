@@ -85,6 +85,22 @@ export const EXIT_KIND_BY_INTAKE: Record<IntakeKind, ExitKind> = {
 
 export type Severity = "must" | "should";
 
+/**
+ * Binds a criterion to a real command execution (PLANNING/overhaul/05). A
+ * criterion carrying this is NOT judged by the counter-reviewer's prose read of
+ * the findings — it is decided deterministically from the harness-recorded
+ * `role_runs.evidence_json`, with no model judgement in the loop. That is the
+ * whole point: `exec.tests_pass` means the suite ran and exited 0, not that a
+ * model believes it would.
+ */
+export interface EvidenceRequirement {
+  /** Name of a command in the project's exec allowlist (harness-policy.ts). */
+  command: string;
+  /** Today always true: the recorded run must have exited 0. Kept explicit so a
+   *  future "ran at all, outcome recorded" criterion has somewhere to live. */
+  mustExitZero: boolean;
+}
+
 export interface Criterion {
   /** Stable id, e.g. "bug.root_cause". */
   id: string;
@@ -96,6 +112,9 @@ export interface Criterion {
   severity: Severity;
   /** Optional link into CONCERN_TAXONOMY. */
   concern?: string;
+  /** When set, this criterion is checked against recorded execution evidence
+   *  instead of the reviewer's `criteria_results` (see EvidenceRequirement). */
+  evidence?: EvidenceRequirement;
 }
 
 export type ReviewDepth = "none" | "terminal_only" | "every_step";
@@ -240,6 +259,65 @@ export const EXECUTION_FLOW_TEMPLATE: FlowTemplate = {
   steps: ["developer", "critic"],
 };
 
+/**
+ * Grounded-verification criteria (PLANNING/overhaul/05) — the execution flow's
+ * previously *implicit* contract ("the code should work") made explicit and
+ * machine-checkable. Each is attached only when the project's exec allowlist
+ * actually defines the named command (see {@link withEvidenceCriteria}), so a
+ * project with no test command never fails a gate for not running one.
+ *
+ * `ownerRole` is `developer`: an unmet evidence criterion means the code isn't
+ * green yet, and the developer step is what gets re-opened — not the critic
+ * that reported it.
+ */
+export const EXEC_EVIDENCE_CRITERIA: Criterion[] = [
+  {
+    id: "exec.tests_pass",
+    text: "The project's `test` command was run inside this task's worktree and exited 0.",
+    ownerRole: "developer",
+    severity: "must",
+    concern: "tests",
+    evidence: { command: "test", mustExitZero: true },
+  },
+  {
+    id: "exec.typecheck",
+    text: "The project's `typecheck` command was run inside this task's worktree and exited 0.",
+    ownerRole: "developer",
+    severity: "must",
+    concern: "correctness",
+    evidence: { command: "typecheck", mustExitZero: true },
+  },
+];
+
+/**
+ * Attach the evidence criteria whose commands this project can actually run.
+ *
+ * Deliberately a function of the *available command names* rather than of the
+ * HarnessPolicy itself: harness-policy.ts imports READ_ONLY_TOOLS from this
+ * module, so taking the policy here would close an import cycle. The caller
+ * (orchestrator.ts) resolves the policy and passes the names.
+ *
+ * With exec off — or with an allowlist that defines neither command — this
+ * returns the template unchanged, which is why landing 05 is a no-op for every
+ * existing project.
+ */
+export function withEvidenceCriteria(
+  template: FlowTemplate,
+  availableCommands: readonly string[],
+): FlowTemplate {
+  if (!availableCommands.length) return template;
+  const available = new Set(availableCommands);
+  const applicable = EXEC_EVIDENCE_CRITERIA.filter(
+    (c) => c.evidence && available.has(c.evidence.command),
+  );
+  if (!applicable.length) return template;
+  // Never duplicate a criterion a custom network/flow already declared.
+  const existing = new Set(template.criteria.map((c) => c.id));
+  const added = applicable.filter((c) => !existing.has(c.id));
+  if (!added.length) return template;
+  return { ...template, criteria: [...template.criteria, ...added] };
+}
+
 /** Resolve the flow for an intake kind (falls back to the manual flow). */
 export function flowForIntake(kind: IntakeKind): FlowTemplate {
   return FLOW_TEMPLATES[kind] ?? FLOW_TEMPLATES.manual;
@@ -302,18 +380,26 @@ Your output budget is limited: be decisive and finish promptly. Do NOT narrate a
 
 /**
  * Shared output contract appended to every role's system prompt. Defines the
- * findings schema (verdict, summary, coverage, section_md) every role must
- * report — deliberately mechanism-agnostic (no mention of `record_findings` or
- * any other submission mechanism), since whether that's a tool call or structured
- * text depends on the connection's textMode/twoPhase settings, which aren't known
- * at role-seed time. The mechanism-specific instruction is appended at runtime by
- * agent.ts's TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION / TWO_PHASE_EXPLORE_CONTRACT.
+ * two output channels (the markdown report and the small verdict trailer)
+ * every role must produce — deliberately mechanism-agnostic (no mention of
+ * `record_findings`, `report_section` or any other submission mechanism), since
+ * whether those are tool calls or structured text depends on the connection's
+ * textMode/twoPhase/outputContract settings, which aren't known at role-seed
+ * time. The mechanism-specific instruction is appended at runtime by agent.ts's
+ * TOOL_CALL_DISCIPLINE / TEXT_MODE_INSTRUCTION / TWO_PHASE_EXPLORE_CONTRACT
+ * (and their _V1 variants).
  * (The tool-aware "How to work" preamble is prepended by `buildRoleSystemPrompt`.)
  */
 export const OUTPUT_CONTRACT = `
 ## How to finish (required)
-When you are done, your findings must convey the following. (The exact submission
-mechanism — a tool call or structured text — is specified elsewhere in your instructions.)
+Your work has two output channels. (How each is submitted — tool calls or
+structured text — is specified elsewhere in your instructions.)
+
+**1. Your report.** The full markdown write-up of your findings: start it with a
+"## <Your Role>" heading and include concrete file references. The report is
+appended to the task's planning artifact — it is what later roles and humans read.
+
+**2. Your verdict.** A small structured summary of where things stand:
 - verdict: one of "pass" (your concern is adequately addressed), "needs_more"
   (more refinement needed before this is actionable), "blocker" (a hard problem
   must be resolved first), or "needs_human" (ambiguity only a person can resolve).
@@ -329,19 +415,17 @@ mechanism — a tool call or structured text — is specified elsewhere in your 
   examined. status is "considered", "skipped" (relevant but you did not cover it —
   say why in note), or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}.
   Be honest about what you did NOT look at — omissions must be visible.
-- section_md: a markdown section (start with a "## <Your Role>" heading) that will
-  be appended to the task's planning artifact. Include concrete file references.
 
 ## Keep the deliverable tight
-Your \`summary\` and \`section_md\` are the deliverable, not your reasoning process.
-\`summary\` is short and gets shown to every later role automatically; \`section_md\`
+Your \`summary\` and your report are the deliverable, not your reasoning process.
+\`summary\` is short and gets shown to every later role automatically; the report
 is the full write-up — a busy engineer or a later role reading the planning artifact
 (pointed to in your context, if you have file tools) will skim it. Investigate and
 reason as much as you need to, but do not transcribe that process into your output:
 no "first I checked X, then I considered Y" narration, no restating context you were
 given. Write findings as direct, skimmable statements — prefer bullet lists with
 concrete file:line citations over prose. If you have extended reasoning to do, do it
-in your own thinking process, not in section_md.
+in your own thinking process, not in the report.
 
 ## If you are a counter-reviewer
 When the context gives you an "Acceptance criteria to verify" checklist, your job
@@ -359,12 +443,38 @@ re-work, so a vague justification produces a vague re-run.
 `.trim();
 
 /**
- * Two-phase session contract: phase 1 (exploration). Appended to the system prompt
- * when twoPhase is active. The model uses available tools freely, then stops with a
- * natural-language summary — record_findings is NOT registered as a tool, so the
- * model cannot accidentally try to call it and stall.
+ * Two-phase session contract: phase 1 (exploration), artifact-first variant.
+ * Appended to the system prompt when twoPhase is active. The model uses
+ * available tools freely, then stops with a markdown report — that report text
+ * IS the deliverable (it is persisted as the run's report), so it is asked for
+ * as a finished document rather than a throwaway summary. record_findings is
+ * NOT registered as a tool, so the model cannot accidentally try to call it
+ * and stall.
  */
 export const TWO_PHASE_EXPLORE_CONTRACT = `
+## How to finish (two-phase exploration)
+
+You are in the exploration phase. Use the available tools to inspect the repository
+and ground your reasoning in real code. When you have gathered enough to assess the
+situation, write your findings as a well-structured markdown report (start with a
+"## <Your Role>" heading, include concrete file references) and then stop. Do NOT
+call any "finish" tool — just write the report as plain text. That text is saved as
+your report on the task's planning artifact, so write a finished document, not
+narration.
+
+At the end of the report, note any open questions or uncertainties and a
+preliminary verdict (pass / needs_more / blocker / needs_human).
+
+You will be asked to formalize a small structured verdict as JSON in the next step.
+Do not pre-empt that step — save the JSON for when you are explicitly asked.
+`.trim();
+
+/**
+ * Legacy (v1 output contract) exploration contract: the phase-1 text is a
+ * throwaway summary; the full report is composed in phase 2 as section_md.
+ * Selected per connection via ModelCompat.outputContract = "v1".
+ */
+export const TWO_PHASE_EXPLORE_CONTRACT_V1 = `
 ## How to finish (two-phase exploration)
 
 You are in the exploration phase. Use the available tools to inspect the repository
@@ -382,12 +492,62 @@ Do not pre-empt that step — save formalization for when you are explicitly ask
 `.trim();
 
 /**
- * Two-phase session: phase 2 prompt. Sent as a follow-up within the same pi
- * session after the exploration phase completes. The model has full conversation
- * context from phase 1 and is instructed to formalize its findings as JSON text
- * (no tools). Parsed by extractFindingsFromText() in agent.ts.
+ * Two-phase session: phase 2 prompt, artifact-first variant. Sent as a
+ * follow-up within the same pi session after the exploration phase completes.
+ * The phase-1 report is already the durable prose; phase 2 emits ONLY the small
+ * verdict trailer (plus the structured-role payloads — criteria_results /
+ * subtasks — that genuinely must be structured). Parsed by
+ * extractFindingsAndProse() in agent.ts.
  */
 export const TWO_PHASE_FORMALIZE_PROMPT = `
+## Phase 2 — Formalize your verdict
+
+Your report from the exploration above is already saved — do NOT repeat it. Now
+output ONLY a small structured verdict as a single JSON code block. Do NOT use any
+tools for this — just produce the JSON.
+
+Format exactly (replace the example values with your own):
+\`\`\`json
+{
+  "verdict": "pass",
+  "summary": "One or two sentences capturing your key takeaway.",
+  "open_questions": [{"question": "...", "assumed_answer": "your best guess", "confidence": "medium"}],
+  "coverage": [{"concern": "security", "status": "considered", "note": "checked auth flow"}]
+}
+\`\`\`
+
+Rules:
+- **verdict**: one of "pass", "needs_more", "blocker", or "needs_human"
+- **summary**: brief key takeaway
+- **open_questions**: array of { question, assumed_answer, confidence } (empty if none). For EVERY open question, give your own best-effort guess plus a confidence ("low" | "medium" | "high") — never leave assumed_answer empty. Reserve "blocker"/"needs_human" ONLY for questions with no reasonable guess at all; an ordinary open question with a guess attached should still get "pass" or "needs_more".
+- **coverage**: array of { concern, status, note }. status is "considered", "skipped", or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}. Be honest about what you did NOT examine.
+- Do NOT include a "section_md" field — your report is the prose you already wrote.
+
+If you are a counter-reviewer with acceptance criteria to verify, also include:
+- **criteria_results**: array of { id, status, note } — status is "met", "partial", or "unmet"
+
+IMPORTANT for decomposition: also include a **subtasks** array — one entry per
+epic/story/task node — each { local_id, level, name, brief, acceptance_criteria,
+context_to_carry_forward, depends_on }. local_id is a short id you assign (e.g.
+"1", "1.2") that other nodes' depends_on (array of local_ids, optional) can
+reference; level is "epic", "story", or "task"; context_to_carry_forward must
+state any decision/constraint/fact the child needs that isn't obvious from
+name/brief alone — the child will not see this parent's full history by default.
+If the work is already one atomic, independently-actionable unit, leave subtasks
+empty and instead set **no_decomposition_reason** explaining why — an empty
+subtasks array with no reason is treated as a failed decomposition. The tree
+itself is rendered into the human-facing artifact automatically from
+**subtasks** — do not re-render it in your report.
+
+Output ONLY the JSON block — nothing before, nothing after.
+`.trim();
+
+/**
+ * Legacy (v1 output contract) phase-2 prompt: the full report is embedded in
+ * the JSON as section_md. Selected per connection via
+ * ModelCompat.outputContract = "v1".
+ */
+export const TWO_PHASE_FORMALIZE_PROMPT_V1 = `
 ## Phase 2 — Formalize your findings
 
 Based on the exploration you completed above, output your structured findings as a
@@ -431,6 +591,81 @@ sequencing rationale, rough sizing, and other facts subtasks doesn't capture.
 Output ONLY the JSON block — nothing before, nothing after.
 `.trim();
 
+/**
+ * Repair-pass system prompt (PLANNING/overhaul/03 §1). The stateless,
+ * out-of-session counterpart of TWO_PHASE_FORMALIZE_PROMPT: instead of
+ * formalizing the model's own in-session exploration, it formalizes MATERIAL
+ * that is handed to it as the user turn — the report a role already produced
+ * and/or its reasoning trace — after the in-session verdict channels
+ * (record_findings / fenced trailer / constrained turn) all failed to yield a
+ * parseable verdict. Delivered by a cheap ~150-token completion (constrained
+ * rung when the endpoint supports it, plain fenced JSON otherwise), so it costs
+ * a fraction of a full role re-run.
+ *
+ * Anti-laundering guard (the doc's headline risk): this prompt must NOT invent a
+ * confident verdict for material that shows the analysis never actually
+ * finished. Missing/incomplete analysis ⇒ needs_more, never pass. The resulting
+ * verdict is badged verdictSource="repair" (overhaul/04) so a repair-sourced
+ * "pass" is still visibly distinguishable downstream.
+ */
+export const REPAIR_FORMALIZE_PROMPT = `
+You are a formatting assistant. Below (in the user message) is the material a
+role already produced for a task: its findings report and/or its reasoning
+trace. The role failed to emit a machine-readable verdict, so your ONLY job is to
+read that material and distill the small structured verdict trailer it implies.
+
+Do NOT explore, do NOT use tools, do NOT add analysis of your own, and do NOT
+restate the report. Output ONLY a single JSON code block in EXACTLY this format:
+\`\`\`json
+{
+  "verdict": "needs_more",
+  "summary": "One or two sentences capturing the material's key takeaway.",
+  "open_questions": [{"question": "...", "assumed_answer": "your best guess", "confidence": "low"}],
+  "coverage": [{"concern": "security", "status": "considered", "note": "..."}]
+}
+\`\`\`
+
+Rules:
+- **verdict**: one of "pass", "needs_more", "blocker", or "needs_human". Choose it
+  HONESTLY from the material. If the material is thin, cut off mid-thought, or does
+  not actually demonstrate the role's concern was resolved, use "needs_more" — do
+  NOT upgrade an unfinished analysis to "pass". Only use "pass" when the material
+  itself clearly shows the work is adequately addressed.
+- **summary**: brief key takeaway, drawn from the material (not invented).
+- **open_questions**: array of { question, assumed_answer, confidence } (empty if
+  none evident). Give a best-effort guess for each; never leave assumed_answer empty.
+- **coverage**: array of { concern, status, note }. status is "considered",
+  "skipped", or "out_of_scope". Draw concerns from: ${CONCERN_TAXONOMY.join(", ")}.
+- Do NOT include a "section_md" field — the report is preserved separately.
+
+If the material shows a counter-reviewer's acceptance-criteria checks, also include:
+- **criteria_results**: array of { id, status, note } — status "met"/"partial"/"unmet".
+
+If the material is a decomposition into an epic/story/task tree, also include a
+**subtasks** array (one entry per node: { local_id, level, name, brief,
+acceptance_criteria, context_to_carry_forward, depends_on }); if it is instead one
+atomic unit, set **no_decomposition_reason** explaining why.
+
+Output ONLY the JSON block — nothing before, nothing after.
+`.trim();
+
+/**
+ * Resume steering (PLANNING/overhaul/03 §2). Prepended to a re-entered step's
+ * context (buildRoleContext) when a bounded retry continues an interrupted
+ * attempt rather than re-running it cold. The prior attempt's report sections
+ * are already durable in the task artifact (committed by the failure/degraded
+ * path), so this tells the model to build ON them — append only the missing
+ * tail — instead of redoing completed analysis. Worst case (a small model that
+ * ignores "don't repeat") is no worse than today's cold rerun; the artifact's
+ * own append-dedupe bounds any duplication.
+ */
+export const RESUME_STEERING =
+  "Do not restart from scratch — you are RESUMING a previous attempt at this same " +
+  "step that was interrupted before it recorded a verdict. Its report so far is " +
+  "already saved to your planning artifact (shown/pointed to above). Do NOT redo " +
+  "analysis it already completed. Read what is there, continue from that state, " +
+  "append only what is still missing, and then record your verdict.";
+
 export const DEFAULT_ROLES: RoleSeed[] = [
   {
     key: "intake_triage",
@@ -446,7 +681,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 20,
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ALL,
-    persona: `You do the onboarding a new engineer would do before touching this code: find the entry point(s) the change will go through, name the specific existing utilities/helpers/patterns that already do something similar (so later roles reuse them instead of reinventing), and list the concrete files/modules that make up the affected surface area — not a description of the area, an actual list. Do not propose a design or recommend an approach; that is architecture_review's job. Your output should let a later role open the right files without re-searching.`,
+    persona: `You do the onboarding a new engineer would do before touching this code: find the entry point(s) the change will go through, name the specific existing utilities/helpers/patterns that already do something similar (so later roles reuse them instead of reinventing), and list the concrete files/modules that make up the affected surface area — not a description of the area, an actual list. Do not propose a design or recommend an approach; that is architecture_review's job. Your output should let a later role open the right files without re-searching. Also set \`effort_size\` (XS/S/M/L/XL) now that you've actually seen the files — this is the pipeline's one honest read of how big the work really is, gating how much further planning it does, so don't hedge upward "to be safe."`,
   },
   {
     key: "bug_investigator",
@@ -544,7 +779,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     tools: READ_ONLY_TOOLS.slice(),
     appliesTo: ["feature", "bug", "error_file", "manual", "chore", "spike", "security"],
     can_create_subtasks: true,
-    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. On a \`level: "task"\` node only, set \`execution_ready: true\` if it needs no further requirements/architecture/design analysis — a developer could pick it up and implement it directly from the brief and acceptance criteria alone. Leave it false (or omitted) for anything that still needs analysis, and always false for \`epic\`/\`story\` nodes — do not mark speculative or ambiguous work execution-ready just because it's small. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. The tree itself is rendered into the human-facing artifact automatically from \`subtasks\` — do not re-render it in section_md. Use section_md only for anything subtasks doesn't already capture: sequencing rationale, rough sizing, and key facts an implementer would need.`,
+    persona: `You are the SPEC exit. Break the refined work into an epic → story → atomic task tree with clear sequencing, dependencies, and rough sizing. Report the tree as the structured \`subtasks\` array — one entry per node, each with a \`local_id\`, \`level\`, \`name\`, \`brief\`, \`acceptance_criteria\`, and \`context_to_carry_forward\` (state plainly what a child needs to know that isn't obvious from its name alone — the decisions, constraints, and facts this refinement trail already established, since the child will not automatically see this history). Use \`depends_on\` (a list of other nodes' local_ids) to record real sequencing — a child that can start immediately should have no depends_on. Each atomic task must be independently actionable with acceptance criteria. On a \`level: "task"\` node only, set \`execution_ready: true\` if it needs no further requirements/architecture/design analysis — a developer could pick it up and implement it directly from the brief and acceptance criteria alone. Leave it false (or omitted) for anything that still needs analysis, and always false for \`epic\`/\`story\` nodes — do not mark speculative or ambiguous work execution-ready just because it's small. If the work is already one atomic, independently-actionable unit, leave subtasks empty and set \`no_decomposition_reason\` explaining why — never leave subtasks empty without one. The tree itself is rendered into the human-facing artifact automatically from \`subtasks\` — do not re-render it in your report. Use the report only for anything subtasks doesn't already capture: sequencing rationale, rough sizing, and key facts an implementer would need.`,
   },
 
   // ---- Developer (write/edit capable) ----
@@ -561,7 +796,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 950,
     tools: NO_TOOLS,
     appliesTo: ALL,
-    persona: `You implement the refined work directly in the repository. Ground every change in the actual code: read the affected files before editing them, follow existing patterns and conventions, and make the smallest change that satisfies the acceptance criteria. Do not invent file names, symbols, or APIs — verify they exist first. This role only runs with write/edit tools when a project explicitly grants them; without them, treat this as a dry-run and describe the change you would make instead.`,
+    persona: `You implement the refined work directly in the repository. Ground every change in the actual code: read the affected files before editing them, follow existing patterns and conventions, and make the smallest change that satisfies the acceptance criteria. Do not invent file names, symbols, or APIs — verify they exist first. This role only runs with write/edit tools when a project explicitly grants them; without them, treat this as a dry-run and describe the change you would make instead. If a command-running tool is available to you, your work is not done when the code is written — it is done when the project's own checks run green against it; iterate on real failures rather than reasoning about whether they would occur.`,
   },
 
   // ---- Research / UX track (research_brief exit) ----
@@ -603,7 +838,7 @@ export const DEFAULT_ROLES: RoleSeed[] = [
     ordering: 910,
     tools: NO_TOOLS,
     appliesTo: ["research", "ux", "question"],
-    persona: `You are the RESEARCH_BRIEF exit. Roll the prior findings into a single decision brief: problem statement, the options with trade-offs, key edge cases, a recommendation, and any open questions. section_md should be a self-contained brief a human can act on immediately.`,
+    persona: `You are the RESEARCH_BRIEF exit. Roll the prior findings into a single decision brief: problem statement, the options with trade-offs, key edge cases, a recommendation, and any open questions. Your report should be a self-contained brief a human can act on immediately.`,
   },
 
   // ---- Optional/promotable extras (dormant by default in feature/bug routing —

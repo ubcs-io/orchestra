@@ -10,6 +10,7 @@
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai/compat";
 import { resolveConnection, type Connection } from "./settings.js";
+import { hashSig } from "./profiles.js";
 
 const OPENAI_COMPAT: Api = "openai-completions";
 
@@ -26,16 +27,6 @@ function ensureRegistry(): ModelRegistry {
   const auth = AuthStorage.inMemory();
   registry = ModelRegistry.inMemory(auth);
   return registry;
-}
-
-/** Small non-cryptographic string hash — just needs to be a stable, short,
- *  secret-free provider id derived from the connection signature. */
-function hashSig(sig: string): string {
-  let h = 0;
-  for (let i = 0; i < sig.length; i++) {
-    h = (Math.imul(h, 31) + sig.charCodeAt(i)) | 0;
-  }
-  return (h >>> 0).toString(36);
 }
 
 /** Build a flat compat object from the connection's thinkingFormat + ModelCompat overrides. */

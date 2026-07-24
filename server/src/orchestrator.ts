@@ -14,7 +14,9 @@ import {
   createRoleRun,
   createTask,
   deleteRoleRunsAfter,
+  deleteTask,
   deleteUnconsumedInterventionsAfter,
+  familyMembersExcluding,
   familyRootId,
   getNetwork,
   getProject,
@@ -27,8 +29,11 @@ import {
   listTasks,
   listUnconsumedInterventions,
   markInterventionConsumed,
+  resetTask,
   setRoleRunCommitSha,
+  setRoleRunDigest,
   setRoleRunOpenQuestions,
+  suppressCandidateForTask,
   updateProject,
   updateTask,
   upsertRole,
@@ -49,6 +54,8 @@ import {
   reconcileBranch,
   refineCommitMessage,
   removeFile,
+  readArtifact,
+  removeWorktree,
   resetHardTo,
   sanitizePath,
   scaffoldPlanning,
@@ -62,7 +69,10 @@ import {
   EXIT_KIND_BY_INTAKE,
   flowForIntake,
   isCritiqueExempt,
+  RESUME_STEERING,
   TERMINAL_ROLE,
+  withEvidenceCriteria,
+  type Criterion,
   type ExitKind,
   type FlowTemplate,
   type IntakeKind,
@@ -73,6 +83,7 @@ import {
   type CoverageItem,
   type CoverageStatus,
   type CriteriaResult,
+  type EffortSize,
   type OpenQuestion,
   type RoleFindings,
   type RoleRunResult,
@@ -81,9 +92,34 @@ import {
   type Verdict,
 } from "./agent.js";
 import { getConfig } from "./config.js";
-import { resolveConnectionForModel } from "./settings.js";
+import { resolveConnectionForModel, type Connection } from "./settings.js";
+import {
+  allocate,
+  capHeadTail,
+  computeBudget,
+  estimateTokens,
+  generateDigest,
+  type BudgetPart,
+} from "./context-budget.js";
 import { checkReachable } from "./providers.js";
-import { resolveHarnessPolicy } from "./harness-policy.js";
+import { execEnabled, resolveHarnessPolicy } from "./harness-policy.js";
+import { getOrResetIdleWindowBudget, isWithinActiveHours, resolveAutonomyConfig } from "./autonomy.js";
+import { effectiveAutonomyLevel } from "./autonomy-level.js";
+import { DEFAULT_PLANNING_RIGOR, effectivePlanningRigor, type PlanningRigor } from "./planning-rigor.js";
+import {
+  describeEvidence,
+  isGreen,
+  parseEvidence,
+  renderEvidenceBlock,
+  type ExecEvidence,
+} from "./exec.js";
+import {
+  computeRunHealth,
+  isTrustedHealth,
+  runHealthReason,
+  roleRunHealthInput,
+  type RunHealth,
+} from "./health.js";
 import {
   resolveRouterConfig,
   distillQuestions,
@@ -109,6 +145,12 @@ export function setRoleRunner(fn: RoleRunner): void {
 /** Restore the real pi-backed runner. */
 export function resetRoleRunner(): void {
   roleRunner = defaultRunRole;
+}
+/** The currently active role runner (real or test-injected) — watchers.ts
+ *  needs this to drive the candidate-triage router call the same way every
+ *  other call point in this file does. */
+export function getRoleRunner(): RoleRunner {
+  return roleRunner;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +180,14 @@ export interface PlanStep {
   depth: number;
   /** Loop-back attempts spent on this step (reviewer steps only). */
   attempts?: number;
+  /** Set by a cold-rerun retry path (dead-air timeout / JSON-parse failure) to
+   *  mark the next execution of this step as a RESUME rather than a fresh start
+   *  (PLANNING/overhaul/03 §2): the prior attempt's report is already durable in
+   *  the artifact, so buildRoleContext prepends resume steering + the artifact
+   *  tail instead of re-running the role cold. Consumed (and left set — benign
+   *  if a later re-queue keeps it, since prior work genuinely exists) when the
+   *  step next runs. */
+  resume?: boolean;
 }
 
 export interface NetworkEdgeCondition {
@@ -171,14 +221,33 @@ export interface EdgeEvaluationContext {
   criteriaResults: CriteriaResult[];
 }
 
+/** The command names a project has approved for execution, or [] when exec is
+ *  off / the menu is empty (PLANNING/overhaul/05). This is the single input
+ *  that decides whether a task's flow carries evidence criteria at all, which
+ *  is what makes landing 05 a no-op for every project that hasn't opted in. */
+function execCommandNames(project: ProjectRow | undefined): string[] {
+  if (!project) return [];
+  const policy = resolveHarnessPolicy(project.config_json);
+  return execEnabled(policy) ? policy.execAllowlist.map((c) => c.name) : [];
+}
+
 /** Resolve the flow template for a task from its intake kind.
  *  If the task has a custom network_id, resolve criteria, reviewer, rigor,
- *  mandatoryConcerns, and maxLoopbacks from the stored graph. */
-function flowForTask(task: TaskRow): FlowTemplate {
+ *  mandatoryConcerns, and maxLoopbacks from the stored graph.
+ *
+ *  `availableExecCommands` (from {@link execCommandNames}) attaches the
+ *  grounded-verification criteria the project can actually satisfy — see
+ *  roles.ts's withEvidenceCriteria. Passing [] (the default, and what every
+ *  non-exec project resolves to) leaves the flow byte-for-byte as before. */
+function flowForTask(task: TaskRow, availableExecCommands: readonly string[] = []): FlowTemplate {
   // An atomic decomposition leaf routed straight to implementation — see
   // createDecompositionChildren. Independent of intake_kind/network_id: it's
-  // scoped by the parent's decomposition, not re-planned.
-  if ((task.exit_kind as ExitKind) === "code_change") return EXECUTION_FLOW_TEMPLATE;
+  // scoped by the parent's decomposition, not re-planned. Evidence criteria are
+  // scoped to this flow only (overhaul/05 migration step 3): it is the one flow
+  // whose output is code that can be executed.
+  if ((task.exit_kind as ExitKind) === "code_change") {
+    return withEvidenceCriteria(EXECUTION_FLOW_TEMPLATE, availableExecCommands);
+  }
 
   const base = flowForIntake((task.intake_kind as IntakeKind) || "manual");
   if (!task.network_id) return base;
@@ -231,6 +300,118 @@ function flowForTask(task: TaskRow): FlowTemplate {
   } catch {
     return base;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Grounded verification: evidence criteria (PLANNING/overhaul/05)
+//
+// An evidence criterion is decided from `role_runs.evidence_json` — written
+// only by the harness's command executor — and never from what a model said in
+// its `criteria_results`. Three properties make that meaningful:
+//
+//   1. Un-fakeable. A repair pass (overhaul/03) reconstructs a *verdict* from
+//      surviving prose; it can never mint an evidence row, so a repaired "pass"
+//      still fails `exec.tests_pass` if nothing green was recorded. Correct.
+//   2. Fresh. Evidence recorded before the owner role's most recent run is
+//      stale: on a loop-back the developer may edit code and never re-run the
+//      suite, and last attempt's green result must not vouch for this attempt's
+//      code. Admissible evidence starts at the owner's latest run.
+//   3. Deterministic. No model judgement, no criteria_results entry expected —
+//      which is why the "reviewer left criteria_results empty" retry ignores
+//      these criteria entirely.
+// ---------------------------------------------------------------------------
+
+/** One evidence entry plus the run it was recorded on, newest last. */
+interface TaskEvidence {
+  runId: number;
+  roleKey: string;
+  evidence: ExecEvidence;
+}
+
+/** Every command execution recorded on this task's primary runs, in run order. */
+function collectTaskEvidence(taskId: string): TaskEvidence[] {
+  const out: TaskEvidence[] = [];
+  for (const run of listRoleRuns(taskId)) {
+    if (run.run_kind && run.run_kind !== "primary") continue;
+    for (const evidence of parseEvidence(run.evidence_json)) {
+      out.push({ runId: run.id, roleKey: run.role_key, evidence });
+    }
+  }
+  return out;
+}
+
+/** The id of the owner role's most recent primary run — the freshness cutoff
+ *  described above. 0 when that role has never run (nothing to invalidate). */
+function ownerRunCutoff(taskId: string, ownerRole: string): number {
+  const runs = listRoleRuns(taskId).filter(
+    (r) => r.role_key === ownerRole && (!r.run_kind || r.run_kind === "primary"),
+  );
+  return runs.length ? runs[runs.length - 1]!.id : 0;
+}
+
+export interface EvidenceCheck {
+  criterion: Criterion;
+  met: boolean;
+  /** The most recent admissible execution of the required command, if any. */
+  latest?: ExecEvidence;
+  /** Short human/model-readable explanation, used in gate notes and escalations. */
+  detail: string;
+}
+
+/**
+ * Decide each evidence criterion against the task's recorded executions.
+ * Pure apart from its two DB reads; exported for unit testing.
+ */
+export function checkEvidenceCriteria(taskId: string, criteria: Criterion[]): EvidenceCheck[] {
+  if (!criteria.length) return [];
+  const all = collectTaskEvidence(taskId);
+  return criteria.map((criterion) => {
+    const want = criterion.evidence!;
+    const cutoff = ownerRunCutoff(taskId, criterion.ownerRole);
+    const admissible = all.filter((e) => e.evidence.name === want.command && e.runId >= cutoff);
+    const latest = admissible.length ? admissible[admissible.length - 1]!.evidence : undefined;
+    if (!latest) {
+      const stale = all.some((e) => e.evidence.name === want.command);
+      return {
+        criterion,
+        met: false,
+        detail: stale
+          ? `\`${want.command}\` has not been run since ${criterion.ownerRole} last changed the code`
+          : `\`${want.command}\` was never run`,
+      };
+    }
+    return {
+      criterion,
+      met: want.mustExitZero ? isGreen(latest) : true,
+      latest,
+      detail: describeEvidence(latest),
+    };
+  });
+}
+
+/** Project an evidence check onto the same CriteriaResult shape the model-judged
+ *  criteria use, so gate notes, the recap and the UI render one uniform list. */
+function evidenceCheckToResult(check: EvidenceCheck): CriteriaResult {
+  return {
+    id: check.criterion.id,
+    status: check.met ? "met" : "unmet",
+    note: check.detail,
+  };
+}
+
+/**
+ * Merge deterministic evidence results over whatever the reviewer reported.
+ * Evidence always wins for its own criterion ids: a model claiming
+ * `exec.tests_pass` is "met" while no green run exists is exactly the
+ * self-assessment this whole feature exists to stop trusting.
+ */
+function mergeCriteriaResults(
+  reported: CriteriaResult[],
+  checks: EvidenceCheck[],
+): CriteriaResult[] {
+  if (!checks.length) return reported;
+  const evidenceIds = new Set(checks.map((c) => c.criterion.id));
+  return [...reported.filter((r) => !evidenceIds.has(r.id)), ...checks.map(evidenceCheckToResult)];
 }
 
 function readPlan(task: TaskRow): RefinementPlan | null {
@@ -609,8 +790,91 @@ export function taskRepoPath(task: TaskRow, project: ProjectRow): string {
   return task.git_worktree_path ?? project.repo_path;
 }
 
+/** Above this many chars, an intake file's content is compacted once at ingest
+ *  time (PLANNING/overhaul/07 §3) rather than carried unbounded through
+ *  `tasks.content` and reconstructed on every future `buildRoleContext` call.
+ *  `error_file` intakes (crash logs, stack traces) are the common case that
+ *  hits this; manual/security intakes rarely approach it. */
+const INTAKE_COMPACTION_THRESHOLD_CHARS = 8000;
+const INTAKE_COMPACTION_HEAD_CHARS = 4000;
+const INTAKE_COMPACTION_TAIL_CHARS = 2000;
+
 /** Scan every project's INTAKE folder and create tasks for new files.
  *  Returns the list of task rows that were created. */
+/**
+ * Create a task from a piece of content and materialize it into a real
+ * worktree + REFINING artifact — the create-task→worktree→artifact→commit
+ * body shared by every intake path, human or self-generated (PLANNING/
+ * overhaul/08 §2). Extracted from `ingestProject`'s per-file loop so a
+ * triaged watcher candidate becomes a task via the exact same machinery as a
+ * human-dropped intake file, rather than a parallel path. `ingestProject`
+ * keeps its own INTAKE-file-specific `removeFile`/`commitArtifacts` call
+ * *before* invoking this — that part has no equivalent for a watcher
+ * candidate (there is no INTAKE file to consume).
+ */
+export function materializeIntakeTask(
+  project: ProjectRow,
+  input: { name: string; content: string; intakeKind: IntakeKind; origin?: string; priority?: number },
+): TaskRow {
+  const planningDir = project.planning_dir || "PLANNING";
+  const kind = input.intakeKind;
+  let task = createTask({
+    name: input.name,
+    content: input.content,
+    project_id: project.id,
+    stage: "intake",
+    level: "task",
+    intake_kind: kind,
+    exit_kind: EXIT_KIND_BY_INTAKE[kind],
+    origin: input.origin ?? "human",
+    priority: input.priority ?? 3,
+  });
+
+  // Give the task its own worktree (off the current base), then seed the
+  // REFINING artifact there.
+  task = ensureTaskWorkspace(task, project);
+  const artName = artifactName(task);
+  const relArtifact = path.join(planningDir, "REFINING", artName);
+  const taskRepo = taskRepoPath(task, project);
+
+  // Intake compaction (PLANNING/overhaul/07 §3): oversize content (typically
+  // an error_file crash log) is compacted ONCE here rather than carried
+  // unbounded through `tasks.content` and reconstructed on every future
+  // `buildRoleContext` call. The full original is NEVER discarded — it is
+  // written to a sidecar file next to the REFINING artifact and referenced
+  // by path from both the DB row and the artifact, matching the "condense
+  // in-window, pull detail on demand" pattern that already governs prior-run
+  // findings (buildPriorFindingsPart's artifact pointer).
+  const oversize = input.content.length > INTAKE_COMPACTION_THRESHOLD_CHARS;
+  const sidecarRelPath = oversize
+    ? path.join(planningDir, "REFINING", `${artName.replace(/\.md$/i, "")}.raw-intake.txt`)
+    : null;
+  const storedContent =
+    oversize && sidecarRelPath
+      ? `${capHeadTail(input.content, INTAKE_COMPACTION_HEAD_CHARS, INTAKE_COMPACTION_TAIL_CHARS)}\n\n` +
+        `[condensed at intake — ${input.content.length.toLocaleString()} chars original; full text at ` +
+        `\`${sidecarRelPath}\`]`
+      : input.content;
+  if (oversize && sidecarRelPath) {
+    writeArtifact(path.join(taskRepo, sidecarRelPath), input.content);
+    task = updateTask(task.task_id, { content: storedContent }) ?? task;
+  }
+
+  writeArtifact(
+    path.join(taskRepo, relArtifact),
+    `# ${input.name}\n\n> Intake kind: **${kind}** · task \`${task.task_id.slice(0, 8)}\`\n\n## Original intake\n\n` +
+      `\`\`\`\n${storedContent.trim()}\n\`\`\`\n`,
+  );
+  updateTask(task.task_id, { artifact_path: relArtifact });
+  commitArtifacts(
+    taskRepo,
+    [relArtifact, ...(sidecarRelPath ? [sidecarRelPath] : [])],
+    `intake(${kind}): ${input.name}`,
+  );
+  publish(task.task_id, "task_update", { stage: "intake" });
+  return getTask(task.task_id)!;
+}
+
 export function ingestProject(project: ProjectRow): TaskRow[] {
   const planningDir = project.planning_dir || "PLANNING";
   scaffoldPlanning(project.repo_path, planningDir);
@@ -618,15 +882,6 @@ export function ingestProject(project: ProjectRow): TaskRow[] {
   const created: TaskRow[] = [];
   for (const f of files) {
     const kind = inferIntakeKind(f.fileName, f.content);
-    let task = createTask({
-      name: f.fileName,
-      content: f.content,
-      project_id: project.id,
-      stage: "intake",
-      level: "task",
-      intake_kind: kind,
-      exit_kind: EXIT_KIND_BY_INTAKE[kind],
-    });
     // Consume the INTAKE original on the shared checkout first — before this
     // task's own worktree branches off it — so the file can never be
     // re-scanned into a duplicate task, and no task branch needs to carry a
@@ -634,20 +889,8 @@ export function ingestProject(project: ProjectRow): TaskRow[] {
     removeFile(f.absPath);
     commitArtifacts(project.repo_path, [path.join(planningDir, "INTAKE")], `intake(${kind}): consumed ${f.fileName}`);
 
-    // Give the task its own worktree (off the now-updated base), then seed
-    // the REFINING artifact there.
-    task = ensureTaskWorkspace(task, project);
-    const artName = artifactName(task);
-    const relArtifact = path.join(planningDir, "REFINING", artName);
-    const taskRepo = taskRepoPath(task, project);
-    writeArtifact(
-      path.join(taskRepo, relArtifact),
-      `# ${f.fileName}\n\n> Intake kind: **${kind}** · task \`${task.task_id.slice(0, 8)}\`\n\n## Original intake\n\n\`\`\`\n${f.content.trim()}\n\`\`\`\n`,
-    );
-    updateTask(task.task_id, { artifact_path: relArtifact });
-    commitArtifacts(taskRepo, [relArtifact], `intake(${kind}): ${f.fileName}`);
+    const task = materializeIntakeTask(project, { name: f.fileName, content: f.content, intakeKind: kind });
     created.push(task);
-    publish(task.task_id, "task_update", { stage: "intake" });
   }
   return created;
 }
@@ -696,6 +939,9 @@ function consumeInterventions(task: TaskRow, plan: RefinementPlan): { plan: Refi
         break;
       case "wont_do":
         updateTask(task.task_id, { stage: "ready", exit_state: "wont_do", paused: 1 });
+        if ((task.origin ?? "human").startsWith("watcher:")) {
+          suppressCandidateForTask(task.task_id, "closed as wont_do (steering)");
+        }
         break;
       // steer_note / pin_question influence context (read in buildContext), no plan change
       default:
@@ -787,106 +1033,442 @@ function getRouterCfg(project: ProjectRow): RouterConfig | null {
   return cfg.enabled ? cfg : null;
 }
 
+/**
+ * READY-gate health flag (PLANNING/overhaul/04 §4). When on, a task may not be
+ * promoted to a terminal "ready"/"review" state on a degraded/empty terminal
+ * run — it loops back (bounded by the flow's maxLoopbacks) then escalates to a
+ * human, rather than reaching READY on a synthesized verdict. New projects get
+ * it seeded on (routes/api.ts); existing projects keep today's behavior until
+ * they opt in, so the resolver defaults to false when the key is absent.
+ */
+function requireHealthyTerminal(project: ProjectRow): boolean {
+  if (!project.config_json) return false;
+  try {
+    const parsed = JSON.parse(project.config_json) as { requireHealthyTerminal?: boolean };
+    return parsed.requireHealthyTerminal === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Context budgeting enforcement flag (PLANNING/overhaul/07, migration step 2).
+ * Absent/false (default): shadow mode — `buildRoleContext` still computes and
+ * records `context_tokens_est`/`context_degraded` on every run, but sends the
+ * full, undegraded prompt (today's exact behavior). true: the budgeted,
+ * tier-degraded assembly is what's actually sent. Opt-in per project so
+ * enabling it on one project can't change another's behavior underneath it.
+ */
+function contextBudgetEnabled(project: ProjectRow): boolean {
+  if (!project.config_json) return false;
+  try {
+    const parsed = JSON.parse(project.config_json) as { contextBudget?: boolean };
+    return parsed.contextBudget === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The most recent primary run of a given role for a task (the run that
+ *  produced the step's current output), or undefined if none exists. */
+function latestPrimaryRun(taskId: string, roleKey: string): RoleRunRow | undefined {
+  const runs = listRoleRuns(taskId).filter(
+    (r) => r.role_key === roleKey && (r.run_kind === "primary" || !r.run_kind),
+  );
+  return runs.length ? runs[runs.length - 1] : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Context building
 // ---------------------------------------------------------------------------
 
-function buildRoleContext(
-  task: TaskRow,
-  roleKey: string,
-  twoPhase = false,
-  textMode = false,
-  relArtifact?: string,
-  hasTools = false,
-): string {
-  const parts: string[] = [];
-  parts.push(`# Task: ${task.name ?? task.task_id}`);
-  parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
-  if (task.content) parts.push(`\n## Original intake\n\n${task.content.trim()}`);
+/**
+ * Resume block (PLANNING/overhaul/03 §2) prepended to a re-entered step's "Your
+ * task now" instruction when the step is resuming an interrupted attempt. Pairs
+ * the RESUME_STEERING directive with a capped tail of the prior attempt's report
+ * (already committed to the artifact by the failure/degraded path) so the model
+ * continues from real state instead of re-deriving it — turning retry cost from
+ * O(full run) into O(missing tail). Capped like buildParentDigest so attempt N
+ * never needs a bigger window than attempt 1.
+ */
+const RESUME_EXCERPT_MAX_CHARS = 1200;
 
-  const priors = listRoleRuns(task.task_id);
-  if (priors.length) {
-    parts.push(`\n## Findings so far (from earlier roles)`);
-    for (const r of priors) {
-      parts.push(
-        `\n### ${r.role_key} — verdict: ${r.verdict ?? "n/a"}\n${r.summary ?? ""}`.trimEnd(),
-      );
-    }
-    if (relArtifact && hasTools) {
-      parts.push(
-        `\nThe above are condensed summaries. Full prior write-ups (with code citations) are on disk ` +
-          `at \`${relArtifact}\` — read it with your \`read\` tool if a summary above isn't enough detail.`,
-      );
+function buildResumeBlock(relArtifact: string | undefined, absArtifact: string | undefined): string {
+  let excerpt = "";
+  if (absArtifact) {
+    try {
+      excerpt = readArtifact(absArtifact).trim();
+    } catch {
+      excerpt = "";
     }
   }
+  const capped =
+    excerpt.length > RESUME_EXCERPT_MAX_CHARS
+      ? `…\n${excerpt.slice(excerpt.length - RESUME_EXCERPT_MAX_CHARS)}`
+      : excerpt;
+  const where = relArtifact ? `\`${relArtifact}\`` : "your planning artifact";
+  const parts = [`\n## Your previous attempt (resume — do not restart)`, RESUME_STEERING];
+  parts.push(
+    capped
+      ? `\nYour report so far, already saved to ${where} (most recent content):\n\n${capped}`
+      : `\nYour report so far is saved to ${where} — read it with your \`read\` tool before continuing.`,
+  );
+  return parts.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Context budgeting (PLANNING/overhaul/07) — tier-4/5 content builders
+// ---------------------------------------------------------------------------
+
+/** How many of the most recent prior runs stay at full detail in Tier 4's
+ *  first degradation rung before older ones collapse to one-liners. */
+const RECENT_PRIOR_RUNS_FULL = 3;
+
+/** How many open questions survive Tier 5's first degradation rung before the
+ *  rest collapse to a bare count. */
+const MAX_OPEN_QUESTIONS_SHOWN = 6;
+
+const CONFIDENCE_RANK: Record<"low" | "medium" | "high", number> = { low: 0, medium: 1, high: 2 };
+
+/** One-line gist for a prior run, most-authoritative source first: a generated
+ *  digest (§2), then the role's own `carry_forward` handoff (§4), then a
+ *  hard-truncated `summary` — the doc's "Tier 4 prefers carry_forward over
+ *  summary when present" plus digest as the even-shorter-is-available source. */
+function priorRunGist(r: RoleRunRow): string {
+  const digest = r.digest?.trim();
+  if (digest) return digest;
+  const carry = r.carry_forward?.trim();
+  if (carry) return carry.length > 160 ? `${carry.slice(0, 160)}…` : carry;
+  const summary = (r.summary ?? "").trim();
+  return summary.length > 160 ? `${summary.slice(0, 160)}…` : summary || "(no summary)";
+}
+
+/** Full-detail rendering of one prior run — today's exact format, plus the
+ *  handoff contract when the role left one. */
+function priorRunFull(r: RoleRunRow): string {
+  const body = `\n### ${r.role_key} — verdict: ${r.verdict ?? "n/a"}\n${r.summary ?? ""}`.trimEnd();
+  const carry = r.carry_forward?.trim();
+  return carry ? `${body}\n\n**Carry forward for later roles:** ${carry}` : body;
+}
+
+/** Build the Tier-4 "Findings so far" part: full detail when it fits, else
+ *  recent-K-full + older-as-one-liners, else one rolled-up paragraph — the
+ *  doc §1 table's three-rung prior-findings degradation. Every degraded
+ *  rendering restates where to find the full detail (the artifact pointer),
+ *  matching the existing "read it with your `read` tool" pattern so a
+ *  degraded run never looks like the pointer silently vanished. */
+function buildPriorFindingsPart(
+  priors: RoleRunRow[],
+  relArtifact: string | undefined,
+  hasTools: boolean,
+): BudgetPart | null {
+  if (!priors.length) return null;
+  const heading = `\n## Findings so far (from earlier roles)`;
+  const pointer =
+    relArtifact && hasTools
+      ? `\nThe above are condensed summaries. Full prior write-ups (with code citations) are on disk ` +
+        `at \`${relArtifact}\` — read it with your \`read\` tool if a summary above isn't enough detail.`
+      : "";
+  const fallbackPointer = relArtifact
+    ? `\nOlder findings above are condensed — full write-ups are on disk at \`${relArtifact}\`.`
+    : `\nOlder findings above are condensed to fit this model's context window.`;
+
+  const full = [heading, ...priors.map(priorRunFull)].join("\n") + pointer;
+
+  const recentCount = Math.min(RECENT_PRIOR_RUNS_FULL, priors.length);
+  const older = priors.slice(0, priors.length - recentCount);
+  const recent = priors.slice(priors.length - recentCount);
+  const collapsed =
+    [
+      heading,
+      ...(older.length
+        ? [
+            `### Earlier steps (condensed)`,
+            ...older.map((r) => `- **${r.role_key}** (${r.verdict ?? "n/a"}): ${priorRunGist(r)}`),
+          ]
+        : []),
+      ...recent.map(priorRunFull),
+    ].join("\n") + (pointer || fallbackPointer);
+
+  const paragraph =
+    `${heading} (condensed)\n` +
+    priors.map((r) => `**${r.role_key}** (${r.verdict ?? "n/a"}): ${priorRunGist(r)}`).join("\n") +
+    (pointer || fallbackPointer);
+
+  return { id: "priors", tier: 4, renderings: [full, collapsed, paragraph] };
+}
+
+/** Build the Tier-5 open-questions part: all of them, then a subset capped at
+ *  {@link MAX_OPEN_QUESTIONS_SHOWN} prioritizing the lowest-confidence guesses
+ *  (the ones most likely wrong) with a "+N more" count, then a bare count. */
+function buildOpenQuestionsPart(
+  unresolved: Array<OpenQuestion & { roleKey: string }>,
+): BudgetPart | null {
+  if (!unresolved.length) return null;
+  const heading = `\n## Open questions from earlier roles (unresolved)`;
+  const line = (q: (typeof unresolved)[number]) =>
+    `- **${q.roleKey}** [${q.confidence} confidence] ${q.question} → assumed: ${q.assumed_answer || "(no guess)"}`;
+
+  const full = [heading, ...unresolved.map(line)].join("\n");
+
+  const byPriority = [...unresolved].sort(
+    (a, b) => CONFIDENCE_RANK[a.confidence] - CONFIDENCE_RANK[b.confidence],
+  );
+  const shown = byPriority.slice(0, MAX_OPEN_QUESTIONS_SHOWN);
+  const rest = unresolved.length - shown.length;
+  const capped = [
+    heading,
+    ...shown.map(line),
+    rest > 0 ? `- …and ${rest} more open question${rest === 1 ? "" : "s"} — see the task artifact.` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const countOnly =
+    `\n## Open questions from earlier roles\n${unresolved.length} unresolved open ` +
+    `question${unresolved.length === 1 ? "" : "s"} from earlier roles — see the task artifact for detail.`;
+
+  return { id: "open-questions", tier: 5, renderings: [full, capped, countOnly] };
+}
+
+/** Build the Tier-3 intake part: the full original intake, then progressively
+ *  smaller head+tail extractions (doc §3). `capHeadTail` is already a no-op
+ *  when the text is short enough that a smaller cap wouldn't cut anything. */
+function buildIntakePart(content: string): BudgetPart {
+  const trimmed = content.trim();
+  const full = `\n## Original intake\n\n${trimmed}`;
+  const condensedHeading = `\n## Original intake (condensed — head + tail; full text is in the task artifact)\n\n`;
+  const large = `${condensedHeading}${capHeadTail(trimmed, 2000, 800)}`;
+  const small = `${condensedHeading}${capHeadTail(trimmed, 600, 300)}`;
+  return { id: "intake", tier: 3, renderings: [full, large, small] };
+}
+
+interface RoleContextResult {
+  text: string;
+  /** chars/4 estimate of whatever `text` actually contains (doc §5's stat). */
+  tokensEst: number;
+  /** True iff the budgeted allocation needed to collapse/drop any degradable
+   *  tier — recorded regardless of whether budgeting is enforced, so shadow
+   *  mode (§ Migration step 1) gets "would have overflowed" for free. */
+  degraded: boolean;
+}
+
+interface BuildRoleContextOpts {
+  task: TaskRow;
+  roleKey: string;
+  connection: Connection;
+  /** The role's fully-composed system prompt — measured for
+   *  `systemPromptTokens` (doc §1's ledger input), never included in the
+   *  returned context text itself (pi sends it separately as the system turn). */
+  systemPrompt: string;
+  twoPhase?: boolean;
+  textMode?: boolean;
+  relArtifact?: string;
+  hasTools?: boolean;
+  outputContract?: "v1" | "artifact-first";
+  resumeBlock?: string;
+  /** Approved command names for this project (PLANNING/overhaul/05) — decides
+   *  whether this task's flow carries evidence criteria worth telling the role
+   *  about. [] for every project that hasn't enabled exec. */
+  execCommands?: readonly string[];
+  /** PLANNING/overhaul/07 migration: false (default, shadow mode) computes and
+   *  returns `tokensEst`/`degraded` for observability but still returns the
+   *  full, undegraded text — byte-identical to pre-budgeting behavior. true
+   *  returns the actually-degraded text, i.e. budgeting is enforced. */
+  budgetEnforced?: boolean;
+}
+
+function buildRoleContext(opts: BuildRoleContextOpts): RoleContextResult {
+  const {
+    task,
+    roleKey,
+    connection,
+    systemPrompt,
+    twoPhase = false,
+    textMode = false,
+    relArtifact,
+    hasTools = false,
+    outputContract = "artifact-first",
+    resumeBlock,
+    execCommands = [],
+    budgetEnforced = false,
+  } = opts;
+
+  // One ordered array in final document order — allocate() preserves this
+  // order in its output regardless of tier, so tier/neverDrop are just tags.
+  const parts: BudgetPart[] = [];
+  const neverDrop = (id: string, text: string, tier: 1 | 2 = 1): void => {
+    parts.push({ id, tier, neverDrop: true, renderings: [text] });
+  };
+
+  neverDrop("header", `# Task: ${task.name ?? task.task_id}`);
+  neverDrop("intake-kind", `Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
+  if (task.content) parts.push(buildIntakePart(task.content));
+
+  const priors = listRoleRuns(task.task_id);
+  const priorsPart = buildPriorFindingsPart(priors, relArtifact, hasTools);
+  if (priorsPart) parts.push(priorsPart);
 
   const unresolved = priors.flatMap((r) =>
     parseOpenQuestions(r.open_questions_json)
       .filter((q) => q.resolved === "assumed")
       .map((q) => ({ ...q, roleKey: r.role_key })),
   );
-  if (unresolved.length) {
-    parts.push(`\n## Open questions from earlier roles (unresolved)`);
-    for (const q of unresolved) {
-      parts.push(
-        `- **${q.roleKey}** [${q.confidence} confidence] ${q.question} → assumed: ${q.assumed_answer || "(no guess)"}`,
-      );
-    }
+  const questionsPart = buildOpenQuestionsPart(unresolved);
+  if (questionsPart) parts.push(questionsPart);
+
+  // Sibling/ancestor awareness: a new epic/story spawned partway through a
+  // family tree otherwise has zero visibility into what OTHER branches
+  // already created (buildParentDigest only reaches its own immediate
+  // parent's role history) — the direct cause of the "epic → duplicate epic
+  // → duplicate tasks" runaway this was built to prevent. Scoped to
+  // decomposition (deciding whether/how to split further) and explorer
+  // (deciding what's already been established) — the two roles most likely
+  // to otherwise redo a sibling's work.
+  if ((roleKey === "decomposition" || roleKey === "explorer") && task.parent_task_id) {
+    const manifest = buildFamilyManifest(task);
+    if (manifest) neverDrop("family-manifest", manifest, 2);
   }
 
   const notes = steeringNotes(task.task_id);
   if (notes.length) {
-    parts.push(`\n## Human steering (honor these)`);
-    for (const n of notes) parts.push(`- ${n}`);
+    neverDrop("steering", [`\n## Human steering (honor these)`, ...notes.map((n) => `- ${n}`)].join("\n"));
   }
 
   // Resolved questions from human answers.
   const answers = answeredQuestions(task.task_id);
   if (answers.length) {
-    parts.push(`\n## Questions resolved by human`);
-    for (const qa of answers) {
-      parts.push(`- Q: ${qa.question}\n  A: ${qa.answer}`);
-    }
+    neverDrop(
+      "human-answers",
+      [
+        `\n## Questions resolved by human`,
+        ...answers.map((qa) => `- Q: ${qa.question}\n  A: ${qa.answer}`),
+      ].join("\n"),
+    );
+  }
+
+  // Verification evidence recorded so far (PLANNING/overhaul/05) — what
+  // actually ran, straight from the harness's own record. This is how the
+  // critic sees the developer's test runs: not as a claim in the developer's
+  // prose, but as executions it can weigh (and re-run itself). Small and
+  // factual — never dropped (Tier 2).
+  const priorEvidence = collectTaskEvidence(task.task_id).map((e) => e.evidence);
+  if (priorEvidence.length) {
+    neverDrop(
+      "evidence",
+      `\n${renderEvidenceBlock(priorEvidence)}\n` +
+        `\nThese results were recorded by the platform, not claimed by a role — treat them as fact. ` +
+        `A red run is not resolved by arguing with it.`,
+      2,
+    );
   }
 
   // Counter-reviewer: hand it the acceptance checklist it must verify.
-  const flow = flowForTask(task);
-  if (roleKey === flow.reviewerRole && flow.criteria.length) {
-    parts.push(
-      `\n## Acceptance criteria to verify\nVerify each criterion against the findings above and the real code, then return one \`criteria_results\` entry per id (status met/partial/unmet). Set verdict "needs_more" if any **must** criterion is not fully met.`,
+  const flow = flowForTask(task, execCommands);
+  // Evidence criteria are decided deterministically from the recorded runs, so
+  // the reviewer is told the bar but is NOT asked to judge them — demanding a
+  // criteria_results entry for something no model opinion can settle would just
+  // invite it to assert "met" and get overruled.
+  const judgedCriteria = flow.criteria.filter((c) => !c.evidence);
+  const evidenceCriteria = flow.criteria.filter((c) => c.evidence);
+  if (roleKey === flow.reviewerRole && judgedCriteria.length) {
+    neverDrop(
+      "criteria-judged",
+      [
+        `\n## Acceptance criteria to verify\nVerify each criterion against the findings above and the real code, then return one \`criteria_results\` entry per id (status met/partial/unmet). Set verdict "needs_more" if any **must** criterion is not fully met.`,
+        ...judgedCriteria.map((c) => `- [${c.severity}] \`${c.id}\` — ${c.text}`),
+      ].join("\n"),
+      2,
     );
-    for (const c of flow.criteria) {
-      parts.push(`- [${c.severity}] \`${c.id}\` — ${c.text}`);
-    }
-    if (flow.mandatoryConcerns.length) {
-      parts.push(`\nThese concerns MUST be covered before this is ready: ${flow.mandatoryConcerns.join(", ")}.`);
-    }
+  }
+  if (roleKey === flow.reviewerRole && evidenceCriteria.length) {
+    neverDrop(
+      "criteria-evidence",
+      [
+        `\n## Automatically verified (do not report these in criteria_results)\nThese are checked by the platform against the recorded command runs above, not against your judgement. They gate this task regardless of your verdict:`,
+        ...evidenceCriteria.map((c) => `- [${c.severity}] \`${c.id}\` — ${c.text}`),
+      ].join("\n"),
+      2,
+    );
+  }
+  if (roleKey === flow.reviewerRole && flow.criteria.length && flow.mandatoryConcerns.length) {
+    neverDrop(
+      "mandatory-concerns",
+      `\nThese concerns MUST be covered before this is ready: ${flow.mandatoryConcerns.join(", ")}.`,
+      2,
+    );
   }
 
+  // Resume steering (overhaul/03 §2) sits right before the "Your task now"
+  // instruction so it is the last framing the model reads before acting.
+  if (resumeBlock) neverDrop("resume", resumeBlock, 2);
+
+  const artifactFirst = outputContract !== "v1";
+  let instruction: string;
   if (twoPhase) {
-    parts.push(
-      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
-        `write a concise natural-language summary of your findings. Do not look for a "record_findings" ` +
-        `tool — just write your summary as plain text. You will be asked to formalize it as structured ` +
-        `JSON in the next step.`,
-    );
+    instruction = artifactFirst
+      ? `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+          `write your findings as a markdown report (start with a "## <Your Role>" heading, cite concrete ` +
+          `files). That text is saved to the task's planning artifact as your report. Do not look for a ` +
+          `"record_findings" tool — just write the report as plain text. You will be asked to formalize a ` +
+          `small structured verdict in the next step.`
+      : `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+          `write a concise natural-language summary of your findings. Do not look for a "record_findings" ` +
+          `tool — just write your summary as plain text. You will be asked to formalize it as structured ` +
+          `JSON in the next step.`;
   } else if (textMode) {
-    parts.push(
-      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
-        `output your findings as a single \`\`\`json code block at the end of your response. You do NOT ` +
-        `have a \`record_findings\` tool — do not try to call it. Instead, use this exact JSON format:\n` +
-        `\`\`\`\n{"verdict": "pass", "summary": "...", "open_questions": [], "coverage": [...], ` +
-        `"section_md": "## My Role\\n\\n..."}\n\`\`\`\n` +
-        `See the system prompt for the full schema. Output ONLY the JSON block — nothing after the closing \`\`\`.`,
-    );
+    instruction = artifactFirst
+      ? `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+          `write your findings as normal markdown prose (your report — it is saved to the task's planning ` +
+          `artifact as-is), and END your response with ONE small \`\`\`json verdict block:\n` +
+          `\`\`\`\n{"verdict": "pass", "summary": "...", "open_questions": [], "coverage": [...]}\n\`\`\`\n` +
+          `You do NOT have a \`record_findings\` tool — do not try to call it — and there is no ` +
+          `"section_md" field: the prose above the JSON block is your report. See the system prompt for ` +
+          `the full trailer schema. Nothing after the closing \`\`\`.`
+      : `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then ` +
+          `output your findings as a single \`\`\`json code block at the end of your response. You do NOT ` +
+          `have a \`record_findings\` tool — do not try to call it. Instead, use this exact JSON format:\n` +
+          `\`\`\`\n{"verdict": "pass", "summary": "...", "open_questions": [], "coverage": [...], ` +
+          `"section_md": "## My Role\\n\\n..."}\n\`\`\`\n` +
+          `See the system prompt for the full schema. Output ONLY the JSON block — nothing after the closing \`\`\`.`;
   } else {
-    parts.push(
-      `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
-        `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in ` +
-        `plain text first — make the function call directly.`,
-    );
+    instruction = artifactFirst
+      ? `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, and save ` +
+          `your report as you go by calling the \`report_section\` tool (section by section — this is how ` +
+          `your work is persisted). Then finish by invoking \`record_findings\` directly as a tool call ` +
+          `with your verdict trailer (no section_md — your report is already saved). Do not describe or ` +
+          `announce the calls in plain text first — make the function calls directly.`
+      : `\n## Your task now\nYou are the **${roleKey}** role. Inspect the repository, do your part, then finish ` +
+          `by invoking \`record_findings\` directly as a tool call. Do not describe or announce the call in ` +
+          `plain text first — make the function call directly.`;
   }
-  return parts.join("\n");
+  neverDrop("instruction", instruction);
+
+  // ---- Ledger arithmetic (doc §1) ----
+  const thinkingBudget = connection.reasoning
+    ? connection.thinkingBudgets?.[connection.thinkingLevel as "minimal" | "low" | "medium" | "high"]
+    : undefined;
+  const budget = computeBudget({
+    contextWindow: connection.contextWindow,
+    effectiveContext: connection.effectiveContext,
+    maxTokens: connection.maxTokens,
+    thinkingBudget,
+    systemPromptTokens: estimateTokens(systemPrompt),
+  });
+  const allocated = allocate(parts, budget.budget);
+
+  const fullText = parts
+    .map((p) => p.renderings[0] ?? "")
+    .filter((s) => s.trim().length > 0)
+    .join("\n");
+
+  // Shadow mode (default): return the full assembly unchanged — today's exact
+  // behavior — but still report what the budgeted allocation WOULD have been,
+  // which is the "would-have-overflowed" signal the migration's step 1 wants.
+  // Enforced mode: return the budgeted/degraded text itself.
+  return budgetEnforced
+    ? { text: allocated.text, tokensEst: allocated.tokensEst, degraded: allocated.degraded }
+    : { text: fullText, tokensEst: estimateTokens(fullText), degraded: allocated.degraded };
 }
 
 // ---------------------------------------------------------------------------
@@ -923,7 +1505,7 @@ function maybeDistillQuestions(
     }
   }
 
-  const { modelId } = resolveConnectionForModel(
+  const { connection, modelId } = resolveConnectionForModel(
     task.model || project.default_model || null,
     project.id,
   );
@@ -941,6 +1523,7 @@ function maybeDistillQuestions(
     taskRepoPath(task, project),
     project.planning_dir || "PLANNING",
     modelId,
+    connection,
   )
     .then((distilled) => {
       // Update the role run's open_questions with the distilled text versions
@@ -1008,6 +1591,9 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 
   const tools: string[] = role.tools_json ? (JSON.parse(role.tools_json) as string[]) : [];
   const harnessPolicy = resolveHarnessPolicy(project.config_json);
+  // Grounded verification (overhaul/05): [] unless this project has exec on
+  // with a non-empty menu — which is what keeps evidence criteria dormant.
+  const execCommands = execEnabled(harnessPolicy) ? harnessPolicy.execAllowlist.map((c) => c.name) : [];
   // Resolve the connection FROM the chosen model reference (a named model-config's
   // `name`, or a raw modelId) rather than always the project/global default — this
   // is what lets textMode/twoPhase/base_url vary per role when a model override
@@ -1077,6 +1663,29 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     }, connection.requestTimeoutMs);
   };
   armIdleTimer();
+  // Context ledger (PLANNING/overhaul/07): computed once so both the actual
+  // roleRunner call and the run row (below) see the same allocation.
+  const roleContext = buildRoleContext({
+    task,
+    roleKey: step.role,
+    connection,
+    systemPrompt: role.system_prompt,
+    twoPhase: connection.twoPhase,
+    textMode: connection.textMode,
+    relArtifact,
+    hasTools: tools.length > 0,
+    outputContract: connection.compat.outputContract ?? "artifact-first",
+    // Resume (overhaul/03 §2): a cold-rerun retry path marked this step for
+    // resume — re-enter continuing the prior attempt's durable report rather
+    // than restarting it. Only a role that owns an artifact and has tools to
+    // read it can meaningfully resume.
+    resumeBlock:
+      step.resume && relArtifact && tools.length > 0
+        ? buildResumeBlock(relArtifact, absArtifact)
+        : undefined,
+    execCommands,
+    budgetEnforced: contextBudgetEnabled(project),
+  });
   try {
     result = await roleRunner({
       repoPath,
@@ -1085,7 +1694,7 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       modelId,
       systemPrompt: role.system_prompt,
       tools,
-      context: buildRoleContext(task, step.role, connection.twoPhase, connection.textMode, relArtifact, tools.length > 0),
+      context: roleContext.text,
       thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
       textMode: connection.textMode,
       twoPhase: connection.twoPhase,
@@ -1102,6 +1711,16 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     const msg = (err as Error).message;
     const aborted = ac.signal.aborted || msg === "AbortError" || msg.includes("aborted");
 
+    // Prose is never discarded: any report sections the role streamed to the
+    // artifact via report_section before this failure are already on disk —
+    // checkpoint them now so a retry, an escalation, or a process restart can
+    // never lose them. Best-effort and quiet when nothing changed.
+    commitArtifacts(
+      repoPath,
+      [relArtifact],
+      `refine(${step.role}): salvage streamed report sections [degraded: run failed]`,
+    );
+
     // JSON formatting failures are transient — re-queue with explicit guidance
     // instead of immediately escalating to human review.
     if (!aborted && isJsonParseError(msg)) {
@@ -1113,16 +1732,20 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
         );
         step.status = "pending";
         step.attempts = retryCount + 1;
+        // Resume rather than cold-rerun: the prior attempt's report sections are
+        // already committed to the artifact (salvage commit above), so re-enter
+        // continuing from them instead of redoing the whole role (overhaul/03 §2).
+        step.resume = true;
         createIntervention({
           task_id: task.task_id,
           kind: "steer_note",
           payload_json: JSON.stringify({
             text:
               `[orchestrator·retry] The previous attempt failed because your JSON output was not valid — ` +
-              `there was extra text after the closing brace or bracket. When you call record_findings (or ` +
-              `output a JSON block in text mode), ensure the JSON is the ONLY content after the opening ` +
-              `brace — no commentary, no markdown, no trailing text. If using a code fence, close it ` +
-              `immediately after the final brace.`,
+              `there was extra text after the closing brace or bracket. Do not redo the analysis you already ` +
+              `completed (it is saved to your report) — just continue and, when you record your verdict, ` +
+              `ensure the JSON is the ONLY content after the opening brace: no commentary, no markdown, no ` +
+              `trailing text. If using a code fence, close it immediately after the final brace.`,
           }),
           created_by: "orchestrator",
         });
@@ -1157,13 +1780,19 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
         );
         step.status = "pending";
         step.attempts = retryCount + 1;
+        // Resume rather than cold-rerun (overhaul/03 §2): whatever the prior
+        // attempt streamed to its report before the dead-air abort is already on
+        // disk (salvage commit above) — continue from it, don't restart.
+        step.resume = true;
         createIntervention({
           task_id: task.task_id,
           kind: "steer_note",
           payload_json: JSON.stringify({
             text:
               `[orchestrator·retry] The previous attempt stopped responding (no output for over ` +
-              `${Math.round(connection.requestTimeoutMs / 1000)}s) and was aborted. Please retry the task from the beginning.`,
+              `${Math.round(connection.requestTimeoutMs / 1000)}s) and was aborted before it finished. Any ` +
+              `report sections it saved are in your artifact — continue from there, do not redo completed ` +
+              `analysis, and record your verdict promptly.`,
           }),
           created_by: "orchestrator",
         });
@@ -1209,6 +1838,8 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
           : `Role execution failed: ${msg}`,
       depth: step.depth,
       model: modelId,
+      context_tokens_est: roleContext.tokensEst,
+      context_degraded: roleContext.degraded ? 1 : 0,
     });
     step.status = "done";
     updateTask(task.task_id, {
@@ -1278,8 +1909,14 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // instead of trusting whatever freeform rendering the model wrote —
   // guarantees the artifact always shows a correctly-formatted, parseable
   // tree when subtasks are present, regardless of prose format drift.
-  if (role.can_create_subtasks && findings.subtasks?.length) {
-    findings.section_md = `${renderSubtaskTree(findings.subtasks)}\n\n${findings.section_md}`;
+  // Captured separately so the artifact-append below can add just the tree
+  // when the prose itself already streamed to the artifact during the run.
+  const treeMd =
+    role.can_create_subtasks && findings.subtasks?.length
+      ? renderSubtaskTree(findings.subtasks)
+      : "";
+  if (treeMd) {
+    findings.section_md = `${treeMd}\n\n${findings.section_md}`;
   }
 
   // The counter-reviewer gate below treats a missing entry in
@@ -1290,9 +1927,13 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // failure and burns a loop-back for nothing. Retry with corrective
   // guidance (same bounded shape/counter as the other retries) before that
   // happens, instead of only discovering it after the loop-backs are spent.
-  const flow = flowForTask(task);
+  const flow = flowForTask(task, execCommands);
   const isReviewerStep = step.role === flow.reviewerRole;
-  if (isReviewerStep && flow.criteria.length > 0 && !findings.criteria_results?.length) {
+  // Only the model-judged criteria can be "left empty" — evidence criteria are
+  // decided from the recorded runs and deliberately never asked of the model
+  // (see checkEvidenceCriteria), so they must not trigger this retry.
+  const judgedCriteriaCount = flow.criteria.filter((c) => !c.evidence).length;
+  if (isReviewerStep && judgedCriteriaCount > 0 && !findings.criteria_results?.length) {
     const retryCount = step.attempts ?? 0;
     if (retryCount < 2) {
       console.warn(
@@ -1334,14 +1975,33 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   if (result.fallback || result.stopReason === "length" || result.stalled) {
     console.warn(
       `[orchestrator] degraded run: task=${task.task_id.slice(0, 8)} role=${step.role} ` +
-        `stop=${result.stopReason ?? "?"} fallback=${result.fallback} stalled=${result.stalled} tokens=${result.tokens}`,
+        `stop=${result.stopReason ?? "?"} fallback=${result.fallback} stalled=${result.stalled} ` +
+        `verdict_source=${result.verdictSource ?? "?"} artifact_bytes=${result.artifactBytesAppended ?? 0} ` +
+        `tokens=${result.tokens}`,
     );
   }
 
-  // Persist the run.
+  // Retry lineage (overhaul/03): `attempt` is this step's 1-based try index
+  // (step.attempts counts prior retries); `resumed_from` links to the most
+  // recent prior primary run of the same role when this is a retry, so the
+  // degraded-run observability pass (overhaul/04) can reconstruct the chain.
+  const attemptIdx = (step.attempts ?? 0) + 1;
+  const priorSameRole = listRoleRuns(task.task_id).filter(
+    (r) => r.role_key === step.role && r.run_kind === "primary",
+  );
+  const resumedFrom =
+    attemptIdx > 1 && priorSameRole.length ? priorSameRole[priorSameRole.length - 1]!.id : null;
+
+  // Persist the run. The three run-health signals (overhaul/04) complete the
+  // raw data the derived health enum reads: `phase` (twoPhase exit progress),
+  // `failed_tool_calls` (tool calls that errored this run), `artifact_bytes`
+  // (prose durably streamed during the run — 0 is the "wrote no output" signal).
+  const failedToolCalls = result.toolCalls.filter((tc) => tc.isError).length;
   const run = createRoleRun({
     task_id: task.task_id,
     role_key: step.role,
+    attempt: attemptIdx,
+    resumed_from: resumedFrom,
     verdict: findings.verdict,
     summary: findings.summary,
     output_md: findings.section_md,
@@ -1352,14 +2012,86 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     stop_reason: result.stopReason ?? null,
     fallback: result.fallback ? 1 : 0,
     stalled: result.stalled ? 1 : 0,
+    verdict_source: result.verdictSource ?? null,
     thinking_md: result.thinkingText || null,
     open_questions_json: JSON.stringify(findings.open_questions ?? []),
+    phase: result.phase ?? null,
+    failed_tool_calls: failedToolCalls,
+    artifact_bytes: result.artifactBytesAppended ?? 0,
+    // Harness-recorded executions (overhaul/05). Sourced ONLY from the run
+    // result — never from findings — so nothing a model wrote can land here.
+    evidence_json: result.evidence?.length ? JSON.stringify(result.evidence) : null,
     depth: step.depth,
     model: result.model,
     tokens: result.tokens,
     subtasks_json: JSON.stringify(findings.subtasks ?? []),
     no_decomposition_reason: findings.no_decomposition_reason ?? null,
+    // Context ledger (PLANNING/overhaul/07): the allocation this run's context
+    // was actually assembled/measured against, computed in buildRoleContext
+    // before the model call. carry_forward is the role's own handoff — capped
+    // defensively even though the schema already documents a ~300-char budget.
+    context_tokens_est: roleContext.tokensEst,
+    context_degraded: roleContext.degraded ? 1 : 0,
+    carry_forward: findings.carry_forward?.trim()?.slice(0, 300) || null,
   });
+
+  // The explorer role is the first (and only) role in every flow that has
+  // actually looked at the real files before estimating size — persist its
+  // effort_size onto the task row immediately so the family-wide
+  // decomposition budget and the XS fast path can read it off later steps
+  // without re-deriving it from role_runs.
+  if (step.role === "explorer" && findings.effort_size) {
+    task = updateTask(task.task_id, { effort_size: findings.effort_size }) ?? task;
+  }
+
+  // XS fast path: skip architecture_review/test_strategy/spec_review/
+  // decomposition entirely and route straight to the developer/critic
+  // execution flow (the same flow an execution_ready decomposition leaf
+  // gets — see createDecompositionChildren/runTaskStepOnce). This is the
+  // single highest-value fix for the runaway-decomposition case this whole
+  // effort-sizing/budget system was built for: a genuinely XS change (a
+  // two-file default-value flip, say) has no business entering the full
+  // planning gauntlet only to have decomposition conclude "no further work"
+  // several expensive steps later. Gated on exit_kind still being "spec" —
+  // question/research/ux flows target a research_brief, not code, and
+  // forcing those into a code_change routing would be nonsensical — and on
+  // autonomy not being "plan" (which must never let a task begin writing
+  // code) and rigor not being "thorough" (an explicit ask for more process
+  // even on small work).
+  if (
+    step.role === "explorer" &&
+    findings.effort_size === "XS" &&
+    (task.level ?? "task") === "task" &&
+    (task.exit_kind as ExitKind) === "spec" &&
+    effectiveAutonomyLevel(task, project) !== "plan" &&
+    effectivePlanningRigor(task, project) !== "thorough"
+  ) {
+    task = updateTask(task.task_id, { exit_kind: "code_change" }) ?? task;
+    const idx = plan.steps.indexOf(step);
+    if (idx >= 0) {
+      plan.steps = [
+        ...plan.steps.slice(0, idx + 1),
+        ...EXECUTION_FLOW_TEMPLATE.steps.map((role) => ({ role, status: "pending" as const, depth: 1 })),
+      ];
+    }
+  }
+
+  // Rolling digest (doc §2): a short, cheap, extractive summary of THIS run's
+  // report, generated post-run so a later step's Tier-4 one-liner collapse
+  // (buildPriorFindingsPart) can prefer it over a hand-truncated `summary`.
+  // Fire-and-forget — same posture as Call Point 1's question distillation
+  // below: never blocks the tick. generateDigest never throws and silently
+  // no-ops on short reports or a failed call; if the very next step's context
+  // is assembled before this lands, priorRunGist just falls back to
+  // `carry_forward`/`summary`, which is always already durable.
+  const digestSource = result.artifactResidualMd || findings.section_md || findings.summary;
+  generateDigest(digestSource, connection, modelId)
+    .then((digest) => {
+      if (digest) setRoleRunDigest(run.id, digest);
+    })
+    .catch((err) => {
+      console.warn(`[orchestrator] digest generation failed for run ${run.id}: ${(err as Error).message}`);
+    });
 
   // ---- Call Point 1: Question Distillation (fire-and-forget) ----
   const routerCfg = getRouterCfg(project);
@@ -1367,16 +2099,24 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     maybeDistillQuestions(task, project, run.id, findings.open_questions, routerCfg);
   }
 
-  // Append the section to the artifact + commit. On success, the resulting
-  // commit is this run's checkpoint — restore resets task.git_branch to it.
-  // Any files the role wrote/edited via the guarded write/edit tools ride
-  // along in the same checkpoint commit.
-  appendArtifactSection(absArtifact, findings.section_md);
-  const committed = commitArtifacts(
-    repoPath,
-    [relArtifact, ...result.filesWritten],
-    refineCommitMessage(step.role, task.name ?? task.task_id, findings.summary),
-  );
+  // Append to the artifact + commit. Under the artifact-first contract the
+  // model may have already streamed its report to the artifact via
+  // report_section during the run — artifactResidualMd is exactly the part of
+  // section_md NOT yet on disk (it defaults to the whole section_md for test
+  // fakes and v1-style runs). The deterministic subtask tree is orchestrator-
+  // rendered, so it is always appended here. On success, the resulting commit
+  // is this run's checkpoint — restore resets task.git_branch to it. Any files
+  // the role wrote/edited via the guarded write/edit tools ride along in the
+  // same checkpoint commit.
+  const residualMd = result.artifactResidualMd ?? findings.section_md;
+  const artifactMd = [treeMd, residualMd].filter((s) => s.trim()).join("\n\n");
+  if (artifactMd) appendArtifactSection(absArtifact, artifactMd);
+  // Degraded-run marker: a checkpoint whose verdict had to be synthesized is
+  // visibly flagged in the git history, not just in the run row.
+  const commitMessage =
+    refineCommitMessage(step.role, task.name ?? task.task_id, findings.summary) +
+    (result.fallback ? " [degraded: fallback verdict]" : "");
+  const committed = commitArtifacts(repoPath, [relArtifact, ...result.filesWritten], commitMessage);
   if (committed) {
     try {
       setRoleRunCommitSha(run.id, headSha(repoPath));
@@ -1398,6 +2138,18 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     fallback: result.fallback,
     stopReason: result.stopReason,
     tokens: result.tokens,
+    model: result.model,
+  });
+
+  // Run-health completion event (overhaul/04 §2): lets boards/detail views
+  // update their badges and degraded chips live without re-fetching.
+  const runHealth = computeRunHealth(roleRunHealthInput(run));
+  publish(task.task_id, "run_health", {
+    runId: run.id,
+    role: step.role,
+    health: runHealth,
+    reason: runHealthReason(roleRunHealthInput(run)),
+    verdictSource: run.verdict_source,
     model: result.model,
   });
 
@@ -1489,13 +2241,44 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
 const VERDICT_RANK: Record<string, number> = { pass: 0, needs_more: 1, blocker: 2, needs_human: 2 };
 
 /** Pure: scope a critique's context to just the one step's output being judged. */
-function buildCritiqueContext(task: TaskRow, roleKey: string, findings: RoleFindings): string {
+function buildCritiqueContext(
+  task: TaskRow,
+  roleKey: string,
+  findings: RoleFindings,
+  producingRun?: RoleRunRow,
+): string {
   const parts: string[] = [];
   parts.push(`# Task: ${task.name ?? task.task_id}`);
   parts.push(`Intake kind: ${task.intake_kind} · Target exit: ${task.exit_kind}`);
   parts.push(`\n## Step under review: ${roleKey}`);
   parts.push(`- Verdict: ${findings.verdict}`);
   parts.push(`- Summary: ${findings.summary}`);
+  // Distrust signal (overhaul/04 §4): tell the critic when it is judging salvage
+  // rather than a clean run, so it weights a degraded/reconstructed verdict
+  // accordingly instead of taking the output at face value.
+  if (producingRun) {
+    const health = computeRunHealth(roleRunHealthInput(producingRun));
+    if (!isTrustedHealth(health)) {
+      parts.push(
+        `- ⚠ Run health: **${health}** — ${runHealthReason(roleRunHealthInput(producingRun))} ` +
+          `Judge the output on its merits, but do not treat a synthesized or reconstructed verdict as authoritative.`,
+      );
+    }
+    // Grounded verification (overhaul/05): the executions this step actually
+    // performed, harness-recorded. A step that claims success while its own
+    // recorded run is red is precisely the "domain violation" the critic exists
+    // to catch, so it gets the facts rather than the claim.
+    const evidence = parseEvidence(producingRun.evidence_json);
+    if (evidence.length) {
+      parts.push(`\n${renderEvidenceBlock(evidence)}`);
+      if (evidence.some((e) => !isGreen(e))) {
+        parts.push(
+          `\nAt least one command above did NOT pass. If this step's output claims otherwise, that is a ` +
+            `concrete, high-severity contradiction — say so.`,
+        );
+      }
+    }
+  }
   parts.push(`\n${findings.section_md}`);
   parts.push(
     `\n## Your task now\nYou are the **critic**. Judge ONLY this one step's output above — not ` +
@@ -1534,7 +2317,7 @@ async function runCritiquePass(
       modelId,
       systemPrompt: criticRole.system_prompt,
       tools,
-      context: buildCritiqueContext(task, step.role, findings),
+      context: buildCritiqueContext(task, step.role, findings, run),
       thinkingLevel: connection.reasoning ? connection.thinkingLevel : undefined,
       textMode: connection.textMode,
       twoPhase: connection.twoPhase,
@@ -1556,8 +2339,12 @@ async function runCritiquePass(
       stop_reason: result.stopReason ?? null,
       fallback: result.fallback ? 1 : 0,
       stalled: result.stalled ? 1 : 0,
+      verdict_source: result.verdictSource ?? null,
       thinking_md: result.thinkingText || null,
       open_questions_json: JSON.stringify(result.findings.open_questions ?? []),
+      phase: result.phase ?? null,
+      failed_tool_calls: result.toolCalls.filter((tc) => tc.isError).length,
+      artifact_bytes: result.artifactBytesAppended ?? 0,
       target_run_id: run.id,
       run_kind: "critique",
       depth: step.depth,
@@ -1572,8 +2359,21 @@ async function runCritiquePass(
   }
 }
 
-/** Pure: build a context document for the orchestrator recap call. */
-function buildRecapContext(task: TaskRow, project: ProjectRow, runs: RoleRunRow[], coverage: CoverageMap, criteriaResults: CriteriaResult[]): string {
+/** Pure: build a context document for the orchestrator recap call, shared
+ *  verbatim by both the prose recap (generateRecap) and the structured
+ *  follow-up proposal (generateRecapDecomposition) so they synthesize from
+ *  identical information. `existingChildren` — already-created child tasks —
+ *  is listed explicitly so a follow-up proposal doesn't duplicate whatever
+ *  the pipeline's own decomposition (or its atomic-synthesis fallback)
+ *  already spawned. */
+function buildRecapContext(
+  task: TaskRow,
+  project: ProjectRow,
+  runs: RoleRunRow[],
+  coverage: CoverageMap,
+  criteriaResults: CriteriaResult[],
+  existingChildren: TaskRow[],
+): string {
   const parts: string[] = [];
   parts.push(`# Recapitulation for: ${task.name ?? task.task_id.slice(0, 8)}`);
   parts.push(`Intake kind: ${task.intake_kind} · Exit kind: ${task.exit_kind} · Stage: ${task.stage}`);
@@ -1612,6 +2412,14 @@ function buildRecapContext(task: TaskRow, project: ProjectRow, runs: RoleRunRow[
     }
   }
 
+  if (existingChildren.length > 0) {
+    parts.push("");
+    parts.push("## Existing children (already created — do not propose a duplicate of any of these)");
+    for (const c of existingChildren) {
+      parts.push(`- **${c.name ?? c.task_id.slice(0, 8)}** — level: ${c.level ?? "task"}, stage: ${c.stage}, exit_kind: ${c.exit_kind ?? "n/a"}`);
+    }
+  }
+
   parts.push("");
   parts.push(
     `## Your task now\n` +
@@ -1629,28 +2437,30 @@ function buildRecapContext(task: TaskRow, project: ProjectRow, runs: RoleRunRow[
 /**
  * Run a one-shot recap call through the LLM to synthesize a final disposition
  * for the task after all role runs have completed. Uses the existing roleRunner
- * seam so it is testable without a live model.
+ * seam so it is testable without a live model. `context` is shared verbatim
+ * with generateRecapDecomposition (see buildRecapContext) so both calls
+ * synthesize from identical information, built once by the caller.
  */
 async function generateRecap(
   task: TaskRow,
   project: ProjectRow,
-  runs: RoleRunRow[],
-  coverage: CoverageMap,
-  criteriaResults: CriteriaResult[],
+  context: string,
 ): Promise<string | null> {
   const { connection, modelId } = resolveConnectionForModel(
     task.model || project.default_model || null,
     project.id,
   );
   const planningDir = project.planning_dir || "PLANNING";
-  const context = buildRecapContext(task, project, runs, coverage, criteriaResults);
   const repoPath = taskRepoPath(task, project);
 
   try {
     const result = await roleRunner({
       repoPath,
       planningDir,
-      artifactAbsPath: path.join(repoPath, planningDir, "REFINING", `${task.task_id.slice(0, 8)}.md`),
+      // "" on purpose: the recap is stored on the task row (recap_md), not the
+      // REFINING artifact — passing a path here would register report_section
+      // and invite the model to append the recap to the artifact.
+      artifactAbsPath: "",
       modelId,
       systemPrompt:
         "You are the orchestration layer performing a final recap of a multi-role refinement pipeline. " +
@@ -1668,6 +2478,73 @@ async function generateRecap(
   } catch (err) {
     console.error(`[orchestrator] recap call failed for task ${task.task_id.slice(0, 8)}: ${(err as Error).message}`);
     return null;
+  }
+}
+
+/** Independent of the idle-watchdog timeout scoped to normal role steps —
+ *  this call is small, separate, and must never let a hung/slow model block
+ *  a task's own finalization. */
+const RECAP_DECOMPOSITION_TIMEOUT_MS = 60_000;
+
+/**
+ * A small, separate structured-output call (not the free-text prose recap)
+ * asking whether the just-finished task's full history suggests any concrete,
+ * independently-actionable follow-up work — reusing the same Subtask schema/
+ * semantics the pipeline decomposition role uses, via the record_findings
+ * contract every role call already exposes (agent.ts's RoleFindings; no
+ * agent.ts change needed). Proposing nothing is a completely normal outcome
+ * here — unlike the pipeline decomposition role, declining is never treated
+ * as a failure. Timeout or error is swallowed the same way: never escalates,
+ * never blocks the task's own finalization.
+ */
+async function generateRecapDecomposition(
+  task: TaskRow,
+  project: ProjectRow,
+  context: string,
+): Promise<{ subtasks: Subtask[]; no_decomposition_reason?: string } | null> {
+  const { connection, modelId } = resolveConnectionForModel(
+    task.model || project.default_model || null,
+    project.id,
+  );
+  const planningDir = project.planning_dir || "PLANNING";
+  const repoPath = taskRepoPath(task, project);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RECAP_DECOMPOSITION_TIMEOUT_MS);
+  try {
+    const result = await roleRunner({
+      repoPath,
+      planningDir,
+      artifactAbsPath: "",
+      modelId,
+      systemPrompt:
+        "You are reviewing a just-finished task's complete history to propose concrete follow-up work. " +
+        "Do NOT use any tools — simply read the context and respond directly. " +
+        "If, and only if, you identify genuinely concrete, independently-actionable follow-ups that are " +
+        "NOT already listed under 'Existing children' — e.g. missing test coverage, manual or end-to-end " +
+        "verification, a documented-but-deferred piece of the work — propose them as a `subtasks` array, " +
+        "one entry per follow-up, every entry `level: \"task\"` (never epic/story: you are proposing point " +
+        "follow-ups, not re-planning a tree), each fully scoped via brief/acceptance_criteria so a developer " +
+        "or tester could act on it directly, and set execution_ready: true when it needs no further " +
+        "requirements/architecture analysis. It is completely normal and expected to propose nothing — do " +
+        "not force a follow-up that isn't genuinely there, and do not propose vague/open-ended research " +
+        "items. `no_decomposition_reason` is optional here; leaving both subtasks and it empty is fine.",
+      tools: [],
+      context,
+      thinkingBudgets: connection.thinkingBudgets,
+      connection,
+      signal: controller.signal,
+    });
+    return {
+      subtasks: result.findings.subtasks ?? [],
+      no_decomposition_reason: result.findings.no_decomposition_reason,
+    };
+  } catch (err) {
+    console.warn(
+      `[orchestrator] recap-decomposition call failed/timed out for task ${task.task_id.slice(0, 8)}: ${(err as Error).message}`,
+    );
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1718,7 +2595,7 @@ async function maybeAssessEscalation(
     ]),
   ];
 
-  const { modelId } = resolveConnectionForModel(
+  const { connection, modelId } = resolveConnectionForModel(
     task.model || project.default_model || null,
     project.id,
   );
@@ -1743,6 +2620,7 @@ async function maybeAssessEscalation(
       taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
+      connection,
     );
 
     console.log(
@@ -1860,7 +2738,7 @@ async function maybeAssessBorderline(
     unmetMust.some((c) => c.ownerRole === r.role_key),
   );
 
-  const { modelId } = resolveConnectionForModel(
+  const { connection, modelId } = resolveConnectionForModel(
     task.model || project.default_model || null,
     project.id,
   );
@@ -1900,6 +2778,7 @@ async function maybeAssessBorderline(
       taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
+      connection,
     );
 
     console.log(
@@ -1976,7 +2855,7 @@ async function maybeSecondReview(
   coverage: CoverageMap,
   routerCfg: RouterConfig,
 ): Promise<SecondReviewResult> {
-  const { modelId } = resolveConnectionForModel(
+  const { connection, modelId } = resolveConnectionForModel(
     task.model || project.default_model || null,
     project.id,
   );
@@ -1997,6 +2876,7 @@ async function maybeSecondReview(
       taskRepoPath(task, project),
       project.planning_dir || "PLANNING",
       modelId,
+      connection,
     );
 
     console.log(
@@ -2034,12 +2914,32 @@ function isTerminalForFamily(t: TaskRow): boolean {
  * today's per-task behavior. Never throws — reconcileBranch itself is
  * best-effort and folds git errors into an "error" status instead.
  */
-function maybeReconcileFamily(task: TaskRow, repoPath: string): void {
+function maybeReconcileFamily(task: TaskRow, project: ProjectRow, repoPath: string): void {
   if (!task.git_branch || !task.git_base_branch) return;
   const family = familyMembers(task);
   const root = family.find((t) => t.task_id === familyRootId(task));
   if (!root || !family.every(isTerminalForFamily)) return; // not everyone settled yet — defer
   if (family.some((t) => t.wrote_source === 1)) {
+    // The family-wide "did the branch as a whole reach base" decision follows
+    // the ROOT's own autonomy level, not the individual triggering task's or
+    // "any member is auto" — reconcile_status/detail are written only onto
+    // the root's row and are what the client reads (the "review branch" pill,
+    // ReviewCTA, WorktreeKanban), so the policy governing that state should be
+    // root-owned too. This doesn't stop an individually-"auto"-overridden
+    // child from getting its own immediate merge attempt the moment its own
+    // checks pass (see the code_change terminal branch) — it only means this
+    // family-wide bookkeeping follows the root's setting.
+    if (effectiveAutonomyLevel(root, project) === "auto") {
+      const reconciled = reconcileBranch(repoPath, root.git_branch!, root.git_base_branch!);
+      updateTask(root.task_id, { reconcile_status: reconciled.status, reconcile_detail: reconciled.detail ?? null });
+      if (reconciled.status === "conflict" || reconciled.status === "error") {
+        console.warn(
+          `[git] auto-merge ${reconciled.status} for family ${root.task_id.slice(0, 8)}: ${reconciled.detail}`,
+        );
+      }
+      publish(root.task_id, "task_update", { reconcileStatus: reconciled.status });
+      return;
+    }
     updateTask(root.task_id, {
       reconcile_status: "pending_human_merge",
       reconcile_detail: "task or a family member wrote source code — merge requires manual review",
@@ -2064,7 +2964,10 @@ async function applyGate(
   step: PlanStep,
   verdict: string,
   coverage: CoverageMap,
-  criteriaResults: CriteriaResult[] = [],
+  /** What the counter-reviewer itself reported. Merged below with the
+   *  deterministic evidence checks (PLANNING/overhaul/05), which win for their
+   *  own criterion ids — a model does not get to grade the test run. */
+  reportedCriteriaResults: CriteriaResult[] = [],
   routerCfg: RouterConfig | null = null,
   /** When the verdict was overridden by the adversarial critique or the
    *  orchestrator's second review, a short explanation appended to escalation
@@ -2081,6 +2984,19 @@ async function applyGate(
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const coverageJson = JSON.stringify(coverage);
   const repoPath = taskRepoPath(task, project);
+  const flow = flowForTask(task, execCommandNames(project));
+
+  // Grounded verification (PLANNING/overhaul/05). Evidence criteria are settled
+  // here, from `role_runs.evidence_json`, before any verdict is consulted — the
+  // reviewer's opinion of `exec.tests_pass` is discarded in favour of whether a
+  // green run exists. Resolved once at the top so every downstream consumer
+  // (the gate, the loop-back steer note, the escalation reason, the recap) sees
+  // the same authoritative list.
+  const evidenceChecks = checkEvidenceCriteria(
+    task.task_id,
+    flow.criteria.filter((c) => c.evidence),
+  );
+  const criteriaResults = mergeCriteriaResults(reportedCriteriaResults, evidenceChecks);
 
   const escalate = (reason: string) => {
     const dest = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}REVIEW${path.sep}`);
@@ -2101,7 +3017,15 @@ async function applyGate(
   /** Fire-and-forget: generate a recap for a task that just reached terminal state. */
   const triggerRecap = (finalCoverage: CoverageMap, finalCriteria: CriteriaResult[]) => {
     publish(task.task_id, "recap_start", {});
-    generateRecap(task, project, listRoleRuns(task.task_id), finalCoverage, finalCriteria).then(
+    const context = buildRecapContext(
+      getTask(task.task_id) ?? task,
+      project,
+      listRoleRuns(task.task_id),
+      finalCoverage,
+      finalCriteria,
+      listTasks({ parentTaskId: task.task_id }),
+    );
+    generateRecap(task, project, context).then(
       (recapMd) => {
         if (recapMd) updateTask(task.task_id, { recap_md: recapMd });
         publish(task.task_id, "recap_end", { success: true });
@@ -2114,6 +3038,69 @@ async function applyGate(
       },
     );
   };
+
+  /**
+   * Awaited (unlike triggerRecap): fires the same fire-and-forget prose recap
+   * unchanged, then — only for a task whose own lineage hasn't already gone
+   * through this once (`origin_role_key !== "recap"`, the recursion bound) —
+   * awaits a small, timeout-bounded proposal for additional concrete follow-up
+   * subtasks recap itself identifies (tests, verification, deferred pieces),
+   * spawning any of them as real children tagged `origin_role_key: "recap"`
+   * BEFORE this function returns. Wired only into the generic "ready"
+   * finalization path (spec + research_brief exit kinds) — never the
+   * code_change branch, which keeps its own unawaited triggerRecap call
+   * unchanged: a task awaiting human merge approval doesn't get more
+   * automatic child-spawning piled onto it. Must run before
+   * maybeReconcileFamily at its call site so any spawned children exist
+   * before the family's settledness is evaluated.
+   */
+  async function finalizeRecapAndDecompose(
+    finalCoverage: CoverageMap,
+    finalCriteria: CriteriaResult[],
+  ): Promise<void> {
+    triggerRecap(finalCoverage, finalCriteria);
+    if (task.origin_role_key === "recap") return;
+
+    const context = buildRecapContext(
+      getTask(task.task_id) ?? task,
+      project,
+      listRoleRuns(task.task_id),
+      finalCoverage,
+      finalCriteria,
+      listTasks({ parentTaskId: task.task_id }),
+    );
+    const proposal = await generateRecapDecomposition(task, project, context);
+    if (!proposal) return;
+    const outcome = resolveDecompositionOutcome(
+      task,
+      verdict,
+      { subtasks: proposal.subtasks, noDecompositionReason: proposal.no_decomposition_reason },
+      { treatEmptyNoReasonAsFailure: false, synthesizeWholeTaskOnEmptyWithReason: false },
+    );
+    if (outcome.subtasks.length > 0) {
+      // Recap proposals are always "real" (this call site passes
+      // synthesizeWholeTaskOnEmptyWithReason: false above), so the family
+      // budget always applies here — recap-spawned children share the same
+      // pool as pipeline-spawned ones.
+      const budgetDecision = applyFamilyBudget(task, project, outcome.subtasks);
+      if (budgetDecision.truncatedCount > 0) {
+        createIntervention({
+          task_id: task.task_id,
+          kind: "steer_note",
+          payload_json: JSON.stringify({
+            text:
+              `[orchestrator·budget] This family's decomposition budget allows ${budgetDecision.budget.maxCount} ` +
+              `total subtasks (max depth ${budgetDecision.budget.maxDepth}); ${budgetDecision.truncatedCount} ` +
+              `recap-proposed subtask(s) exceeded it and were dropped.`,
+          }),
+          created_by: "orchestrator",
+        });
+      }
+      if (budgetDecision.allowedSubtasks.length > 0) {
+        createDecompositionChildren(task, project, budgetDecision.allowedSubtasks, { originRoleKey: "recap" });
+      }
+    }
+  }
 
   if (verdict === "needs_human") {
     // ---- Call Point 2: Escalation Assessment ----
@@ -2154,8 +3141,6 @@ async function applyGate(
     return;
   }
 
-  const flow = flowForTask(task);
-
   // Non-reviewer-step critique/second-review loop-back: a producer step whose
   // output was flagged by the adversarial critique or second review (not the
   // flow's static-criteria reviewerRole gate below). Bounded to one retry,
@@ -2193,13 +3178,35 @@ async function applyGate(
     const missingConcerns = flow.mandatoryConcerns.filter(
       (cc) => (coverage[cc]?.status ?? "never") !== "considered",
     );
-    const failed = verdict === "needs_more" || unmetMust.length > 0 || missingConcerns.length > 0;
+    // Distrust degraded review evidence (overhaul/04 §4): when the reviewer's
+    // own run degraded — a synthesized/fallback verdict or truncated output —
+    // its criteria_results are not trustworthy verification. Treat the gate as
+    // failed so the review re-runs rather than passing on unverified criteria
+    // (a fallback run's empty/defaulted criteria could otherwise slip through
+    // any path that only checks the verdict string).
+    const reviewerRun = latestPrimaryRun(task.task_id, step.role);
+    const reviewerHealth: RunHealth = reviewerRun
+      ? computeRunHealth(roleRunHealthInput(reviewerRun))
+      : "healthy";
+    const reviewUnverified = reviewerHealth === "degraded" || reviewerHealth === "empty";
+    // Unmet criteria that were decided by execution, not judgement
+    // (overhaul/05). Held separately because they are NOT negotiable below: a
+    // red test suite is a fact, and the borderline router — itself a model
+    // call — must not be able to reason a task past one.
+    const unmetEvidenceMust = evidenceChecks.filter(
+      (c) => !c.met && c.criterion.severity === "must",
+    );
+    const failed =
+      verdict === "needs_more" || unmetMust.length > 0 || missingConcerns.length > 0 || reviewUnverified;
 
     if (failed) {
       const attempts = step.attempts ?? 0;
 
       // ---- Call Point 3: Borderline Gate Assessment ----
-      if (routerCfg?.borderlineGateAssessment) {
+      // Skipped entirely when a must-have execution is red: "borderline" is a
+      // judgement call about ambiguous prose criteria, and there is nothing
+      // ambiguous about exit code 1.
+      if (routerCfg?.borderlineGateAssessment && unmetEvidenceMust.length === 0) {
         const borderlineResult = await maybeAssessBorderline(
           task,
           project,
@@ -2271,9 +3278,23 @@ async function applyGate(
         step.attempts = attempts + 1;
 
         // Feed the specific gaps back to the re-run roles via the steering channel.
+        const evidenceDetailById = new Map(evidenceChecks.map((c) => [c.criterion.id, c.detail]));
         const gaps = [
-          ...unmetMust.map((c) => `Unmet (${c.id}): ${c.text}`),
+          ...unmetMust.map((c) => {
+            const detail = evidenceDetailById.get(c.id);
+            // For an evidence criterion, say what actually happened — "tests
+            // were never run" and "tests ran and failed" need different fixes.
+            return detail
+              ? `Unmet (${c.id}): ${c.text} — recorded: ${detail}`
+              : `Unmet (${c.id}): ${c.text}`;
+          }),
           ...missingConcerns.map((cc) => `Concern not yet covered: ${cc}`),
+          ...(reviewUnverified
+            ? [
+                `The previous review run was ${reviewerHealth} (${runHealthReason(roleRunHealthInput(reviewerRun!))}) — ` +
+                  `re-verify every acceptance criterion against the real code and report a complete criteria_results.`,
+              ]
+            : []),
         ];
         if (gaps.length) {
           createIntervention({
@@ -2297,8 +3318,14 @@ async function applyGate(
       // Loop-backs exhausted → human review.
       const reason =
         `Acceptance review incomplete after ${flow.maxLoopbacks} loop-back(s).` +
+        (unmetEvidenceMust.length
+          ? ` Verification did not pass: ${unmetEvidenceMust
+              .map((c) => `${c.criterion.id} — ${c.detail}`)
+              .join("; ")}.`
+          : "") +
         (unmetMust.length ? ` Unmet: ${unmetMust.map((c) => `${c.text} (${c.id})`).join("; ")}.` : "") +
-        (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "");
+        (missingConcerns.length ? ` Concerns not covered: ${missingConcerns.join(", ")}.` : "") +
+        (reviewUnverified ? ` Review evidence unverified — last review run was ${reviewerHealth}.` : "");
       escalate(reason);
       triggerRecap(coverage, criteriaResults);
       return;
@@ -2308,6 +3335,48 @@ async function applyGate(
 
   // Terminal role finished cleanly → ready.
   if (isTerminalRole(task, step.role) || !nextPending(plan)) {
+    // READY health gate (overhaul/04 §4): a task must not reach a terminal
+    // ready/review state on a degraded or empty terminal run — that promotes a
+    // synthesized verdict as if it were sound. When enabled, loop back (bounded
+    // by the flow's maxLoopbacks, reusing the same cap that guards the
+    // acceptance gate against chronically weak models) then escalate to human
+    // REVIEW rather than looping forever. `recovered` (repair/resume produced a
+    // real verdict) is allowed through — only degraded/empty is blocked.
+    if (requireHealthyTerminal(project)) {
+      const terminalRun = latestPrimaryRun(task.task_id, step.role);
+      const terminalHealth: RunHealth = terminalRun
+        ? computeRunHealth(roleRunHealthInput(terminalRun))
+        : "healthy";
+      if (terminalHealth === "degraded" || terminalHealth === "empty") {
+        const attempts = step.attempts ?? 0;
+        const why = terminalRun ? runHealthReason(roleRunHealthInput(terminalRun)) : "no terminal run recorded";
+        if (attempts < flow.maxLoopbacks) {
+          step.status = "pending";
+          step.attempts = attempts + 1;
+          createIntervention({
+            task_id: task.task_id,
+            kind: "steer_note",
+            payload_json: JSON.stringify({
+              text: `[health gate · attempt ${attempts + 1}] The previous run was ${terminalHealth} (${why}). Re-run it to completion and record a real verdict — do not finalize on a synthesized one.`,
+            }),
+            created_by: "orchestrator",
+          });
+          updateTask(task.task_id, {
+            refinement_plan_json: JSON.stringify(plan),
+            coverage_json: coverageJson,
+            stage: "refining",
+          });
+          publish(task.task_id, "task_update", { stage: "refining", loopback: attempts + 1, healthGate: terminalHealth });
+          return;
+        }
+        escalate(
+          `Terminal run for ${step.role} is ${terminalHealth} (${why}) after ${flow.maxLoopbacks} loop-back(s) — ` +
+            `not promoting to ready on a synthesized/degraded verdict.`,
+        );
+        triggerRecap(coverage, criteriaResults);
+        return;
+      }
+    }
     // A can_create_subtasks role (decomposition) is expected to produce either a
     // subtask tree or an explicit reason it's already atomic. Zero subtasks with
     // no stated reason is a failed/incomplete breakdown, not an intentional
@@ -2322,15 +3391,22 @@ async function applyGate(
     const roleCfg = isSpecTerminal ? getRole(project.id, step.role) : undefined;
     let level = task.level ?? "task";
     let resolvedSubtasks: Subtask[] = [];
+    // Carries resolveDecompositionOutcome's synthesized flag past the block
+    // below (where `outcome` itself is scoped) out to the createDecompositionChildren
+    // call site further down — the synthesized single execution-ready leaf
+    // still needs to be spawned as a child even though `level` is deliberately
+    // NOT promoted to "story" for it (see the guard below).
+    let decompositionSynthesized = false;
     if (isSpecTerminal && roleCfg?.can_create_subtasks) {
       const runs = listRoleRuns(task.task_id);
       const decomp = [...runs].reverse().find((r) => r.role_key === step.role);
-      resolvedSubtasks = resolveDecompositionSubtasks(decomp).subtasks;
-      if (resolvedSubtasks.length === 0 && !decomp?.no_decomposition_reason?.trim()) {
-        const zeroSubtaskReason =
-          `Decomposition (verdict: ${verdict}) produced zero subtasks with no stated reason — this is ` +
-          `treated as a failed/incomplete breakdown, not an intentional atomic leaf. Approve to accept ` +
-          `as atomic, or reset to re-run decomposition.`;
+      const outcome = resolveDecompositionOutcome(
+        task,
+        verdict,
+        { subtasks: resolveDecompositionSubtasks(decomp).subtasks, noDecompositionReason: decomp?.no_decomposition_reason },
+        { treatEmptyNoReasonAsFailure: true, synthesizeWholeTaskOnEmptyWithReason: true },
+      );
+      if (outcome.failureReason) {
         // ---- Call Point 2: Escalation Assessment ----
         // Lets an unattended pipeline self-heal a failed decomposition (e.g. a
         // run that got cut off mid-generation, see agent.ts's twoPhase nudging)
@@ -2342,19 +3418,28 @@ async function applyGate(
             plan,
             step,
             verdict,
-            zeroSubtaskReason,
+            outcome.failureReason,
             routerCfg,
           );
           if (overridden) return;
         }
-        escalate(zeroSubtaskReason);
+        escalate(outcome.failureReason);
         triggerRecap(coverage, criteriaResults);
         return;
       }
+      resolvedSubtasks = outcome.subtasks;
+      decompositionSynthesized = outcome.synthesized;
       // Auto-promote a "task" level to "story" when the decomposition role
-      // produced a subtask tree — the model clearly intends this to be
+      // produced a REAL subtask tree — the model clearly intends this to be
       // decomposable; the default "task" level was just never overridden.
-      if (level === "task" && resolvedSubtasks.length > 0) {
+      // Explicitly excludes outcome.synthesized: that's the "no children,
+      // already atomic" terminal case (no_decomposition_reason), a valid
+      // pass condition, not a decomposition — promoting the level there
+      // would misrepresent an atomic task as a multi-child story. The single
+      // synthesized execution-ready child still gets spawned below (see the
+      // decompositionSynthesized check at the createDecompositionChildren
+      // call site) — only the misleading "story" relabeling is skipped.
+      if (level === "task" && resolvedSubtasks.length > 0 && !outcome.synthesized) {
         level = "story";
         updateTask(task.task_id, { level });
       }
@@ -2363,25 +3448,55 @@ async function applyGate(
     // An atomic execution leaf: `critic` passing means the code (if any was
     // written — see the developer role's write/edit tools gate) is ready for a
     // human to review and merge, not "ready for work" like a spec terminus.
-    // Unlike the generic path below, this never auto-reconciles the branch —
-    // merging only happens via the explicit "approve_merge" intervention
-    // (see the /api/tasks/:id/interventions route), regardless of whether
-    // wrote_source ended up true.
+    // At "edit" (the default) this never auto-reconciles the branch — merging
+    // only happens via the explicit "approve_merge" intervention (see the
+    // /api/tasks/:id/interventions route), regardless of whether wrote_source
+    // ended up true. At "auto", attempt the real merge here instead of
+    // parking indefinitely — falling back to exactly the "edit" behavior the
+    // moment there's a genuine conflict/error, never silently swallowing one.
     if ((task.exit_kind as ExitKind) === "code_change") {
       const destCC = relArtifact.replace(`${path.sep}REFINING${path.sep}`, `${path.sep}READY${path.sep}`);
       moveArtifact(path.join(repoPath, relArtifact), path.join(repoPath, destCC));
-      updateTask(task.task_id, {
-        refinement_plan_json: JSON.stringify(plan),
-        coverage_json: coverageJson,
-        stage: "review",
-        exit_state: "needs_merge_approval",
-        review_reason: task.wrote_source
-          ? "Code written — awaiting human review before merge."
-          : "Developer role ran without write/edit tools (dry-run) — review the described change before merge.",
-        artifact_path: destCC,
-        reconcile_status: "pending_human_merge",
-        reconcile_detail: task.wrote_source ? null : "no write/edit tools granted — nothing was committed",
-      });
+
+      let reconciled: { status: "merged" | "up_to_date" | "conflict" | "error"; detail?: string } | null = null;
+      if (effectiveAutonomyLevel(task, project) === "auto" && task.git_branch && task.git_base_branch) {
+        reconciled = reconcileBranch(repoPath, task.git_branch, task.git_base_branch);
+      }
+
+      if (reconciled && (reconciled.status === "merged" || reconciled.status === "up_to_date")) {
+        // Skips the human gate entirely — lands on exactly what the
+        // "approve_merge" intervention (approveCodeChangeMerge) would have
+        // produced, plus the reconcile bookkeeping fields.
+        updateTask(task.task_id, {
+          refinement_plan_json: JSON.stringify(plan),
+          coverage_json: coverageJson,
+          stage: "ready",
+          exit_state: "ready_for_work",
+          review_reason: null,
+          status: "complete",
+          artifact_path: destCC,
+          reconcile_status: reconciled.status,
+          reconcile_detail: reconciled.detail ?? null,
+        });
+        publish(task.task_id, "task_update", { stage: "ready" });
+      } else {
+        updateTask(task.task_id, {
+          refinement_plan_json: JSON.stringify(plan),
+          coverage_json: coverageJson,
+          stage: "review",
+          exit_state: "needs_merge_approval",
+          review_reason: task.wrote_source
+            ? "Code written — awaiting human review before merge."
+            : "Developer role ran without write/edit tools (dry-run) — review the described change before merge.",
+          artifact_path: destCC,
+          reconcile_status: reconciled ? reconciled.status : "pending_human_merge",
+          reconcile_detail: reconciled
+            ? (reconciled.detail ?? "auto-merge attempted and failed — falling back to manual review")
+            : (task.wrote_source ? null : "no write/edit tools granted — nothing was committed"),
+        });
+        publish(task.task_id, "task_update", { stage: "review", exit_state: "needs_merge_approval" });
+      }
+
       commitArtifacts(repoPath, [relArtifact, destCC], `review: ${task.name ?? task.task_id}`);
       triggerRecap(coverage, criteriaResults);
       if (task.git_base_branch) {
@@ -2393,13 +3508,12 @@ async function applyGate(
           );
         }
       }
-      publish(task.task_id, "task_update", { stage: "review", exit_state: "needs_merge_approval" });
-      // Doesn't merge anything itself (see the doc comment above), but may
-      // complete the family's settledness if this was the last member still
-      // outstanding — in which case maybeReconcileFamily will find every
-      // member wrote_source-checked and land on "pending_human_merge" for
-      // the whole family's shared branch, same as this task's own status.
-      maybeReconcileFamily(task, repoPath);
+      // Doesn't merge anything itself beyond this task's own branch above,
+      // but may complete the family's settledness if this was the last
+      // member still outstanding — in which case maybeReconcileFamily will
+      // find every member wrote_source-checked and apply the root's own
+      // autonomy level to the whole family's shared branch (see Gate 2b).
+      maybeReconcileFamily(task, project, repoPath);
       return;
     }
 
@@ -2414,13 +3528,50 @@ async function applyGate(
       status: "complete",
     });
     commitArtifacts(repoPath, [relArtifact, dest], `ready: ${task.name ?? task.task_id}`);
-    triggerRecap(coverage, criteriaResults);
-    if (isSpecTerminal && roleCfg?.can_create_subtasks && (level === "epic" || level === "story")) {
-      // Runs before the base-branch checkout below: each child gets its own
-      // branch created off base, which would otherwise leave the repo on the
-      // last child's branch instead of back where the parent task started.
-      createDecompositionChildren(task, project, resolvedSubtasks);
+    if (
+      isSpecTerminal &&
+      roleCfg?.can_create_subtasks &&
+      (level === "epic" || level === "story" || decompositionSynthesized)
+    ) {
+      // Runs before finalizeRecapAndDecompose below, so recap's "existing
+      // children" context reflects whatever the pipeline's own decomposition
+      // just spawned (never propose a duplicate) — and before the base-branch
+      // checkout further down: each child gets its own branch created off
+      // base, which would otherwise leave the repo on the last child's branch
+      // instead of back where the parent task started. decompositionSynthesized
+      // covers the "no children, already atomic" case: level stays "task"
+      // (not promoted), but the single synthesized execution-ready leaf still
+      // needs to be spawned so it can route to the developer/critic flow —
+      // that node's whole purpose is to END the recursion, so it bypasses the
+      // family budget below rather than risk being budget-blocked into a
+      // dead-ended spec with no path to execution.
+      if (decompositionSynthesized) {
+        createDecompositionChildren(task, project, resolvedSubtasks);
+      } else {
+        const budgetDecision = applyFamilyBudget(task, project, resolvedSubtasks);
+        if (budgetDecision.truncatedCount > 0) {
+          createIntervention({
+            task_id: task.task_id,
+            kind: "steer_note",
+            payload_json: JSON.stringify({
+              text:
+                `[orchestrator·budget] This family's decomposition budget allows ${budgetDecision.budget.maxCount} ` +
+                `total subtasks (max depth ${budgetDecision.budget.maxDepth}, based on the root task's ` +
+                `effort_size); ${budgetDecision.truncatedCount} proposed ${budgetDecision.depthBlocked ? "non-leaf " : ""}` +
+                `subtask(s) exceeded it and were dropped. Consolidate scope rather than asking for more.`,
+            }),
+            created_by: "orchestrator",
+          });
+        }
+        if (budgetDecision.allowedSubtasks.length > 0) {
+          createDecompositionChildren(task, project, budgetDecision.allowedSubtasks);
+        }
+      }
     }
+    // Awaited (unlike the code_change branch's plain triggerRecap above) so
+    // any recap-spawned children exist before maybeReconcileFamily runs below
+    // — otherwise they could arrive after the family already merged.
+    await finalizeRecapAndDecompose(coverage, criteriaResults);
     // Accepted — reconcile the task's branch back into base before returning
     // the shared checkout there. Best-effort: a conflict/error is recorded as
     // a flag on the task (not a blocking state) and never prevents "ready" —
@@ -2444,7 +3595,7 @@ async function applyGate(
       // task's worktree family (itself, for a solo/no-children task) has
       // reached a terminal state — merging a shared branch while a sibling is
       // still mid-flight would pull in unfinished work. See maybeReconcileFamily.
-      maybeReconcileFamily(task, repoPath);
+      maybeReconcileFamily(task, project, repoPath);
     }
     if (task.git_base_branch) {
       try {
@@ -2542,6 +3693,109 @@ export function resolveDecompositionSubtasks(
   return { subtasks: [], legacy: false };
 }
 
+export interface DecompositionOutcome {
+  subtasks: Subtask[];
+  /** Set only when `treatEmptyNoReasonAsFailure` is true and the result was
+   *  genuinely empty with no stated reason — the caller should escalate on
+   *  this message rather than finalize. */
+  failureReason: string | null;
+  /** True when `subtasks` is the single synthesized execution-ready node from
+   *  the `synthesizeWholeTaskOnEmptyWithReason` branch, i.e. the model
+   *  declared the whole task already atomic — NOT a real decomposition.
+   *  Callers must not treat this as "the model chose to decompose" (e.g. the
+   *  task→story auto-promotion below must not fire on it). */
+  synthesized: boolean;
+}
+
+/**
+ * Turn a decomposition-capable call's raw {subtasks, no_decomposition_reason}
+ * output into a resolved outcome. Shared by the pipeline decomposition role's
+ * own terminal-step gate and the recap-driven follow-up proposal (see
+ * generateRecapDecomposition) — the two callers want different handling of an
+ * empty result, hence the opts:
+ *
+ * - `treatEmptyNoReasonAsFailure`: zero subtasks with no stated reason is a
+ *   failed/incomplete breakdown for the pipeline decomposition role (it's
+ *   REQUIRED to explain itself), but a completely normal, un-escalated outcome
+ *   for recap (proposing nothing is expected far more often than not).
+ * - `synthesizeWholeTaskOnEmptyWithReason`: zero subtasks WITH a reason means
+ *   decomposition judged the *whole task* atomic — fully scoped, no further
+ *   analysis needed, a developer could implement it directly. That's the same
+ *   judgement `execution_ready: true` expresses on an individual subtask node,
+ *   just applied to the task as a whole. Synthesizing a single execution-ready
+ *   node here reuses createDecompositionChildren unchanged: it spins up one
+ *   child that skips straight to the developer/critic execution flow instead
+ *   of dead-ending at spec-ready with nothing but prose. Recap opts out of
+ *   this — it isn't the authority on "should this become one execution leaf,"
+ *   only on "here are additional concrete follow-ups I noticed."
+ */
+export function resolveDecompositionOutcome(
+  task: TaskRow,
+  verdict: string,
+  raw: { subtasks: Subtask[]; noDecompositionReason?: string | null },
+  opts: { treatEmptyNoReasonAsFailure: boolean; synthesizeWholeTaskOnEmptyWithReason: boolean },
+): DecompositionOutcome {
+  let subtasks = raw.subtasks;
+  const reason = raw.noDecompositionReason?.trim();
+
+  if (subtasks.length === 0 && !reason && opts.treatEmptyNoReasonAsFailure) {
+    return {
+      subtasks: [],
+      failureReason:
+        `Decomposition (verdict: ${verdict}) produced zero subtasks with no stated reason — this is ` +
+        `treated as a failed/incomplete breakdown, not an intentional atomic leaf. Approve to accept ` +
+        `as atomic, or reset to re-run decomposition.`,
+      synthesized: false,
+    };
+  }
+
+  let synthesized = false;
+  if (subtasks.length === 0 && reason && opts.synthesizeWholeTaskOnEmptyWithReason) {
+    synthesized = true;
+    subtasks = [
+      {
+        local_id: "1",
+        level: "task",
+        name: task.name ?? `Implement: ${task.task_id.slice(0, 8)}`,
+        brief: reason,
+        acceptance_criteria: task.acceptance_criteria
+          ? (JSON.parse(task.acceptance_criteria) as string[])
+          : [],
+        context_to_carry_forward: task.content ?? "",
+        execution_ready: true,
+      },
+    ];
+  }
+
+  return { subtasks, failureReason: null, synthesized };
+}
+
+/**
+ * A flat listing of every OTHER task in `task`'s family (name/level/stage),
+ * reached via familyRootId — not just the immediate parent's children.
+ * Injected into decomposition's (and explorer's) context in buildRoleContext
+ * so a new epic/story doesn't redo work a sibling or cousin branch already
+ * produced. Complements buildParentDigest, which only reaches the immediate
+ * parent's own role history, not the rest of the tree. Returns null when
+ * there's nothing else in the family yet (a fresh root, or the first child).
+ */
+function buildFamilyManifest(task: TaskRow): string | null {
+  const others = familyMembers(task).filter((t) => t.task_id !== task.task_id);
+  if (!others.length) return null;
+  const lines = others
+    .slice()
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
+    .map((t) => `- [${t.level ?? "task"}] ${t.name ?? t.task_id.slice(0, 8)} (${t.stage ?? "?"})`);
+  return [
+    "\n## Already exists in this family — do not recreate",
+    "Every other epic/story/task already spawned for this same root work, across every branch (not just " +
+      "your own parent's other children). If your proposed breakdown would duplicate one of these, reuse " +
+      "or reference it by name instead of proposing a new node for the same work; if the whole family " +
+      "already covers this task's scope, that's a strong signal you're done — set no_decomposition_reason.",
+    ...lines,
+  ].join("\n");
+}
+
 /**
  * Build a right-sized digest of a parent task for a child that needs grounding
  * but not the parent's full history: a capped excerpt of the original intake,
@@ -2554,17 +3808,16 @@ export function buildParentDigest(
   opts: { focusLabel: string; focusText: string; contextLine?: string; instructionFooter?: string },
 ): string {
   const excerpt = parent.content?.trim() ?? "";
-  const truncatedExcerpt =
-    excerpt.length > 600 ? `${excerpt.slice(0, 600)}…` : excerpt || "(no original intake text)";
+  const truncatedExcerpt = excerpt ? capHeadTail(excerpt, 450, 150) : "(no original intake text)";
 
+  // Generalizes over step digests (PLANNING/overhaul/07 §2) instead of hand-
+  // truncating `summary`: priorRunGist prefers a generated digest, then the
+  // role's own carry_forward handoff, falling back to a capped summary only
+  // when neither exists (rows predating this feature).
   const runs = listRoleRuns(parent.task_id).slice(-6);
   const findingsLines = runs.length
     ? runs
-        .map((r) => {
-          const summary = (r.summary ?? "").trim();
-          const truncated = summary.length > 200 ? `${summary.slice(0, 200)}…` : summary;
-          return `- **${r.role_key}** (${r.verdict ?? "unknown"}): ${truncated || "(no summary)"}`;
-        })
+        .map((r) => `- **${r.role_key}** (${r.verdict ?? "unknown"}): ${priorRunGist(r)}`)
         .join("\n")
     : "(no prior findings yet)";
 
@@ -2588,6 +3841,107 @@ export function buildParentDigest(
   return parts.join("\n");
 }
 
+/**
+ * Family-wide decomposition budget, keyed by the ROOT task's own effort_size
+ * — not one budget per node. A per-node cap alone doesn't stop an epic from
+ * spawning another epic that spawns another epic (each individual call stays
+ * "within its own limit" while the tree keeps growing); sharing one pool
+ * across the whole family is what actually bounds total fanout and depth.
+ * maxDepth counts non-leaf generations only: epic(0) → story(1) → task(2)
+ * for an "M" family, for instance. XS gets (0, 0) — an XS-sized family should
+ * never legitimately reach decomposition at all (see the fast path), so if it
+ * somehow does, this refuses everything and forces the task to finalize as a
+ * bare spec instead of spawning more structure.
+ */
+export const EFFORT_BUDGET: Record<EffortSize, { maxCount: number; maxDepth: number }> = {
+  XS: { maxCount: 0, maxDepth: 0 },
+  S: { maxCount: 4, maxDepth: 1 },
+  M: { maxCount: 12, maxDepth: 2 },
+  L: { maxCount: 30, maxDepth: 3 },
+  XL: { maxCount: 60, maxDepth: 4 },
+};
+
+/** Falls back to "M" when explorer hasn't set an effort_size yet (e.g. flows
+ *  that lack an explorer step, or rows predating this feature) — a mid-sized
+ *  default is safer than either extreme: it won't silently allow an XL-scale
+ *  runaway tree, and it won't hard-block a family that just hasn't reported. */
+const DEFAULT_EFFORT_SIZE: EffortSize = "M";
+
+/** How the family's budget scales with the project/task-level planning_rigor
+ *  setting (see planning-rigor.ts) — independent of effort_size: size answers
+ *  "how big is this really," rigor answers "how much process per unit of size." */
+const RIGOR_MULTIPLIER: Record<PlanningRigor, number> = { minimal: 0.6, standard: 1, thorough: 1.5 };
+
+export function resolveFamilyBudget(
+  root: TaskRow,
+  rigor: PlanningRigor = DEFAULT_PLANNING_RIGOR,
+): { maxCount: number; maxDepth: number } {
+  const size = (root.effort_size as EffortSize | null) ?? DEFAULT_EFFORT_SIZE;
+  const base = EFFORT_BUDGET[size] ?? EFFORT_BUDGET[DEFAULT_EFFORT_SIZE];
+  const mult = RIGOR_MULTIPLIER[rigor] ?? 1;
+  return { maxCount: Math.max(0, Math.ceil(base.maxCount * mult)), maxDepth: base.maxDepth };
+}
+
+/** How many ancestor hops `task` is from its family root (root itself = 0).
+ *  No depth column exists on the row — the family tree is expected to stay
+ *  small (that's the whole point of the budget), so walking parent_task_id
+ *  one row at a time is cheap enough not to warrant caching it. */
+function taskDepth(task: TaskRow): number {
+  let depth = 0;
+  let current = task;
+  while (current.parent_task_id) {
+    const parent = getTask(current.parent_task_id);
+    if (!parent) break;
+    depth++;
+    current = parent;
+  }
+  return depth;
+}
+
+interface FamilyBudgetDecision {
+  allowedSubtasks: Subtask[];
+  truncatedCount: number;
+  depthBlocked: boolean;
+  budget: { maxCount: number; maxDepth: number };
+}
+
+/**
+ * Applies the family-wide budget to a REAL (model-produced, non-synthesized)
+ * decomposition proposal. Deliberately NOT applied to the
+ * resolveDecompositionOutcome-synthesized single execution-ready leaf (the
+ * "no children, already atomic" terminal case) — that node's entire purpose
+ * is to END the recursion, not continue it, so budget-blocking it would
+ * strand the task at spec-ready with no path to execution. Callers should
+ * skip this and call createDecompositionChildren directly when
+ * decompositionSynthesized is true.
+ */
+export function applyFamilyBudget(
+  task: TaskRow,
+  project: ProjectRow,
+  subtasks: Subtask[],
+): FamilyBudgetDecision {
+  const root = getTask(familyRootId(task)) ?? task;
+  const budget = resolveFamilyBudget(root, effectivePlanningRigor(root, project));
+  const existingCount = familyMembers(task).length;
+  const parentDepth = taskDepth(task);
+  const depthBlocked = parentDepth + 1 > budget.maxDepth;
+  // At the depth ceiling, only already execution-ready task-level leaves may
+  // still be created (they terminate, they don't extend the tree); proposed
+  // epic/story nodes are dropped outright rather than coerced into a leaf
+  // shape the model never actually described.
+  const candidates = depthBlocked
+    ? subtasks.filter((n) => n.level === "task" && n.execution_ready === true)
+    : subtasks;
+  const remaining = Math.max(0, budget.maxCount - existingCount);
+  const allowedSubtasks = candidates.slice(0, remaining);
+  return {
+    allowedSubtasks,
+    truncatedCount: subtasks.length - allowedSubtasks.length,
+    depthBlocked,
+    budget,
+  };
+}
+
 /** Create child tasks from a resolved decomposition subtask list, so the
  *  scheduler discovers and refines them through the normal pipeline. Each
  *  child is seeded with its own brief/acceptance criteria/carried-forward
@@ -2597,7 +3951,12 @@ export function buildParentDigest(
  *  `depends_on` can reference a sibling created later in iteration order:
  *  pass 1 creates every child (collecting local_id → task_id), pass 2 resolves
  *  each child's depends_on through that map and persists depends_on_json. */
-function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtasks: Subtask[]): void {
+function createDecompositionChildren(
+  task: TaskRow,
+  project: ProjectRow,
+  subtasks: Subtask[],
+  opts?: { originRoleKey?: string },
+): void {
   if (!subtasks.length) return;
 
   const planningDir = project.planning_dir || "PLANNING";
@@ -2605,6 +3964,12 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
   const localIdToTaskId = new Map<string, string>();
   const created: Array<{ node: Subtask; child: TaskRow }> = [];
   let step = 0;
+  // Resolved once — a "plan"-level parent never lets a spawned child become
+  // an execution leaf (see the isExecutionLeaf computation below), and every
+  // child snapshots this same resolved value onto its own autonomy_level
+  // column so the family is homogeneous by default (see the per-child
+  // updateTask call below).
+  const parentLevel = effectiveAutonomyLevel(task, project);
 
   for (const node of subtasks) {
     const sections: string[] = [`## Task: ${node.name}`];
@@ -2626,7 +3991,10 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
     // execution flow instead of re-entering planning (see flowForTask /
     // runTaskStepOnce). Only honored on a "task"-level node — epics/stories
     // always need their own decomposition pass regardless of what the model set.
-    const isExecutionLeaf = node.level === "task" && node.execution_ready === true;
+    // A "plan"-level parent refuses this regardless of execution_ready — plan
+    // mode must stop at any point where it would otherwise begin writing code.
+    const isExecutionLeaf =
+      node.level === "task" && node.execution_ready === true && parentLevel !== "plan";
 
     let child = createTask({
       name: node.name,
@@ -2643,6 +4011,10 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
       acceptance_criteria: node.acceptance_criteria?.length
         ? JSON.stringify(node.acceptance_criteria)
         : null,
+      // Tags recap-spawned children (opts.originRoleKey: "recap") so the
+      // recursion bound in finalizeRecapAndDecompose can refuse to run again
+      // on this child's own eventual recap — caps every lineage at one hop.
+      origin_role_key: opts?.originRoleKey ?? null,
     });
     // Joins the parent's worktree family (root_task_id was set at
     // createTask() above), so this reuses the family's shared worktree/branch
@@ -2656,7 +4028,12 @@ function createDecompositionChildren(task: TaskRow, project: ProjectRow, subtask
       path.join(childRepo, relArtifact),
       `# ${node.name}\n\n> Child of: **${parentName}** · level: \`${node.level}\`\n\n${content}\n`,
     );
-    updateTask(child.task_id, { artifact_path: relArtifact });
+    // Snapshot, not a live pointer: if the project default changes later,
+    // already-spawned children are unaffected — same pattern as task.model
+    // snapshotting a resolved model rather than re-reading
+    // project.default_model forever. A human can still override this one
+    // child individually afterward via the task-level selector.
+    updateTask(child.task_id, { artifact_path: relArtifact, autonomy_level: parentLevel });
     commitArtifacts(childRepo, [relArtifact], `intake(child): ${node.name}`);
     publish(child.task_id, "task_update", { stage: "intake" });
 
@@ -2741,6 +4118,36 @@ export function dependenciesSatisfied(task: TaskRow): boolean {
   return deps.every((id) => getTask(id)?.stage === "ready");
 }
 
+/** Whether any intervention on this task's family was authored by a human
+ *  (`created_by: "user"`, the default for every route the client calls,
+ *  vs. "router"/"orchestrator"/"critic" for internal ones) — the signal that
+ *  promotes a watcher-originated task into the human-preempt scheduling class
+ *  once a person has actually engaged with it (PLANNING/overhaul/08 §3). */
+function hasHumanTouch(rootTaskId: string): boolean {
+  return listInterventions(rootTaskId).some((iv) => iv.created_by === "user");
+}
+
+/** 0 (human-preempt class) for a human-origin task, or a watcher-origin task
+ *  a human has since touched; 1 (watcher class) for a plain untouched
+ *  watcher-origin task. Human work always preempts pure watcher work. */
+function schedulingClass(task: TaskRow): 0 | 1 {
+  if ((task.origin ?? "human") === "human") return 0;
+  return hasHumanTouch(familyRootId(task)) ? 0 : 1;
+}
+
+/** Whether a project's autonomy config currently permits dispatching a
+ *  watcher-class task: the kill-switch is on, the schedule window (if any)
+ *  is open, and the idle-window budget isn't exhausted. This is what makes
+ *  flipping the kill-switch or exhausting a budget take effect within one
+ *  tick for tasks already sitting in the queue — no separate cancellation
+ *  path needed, `pickNextTasks` just stops selecting them. */
+function autonomyAllowsWatcherDispatch(project: ProjectRow): boolean {
+  const cfg = resolveAutonomyConfig(project.config_json);
+  if (!cfg.enabled) return false;
+  if (!isWithinActiveHours(cfg.activeHours, new Date())) return false;
+  return !getOrResetIdleWindowBudget(project.id, cfg).exhausted;
+}
+
 function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRow }> {
   const picked: Array<{ task: TaskRow; project: ProjectRow }> = [];
   // Claimed incrementally (not just checked against inFlightTasks) so two
@@ -2748,11 +4155,25 @@ function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRo
   // within the same round — only the first one found gets to run.
   const claimedFamilies = new Set<string>();
   for (const project of listProjects()) {
+    let watcherDispatchAllowed: boolean | undefined;
     const candidates = listTasks({ projectId: project.id })
       .filter(
         (t) => (t.stage === "intake" || t.stage === "refining") && (t.paused ?? 0) === 0 && dependenciesSatisfied(t),
       )
-      .sort((a, b) => a.updated_at.localeCompare(b.updated_at));
+      .filter((t) => {
+        if (schedulingClass(t) === 0) return true;
+        // Computed lazily, once per project per round — this project may have
+        // no watcher-origin candidates at all in the common case.
+        watcherDispatchAllowed ??= autonomyAllowsWatcherDispatch(project);
+        return watcherDispatchAllowed;
+      })
+      .sort((a, b) => {
+        const classDiff = schedulingClass(a) - schedulingClass(b);
+        if (classDiff) return classDiff;
+        const priorityDiff = (b.priority ?? 3) - (a.priority ?? 3);
+        if (priorityDiff) return priorityDiff;
+        return a.updated_at.localeCompare(b.updated_at);
+      });
     for (const task of candidates) {
       const key = familyRootId(task);
       if (inFlightTasks.has(key) || claimedFamilies.has(key)) continue;
@@ -2782,6 +4203,13 @@ function dispatchTask(taskId: string): Promise<void> {
   });
 }
 
+/** Below this length, a decomposition child's inherited content is treated as
+ *  too thin to skip intake_triage/explorer on (see runTaskStepOnce) — a
+ *  defensive floor rather than the primary gate; createDecompositionChildren
+ *  assembles a name + brief + parent digest for every child, which in
+ *  practice always clears this by a wide margin. */
+const MIN_CHILD_CONTENT_TO_SKIP_INTAKE = 80;
+
 /** Do one unit of work for a single already-picked task: ensure a plan,
  *  consume interventions, then advance (or finalize) the next step. Extracted
  *  from the old single-task `tickOnce` body so it can be dispatched for
@@ -2806,6 +4234,25 @@ async function runTaskStepOnce(taskId: string): Promise<void> {
     // an execution leaf, whose minimal developer/critic flow is deliberate,
     // not the inherited intake_kind's usual planning role set.
     if (!isExecutionLeaf) plan = withPromotedRoles(project, task, plan);
+    // A non-leaf decomposition child (level epic/story, or a task-level child
+    // that wasn't flagged execution_ready) already inherited its brief/
+    // acceptance-criteria/context_to_carry_forward from the parent's
+    // decomposition output, plus the family manifest (buildFamilyManifest) —
+    // intake_triage and explorer's entire job is establishing "what is this"
+    // and "which files," which that content already answers. Re-running them
+    // from scratch on every generation is exactly what let three back-to-back
+    // epics each independently re-explore the same two files (see the
+    // family-budget work above). Skip both UNLESS the inherited content looks
+    // too thin to have actually answered that — a defensive floor, not the
+    // primary gate, since createDecompositionChildren always assembles a
+    // non-trivial content block (name + brief + parent digest) in practice.
+    if (
+      !isExecutionLeaf &&
+      task.task_type === "child" &&
+      (task.content?.trim().length ?? 0) >= MIN_CHILD_CONTENT_TO_SKIP_INTAKE
+    ) {
+      plan = { steps: plan.steps.filter((s) => s.role !== "intake_triage" && s.role !== "explorer") };
+    }
     updateTask(task.task_id, {
       refinement_plan_json: JSON.stringify(plan),
       stage: "refining",
@@ -2864,6 +4311,57 @@ export async function tickOnce(limit: number): Promise<boolean> {
 
 export function tick(): Promise<boolean> {
   return tickOnce(1);
+}
+
+/**
+ * Delete a task and, once no other family member still needs it, its
+ * worktree. Serialized through `serializeTask` (keyed on the task's family
+ * lock, like every other worktree-mutating entry point below) so a delete can
+ * never race a step already running for the same family — an unserialized
+ * `removeWorktree` racing a live role run can fail its `rm -rf` fallback
+ * (e.g. EBUSY on files the running step still has open), leaving a
+ * half-deleted directory at the exact path the next `ensureWorktree` call
+ * tries to `git worktree add` into, which git then refuses as "already
+ * exists".
+ */
+export function deleteTaskAndWorktree(taskId: string, removePlan: boolean): Promise<void> {
+  return serializeTask(familyLockKey(taskId), async () => {
+    const task = getTask(taskId);
+    const artifactRel = task?.artifact_path ?? null;
+    const project = task?.project_id != null ? getProject(task.project_id) : undefined;
+
+    deleteTask(taskId);
+
+    if (removePlan && artifactRel && project) {
+      removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
+    }
+    if (task?.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
+    }
+  });
+}
+
+/**
+ * Reset a task to intake, dropping its worktree (once no other family member
+ * still needs it) but leaving its checkpoint branch alone — `ensureTaskWorkspace`
+ * recreates the worktree onto it next time the task does any work. Serialized
+ * like `deleteTaskAndWorktree` above, for the same reason.
+ */
+export function resetTaskAndWorktree(taskId: string): Promise<TaskRow | undefined> {
+  return serializeTask(familyLockKey(taskId), async () => {
+    const task = getTask(taskId);
+    if (!task) return undefined;
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+
+    if (task.artifact_path && project) {
+      removeFile(path.join(task.git_worktree_path ?? project.repo_path, task.artifact_path));
+    }
+    if (task.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
+      removeWorktree(project.repo_path, task.git_worktree_path);
+    }
+
+    return resetTask(taskId);
+  });
 }
 
 /**
@@ -3043,7 +4541,7 @@ async function doReincorporateAnswer(taskId: string, question: string, answer: s
     if (idx === -1) continue;
 
     const guess = questions[idx]!;
-    const { modelId } = resolveConnectionForModel(task.model || project.default_model || null, project.id);
+    const { connection, modelId } = resolveConnectionForModel(task.model || project.default_model || null, project.id);
 
     let matches: boolean;
     try {
@@ -3053,6 +4551,7 @@ async function doReincorporateAnswer(taskId: string, question: string, answer: s
         taskRepoPath(task, project),
         project.planning_dir || "PLANNING",
         modelId,
+        connection,
       );
       matches = assessment.decision === "confirms";
     } catch (err) {
