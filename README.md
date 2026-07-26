@@ -1,12 +1,12 @@
 # Orchestra
 
-**A configurable, Git-backed, code-planning refinement utility.**
+**A Configurable Model Orchestrator for Auditable, Long Running Tasks**
 
-Smaller local LLMs fail at tasks which require large context windows or are poorly scoped; frontier models struggle with this as well, but they can afford to solve the problem with more hardware - you can't. The point of Orchestra is to offer **tighter control and visibility over long-running, nebulous work**, it breaks tasks into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably. 
+Smaller local LLMs fail at tasks which require large context windows or are poorly scoped; frontier models struggle here as well, but they can afford to solve the problem with more hardware - you can't. The point of Orchestra is to offer **tighter control and visibility over long-running, nebulous work**, it breaks tasks into tracked steps you can *watch* live, *notice* gaps in (via a coverage map), *steer* mid-run, and *enrich* durably. 
 
 Letting a local model burn tokens on a dead-end exploration feels more productive when you can easily travel back to a checkpoint and see *where* the task went sideways.  Fewer blind re-runs means better output.
 
-Connect any git repository, drop in work that ranges from a bare error log to an open-ended research prompt, and a single orchestrator routes it through a chain of specialized "software-company role" agents — powered by [pi](https://github.com/earendil-works/pi) over any OpenAI-compatible endpoint — until it becomes **actionable**: either a decomposed **spec** (epic → story → task) or a **research brief** (approaches, trade-offs, edge cases, recommendation).  Mix and match API and local models in a single workflow to maximize the value of your frontier API calls.
+Connect any git repository, drop in work that ranges from a bare error log to an open-ended research prompt, and a single orchestrator routes it through a chain of specialized "software-company role" agents — powered by [pi](https://github.com/earendil-works/pi) over any OpenAI-compatible endpoint — until it becomes **actionable**: either a decomposed **spec** (epic → story → task) or a **research brief** (approaches, trade-offs, edge cases, recommendation).  *Mix and match* your API and local models in a single workflow to maximize the value of your frontier API calls while keeping local hardware saturated for long runs.
 
 **[Read the docs →](https://ubcs-io.github.io/orchestra/)**
 

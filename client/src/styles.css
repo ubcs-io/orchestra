@@ -37,6 +37,8 @@ button {
 }
 button:hover { border-color: var(--brass); }
 button.primary { background: var(--brass-dim); border-color: var(--brass); color: #fff; }
+button.danger { background: rgba(204, 91, 91, 0.15); border-color: var(--bad); color: var(--bad); }
+button.danger:hover { background: rgba(204, 91, 91, 0.3); }
 button.small { padding: 2px 7px; font-size: 12px; }
 input, textarea, select {
   font: inherit; background: #0f1216; color: var(--ink);
@@ -68,6 +70,25 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
 .pill.human { color: var(--human); border-color: var(--human); }
 .pill.dim { color: var(--ink-dim); }
+.pill.accent { color: var(--accent); border-color: var(--accent); }
+
+.banner { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); font-size: 13px; }
+.banner.human { border-color: var(--human); color: var(--human); background: rgba(209, 145, 60, 0.08); }
+.banner.human a { color: var(--human); }
+/* Degraded-run distrust banner (overhaul/04) */
+.banner.warn { border-color: var(--warn); color: var(--warn); background: rgba(209, 145, 60, 0.08); }
+.banner.bad { border-color: var(--bad); color: var(--bad); background: rgba(204, 91, 91, 0.08); }
+.banner .banner-why { color: var(--ink); opacity: 0.85; font-weight: 400; }
+
+/* Panel tabs — e.g. "New intake" / "Signals" (overhaul/08) */
+.tabs { display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--line); }
+.tab {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--ink-dim); padding: 6px 4px; margin-right: 14px; font-size: 13px;
+  text-transform: uppercase; letter-spacing: 1px; cursor: pointer;
+}
+.tab:hover { color: var(--ink); }
+.tab.active { color: var(--brass); border-bottom-color: var(--brass); }
 
 /* Kanban */
 .kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -78,9 +99,124 @@ button.pill:hover { border-color: var(--brass); color: var(--brass); }
 .card:hover { border-color: var(--brass); }
 .card .title { font-size: 13px; margin-bottom: 4px; }
 .card .meta { font-size: 11px; color: var(--ink-dim); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.card-root-star { position: absolute; top: 4px; right: 6px; font-size: 14px; color: #f0c040; opacity: 0.85; }
 .card--wont-do { opacity: 0.45; }
-.card--wont-do:hover { opacity: 0.65; }
-.card--related-highlight { background: rgba(201, 162, 75, 0.08); border-color: var(--brass-dim); }
+.card--wont-do:hover { opacity: 0.65; border-color: var(--brass); }
+.card--related-highlight {
+  background-color: var(--panel-2);
+  background-image: linear-gradient(rgba(201, 162, 75, 0.08), rgba(201, 162, 75, 0.08));
+  border-color: var(--brass-dim);
+}
+.card--cleanup-mode {
+  border-color: var(--warn);
+  border-style: dashed;
+}
+.card--cleanup-mode:hover {
+  border-color: var(--bad);
+  background-color: var(--panel-2);
+  background-image: linear-gradient(rgba(204, 91, 91, 0.08), rgba(204, 91, 91, 0.08));
+}
+.card--selected {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.12);
+}
+.card--selected:hover {
+  border-color: var(--bad);
+  background-color: var(--panel-2);
+  background-image: linear-gradient(rgba(204, 91, 91, 0.18), rgba(204, 91, 91, 0.18));
+}
+.card-checkmark {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  color: var(--bad);
+  font-weight: bold;
+}
+.row--selected td {
+  background: rgba(204, 91, 91, 0.08);
+}
+.trash-icon {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: border-color 0.15s, background 0.15s;
+}
+.trash-icon:hover {
+  border-color: var(--brass);
+  background: rgba(201, 162, 75, 0.12);
+}
+.trash-icon--active {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.12);
+}
+.trash-icon--active:hover {
+  border-color: var(--bad);
+  background: rgba(204, 91, 91, 0.2);
+}
+.cleanup-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(204, 91, 91, 0.08);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--bad);
+}
+.archived-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.archived-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  color: var(--ink-dim);
+  transition: background 0.15s;
+}
+.archived-header:hover {
+  background: rgba(201, 162, 75, 0.06);
+}
+.archived-caret {
+  font-size: 12px;
+  color: var(--brass);
+  width: 14px;
+  flex-shrink: 0;
+}
+.archived-cards {
+  padding: 4px 12px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.archived-cards .card {
+  flex: 0 0 auto;
+  width: 200px;
+}
+.card--processing {
+  animation: card-pulse 2.5s ease-in-out infinite;
+}
+/* Latest run degraded (overhaul/04) — a left rule so low-trust cards stand out
+   at a glance without competing with the processing pulse. */
+.card--degraded { border-left: 3px solid var(--warn); }
+@keyframes card-pulse {
+  0%, 100% { background: var(--panel-2); }
+  50% { background: rgba(91, 163, 201, 0.06); }
+}
+/* Table rows can't reliably animate background on <tr> across browsers — apply per-cell. */
+.row--processing td { animation: card-pulse 2.5s ease-in-out infinite; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .dot.warn { background: var(--warn); }
 
@@ -518,6 +654,13 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
   text-decoration: none;
 }
 .project-card--register { grid-column: span 2; }
+.project-card--processing {
+  animation: project-card-pulse 2.5s ease-in-out infinite;
+}
+@keyframes project-card-pulse {
+  0%, 100% { background: var(--panel-2); }
+  50% { background: rgba(201, 162, 75, 0.08); }
+}
 
 /* ---- API calls progress bar on project cards ---- */
 .api-calls-bar {
@@ -699,6 +842,10 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
   text-decoration: none;
 }
 
+.network-blocked-panel {
+  border-left: 3px solid var(--bad);
+}
+
 /* ---- Ping results ---- */
 .ping-results {
   display: grid;
@@ -747,6 +894,8 @@ button.ghost { border-style: dashed; opacity: 0.6; cursor: not-allowed; }
 .row.collapsible { cursor: pointer; user-select: none; }
 .row.collapsible:hover { background: rgba(201, 162, 75, 0.06); border-radius: 4px; padding: 2px 4px; margin: -2px -4px; }
 .collapse-caret { font-size: 12px; color: var(--brass); width: 14px; flex-shrink: 0; }
+.panel--expandable { cursor: pointer; }
+.panel--expandable:hover { border-color: var(--brass-dim); }
 
 /* Steering log */
 .steering-log { max-height: 280px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
@@ -1369,7 +1518,11 @@ a.clickable-role:hover {
 
 .task-network-node--active .network-node-card {
   border-color: var(--warn) !important;
-  box-shadow: 0 0 8px rgba(209, 145, 60, 0.3);
+  animation: task-network-node-pulse 1.6s ease-in-out infinite;
+}
+@keyframes task-network-node-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(209, 145, 60, 0.3); }
+  50% { box-shadow: 0 0 14px rgba(209, 145, 60, 0.55); }
 }
 
 .task-network-node--done .network-node-card {
@@ -1384,6 +1537,114 @@ a.clickable-role:hover {
 
 .task-network-panel h2 {
   margin-bottom: 0;
+}
+
+.task-network-panel h2 {
+  margin-bottom: 0;
+}
+
+/* ---- Refinement network split panel (TaskDetail) ---- */
+
+.refinement-split {
+  display: flex;
+  gap: 0;
+  min-height: 280px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.refinement-network-left {
+  flex: 1 1 50%;
+  min-width: 0;
+  background: var(--bg);
+  cursor: grab;
+}
+.refinement-network-left:active {
+  cursor: grabbing;
+}
+.refinement-network-left .react-flow__node {
+  cursor: pointer;
+}
+
+.refinement-role-right {
+  flex: 0 0 320px;
+  max-width: 50%;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.refinement-role-right:hover {
+  background: var(--panel-2);
+}
+
+.refinement-role-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.refinement-role-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--brass);
+}
+.refinement-role-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.refinement-role-section {
+  margin-bottom: 14px;
+}
+.refinement-role-section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ink-dim);
+  margin-bottom: 4px;
+}
+.refinement-role-override {
+  font-size: 12px;
+  color: var(--ink-dim);
+  padding: 2px 0;
+}
+.refinement-role-override code {
+  font-size: 11px;
+  background: var(--panel-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.refinement-role-config-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.refinement-role-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--ink-dim);
+  font-size: 12px;
+  text-align: center;
+}
+.refinement-role-click-hint {
+  font-size: 10px;
+  color: var(--ink-dim);
+  margin-top: auto;
+  padding-top: 12px;
+  text-align: center;
 }
 
 /* ---- Tag input (role editor tools) ---- */
@@ -1960,4 +2221,97 @@ button.review-cta-escape.danger:hover {
   background: var(--panel);
   padding: 2px 8px;
   margin-top: 4px;
+}
+
+/* ---- Worktree kanban + file tree / diff master-detail ---- */
+
+.card--button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+}
+
+.file-tree { font-size: 12px; }
+.file-tree-dir,
+.file-tree-leaf {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 3px 10px;
+  text-align: left;
+  color: var(--ink);
+  cursor: pointer;
+}
+.file-tree-dir:hover,
+.file-tree-leaf:hover { background: var(--panel-2); border-color: transparent; }
+.file-tree-caret { width: 10px; flex-shrink: 0; color: var(--ink-dim); }
+.file-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-leaf.selected { background: rgba(201, 162, 75, 0.12); color: var(--brass); }
+
+.worktree-detail-body { display: flex; gap: 12px; margin-top: 12px; align-items: flex-start; }
+.worktree-detail-tree { width: 260px; flex-shrink: 0; max-height: 70vh; overflow-y: auto; padding: 6px 0; }
+.worktree-detail-diff { flex: 1; min-width: 0; max-height: 70vh; overflow-y: auto; }
+
+/* ---- Role Timeline sidebar card ---- */
+
+.timeline-sidebar-card {
+  /* squished flat — minimal vertical space */
+}
+
+.timeline-sidebar-card h2 {
+  margin-bottom: 8px;
+}
+
+.timeline-bar-container {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--panel-2);
+  gap: 1px;
+}
+
+.timeline-segment {
+  height: 100%;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: filter 0.15s, transform 0.15s;
+  min-width: 6px;
+}
+
+.timeline-segment:hover {
+  filter: brightness(1.4);
+  transform: scaleY(1.3);
+}
+
+.timeline-segment--active {
+  box-shadow: 0 0 4px rgba(201, 162, 75, 0.6);
+  outline: 1px solid rgba(255,255,255,0.3);
+}
+
+.timeline-tooltip {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  min-height: 18px;
+  font-size: 12px;
+}
+
+.timeline-tooltip-role {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* ---- Stopped indicator pill (header) ---- */
+
+.stopped-indicator {
+  color: var(--ink-dim) !important;
+  border-color: var(--ink-dim);
+  font-size: 11px;
 }

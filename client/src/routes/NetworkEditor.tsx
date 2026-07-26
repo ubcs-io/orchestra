@@ -232,6 +232,7 @@ function RoleCardSidebar({
         e.dataTransfer.setData("application/orchestra-role", role.key);
         e.dataTransfer.effectAllowed = "move";
       }}
+      onClick={() => { if (!open) setOpen(true); }}
     >
       <div className="network-role-card-header">
         <button

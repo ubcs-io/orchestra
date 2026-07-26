@@ -1,17 +1,22 @@
 import { useState, useRef, useEffect } from "react";
 import { Link, useParams, useSearch } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Role, type ModelConfig, type RoleStats } from "../api";
+import { api, type ExecCommand, type HarnessPolicy, type Role, type ModelConfig, type RoleStats, type AutonomyLevel, type PlanningRigor } from "../api";
 
 /** Known pi built-in + custom tools (also serves as the dropdown suggestion
  *  list). Mirrors server/src/harness-policy.ts's ALL_KNOWN_TOOL_NAMES — kept
  *  as a hand-copied literal here rather than shared, consistent with how this
  *  list was already just a client mirror before write/edit existed. */
-const KNOWN_TOOLS = ["read", "grep", "find", "ls", "git_history", "write", "edit"] as const;
+const KNOWN_TOOLS = ["read", "grep", "find", "ls", "git_history", "write", "edit", "run_command"] as const;
 
 /** The two write-capable tool names — only addable when a project's harness
  *  policy has allowWrite on. Mirrors server/src/harness-policy.ts's WRITE_TOOL_NAMES. */
 const WRITE_TOOL_NAMES = ["write", "edit"] as const;
+
+/** The command-execution tool — only addable when a project's harness policy
+ *  has allowExec on AND has at least one approved command. Mirrors
+ *  server/src/harness-policy.ts's EXEC_TOOL_NAME. */
+const EXEC_TOOL_NAME = "run_command";
 
 /** Format a number of tokens: 1234 → "1.2k", 1234567 → "1.2M" */
 function fmtTokens(n: number): string {
@@ -304,6 +309,7 @@ function RoleCard({
   defaultModelConfigName,
   stats,
   allowWrite,
+  allowExec,
 }: {
   projectId: number;
   role: Role;
@@ -314,6 +320,8 @@ function RoleCard({
   /** This project's current harness policy — governs whether write/edit can
    *  be newly added to this role's tools. */
   allowWrite: boolean;
+  /** Whether `run_command` can be newly added — exec on with a non-empty menu. */
+  allowExec: boolean;
 }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(defaultOpen);
@@ -380,9 +388,11 @@ function RoleCard({
               value={tools}
               onChange={setTools}
               suggestions={KNOWN_TOOLS}
-              restrictTo={
-                allowWrite ? KNOWN_TOOLS : KNOWN_TOOLS.filter((t) => !(WRITE_TOOL_NAMES as readonly string[]).includes(t))
-              }
+              restrictTo={KNOWN_TOOLS.filter(
+                (t) =>
+                  (allowWrite || !(WRITE_TOOL_NAMES as readonly string[]).includes(t)) &&
+                  (allowExec || t !== EXEC_TOOL_NAME),
+              )}
             />
             <label>Model override (optional)</label>
             <ModelPicker
@@ -451,6 +461,593 @@ function HarnessPolicyCard({ projectId }: { projectId: number }) {
   );
 }
 
+/** Split an argv text field on whitespace. Deliberately simple: an argument
+ *  containing a space is rare for a build/test command and, if genuinely
+ *  needed, belongs in the project's config_json rather than behind quoting
+ *  rules a reader of this field would have to guess at. */
+function parseArgv(text: string): string[] {
+  return text.trim().split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Exec policy editor (PLANNING/overhaul/05): the switch, the approved command
+ * menu, and the run bounds.
+ *
+ * The warning text here is load-bearing, not decoration. The worktree confines
+ * what the *agent* writes; it does nothing to confine a process the agent
+ * starts. Whoever flips this switch is deciding that this repository's test
+ * suite — and every lifecycle script its dependencies bring along — may run as
+ * the user this daemon runs as. That has to be said where the decision is made.
+ */
+function ExecPolicyCard({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["harness-policy", projectId],
+    queryFn: () => api.harnessPolicy(projectId),
+  });
+  const policy = data?.policy;
+
+  const [draft, setDraft] = useState<ExecCommand[] | null>(null);
+  const [caps, setCaps] = useState<Pick<
+    HarnessPolicy,
+    "execTimeoutMs" | "execMaxOutputBytes" | "execMaxRuns"
+  > | null>(null);
+
+  // Adopt the server's values once loaded, and again after a save — but never
+  // clobber an edit in progress.
+  useEffect(() => {
+    if (!policy) return;
+    setDraft((d) => d ?? policy.execAllowlist ?? []);
+    setCaps(
+      (c) =>
+        c ?? {
+          execTimeoutMs: policy.execTimeoutMs,
+          execMaxOutputBytes: policy.execMaxOutputBytes,
+          execMaxRuns: policy.execMaxRuns,
+        },
+    );
+  }, [policy]);
+
+  const save = useMutation({
+    mutationFn: (patch: Parameters<typeof api.saveHarnessPolicy>[1]) =>
+      api.saveHarnessPolicy(projectId, patch),
+    onSuccess: (res) => {
+      setDraft(res.policy.execAllowlist ?? []);
+      qc.invalidateQueries({ queryKey: ["harness-policy", projectId] });
+      qc.invalidateQueries({ queryKey: ["safety"] });
+    },
+  });
+
+  if (!policy || draft === null || caps === null) return null;
+  const allowExec = policy.allowExec ?? false;
+  const dirty =
+    JSON.stringify(draft) !== JSON.stringify(policy.execAllowlist ?? []) ||
+    caps.execTimeoutMs !== policy.execTimeoutMs ||
+    caps.execMaxOutputBytes !== policy.execMaxOutputBytes ||
+    caps.execMaxRuns !== policy.execMaxRuns;
+
+  const patchCommand = (i: number, patch: Partial<ExecCommand>) =>
+    setDraft((d) => (d ?? []).map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ justifyContent: "flex-start", gap: 10 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
+          <input
+            type="checkbox"
+            style={{ width: "auto" }}
+            checked={allowExec}
+            disabled={save.isPending}
+            onChange={(e) => save.mutate({ allowExec: e.target.checked })}
+          />
+          Allow <code>run_command</code> in this project
+        </label>
+        {allowExec && (draft.length === 0) && (
+          <span className="pill warn" style={{ fontSize: 10 }}>
+            no approved commands — the tool stays unavailable
+          </span>
+        )}
+        {save.isError && (
+          <span className="pill bad" style={{ fontSize: 10 }}>{(save.error as Error).message}</span>
+        )}
+      </div>
+
+      <div className="banner warn" style={{ margin: "8px 0", fontSize: 11 }}>
+        ⚠ This is not a sandbox.{" "}
+        <span className="banner-why">
+          An approved command runs this repository's own code — including whatever its dependencies
+          run on install or test — with the same OS privileges as this server process. The task
+          worktree isolates the agent's <em>file edits</em>; it does not contain a process it starts.
+          Turn this on for repositories you would run these commands in yourself, and no others.
+          There is no shell: only the exact argv listed below can run.
+        </span>
+      </div>
+
+      {allowExec && (
+        <>
+          <label style={{ fontSize: 12 }}>Approved commands</label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4 }}>
+            {draft.map((c, i) => (
+              <div
+                key={i}
+                style={{ border: "1px solid var(--border, #333)", borderRadius: 6, padding: 8 }}
+              >
+                <div className="row" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
+                  <input
+                    style={{ width: 130 }}
+                    placeholder="name (e.g. test)"
+                    value={c.name}
+                    onChange={(e) => patchCommand(i, { name: e.target.value })}
+                  />
+                  <input
+                    style={{ flex: 1, minWidth: 220 }}
+                    placeholder="command, e.g. npm test"
+                    value={c.argv.join(" ")}
+                    onChange={(e) => patchCommand(i, { argv: parseArgv(e.target.value) })}
+                  />
+                  <label
+                    style={{ display: "flex", alignItems: "center", gap: 4, width: "auto", fontSize: 11 }}
+                    title="Let the model append extra arguments (regex-validated). A real extension of trust — leave off unless you need it."
+                  >
+                    <input
+                      type="checkbox"
+                      style={{ width: "auto" }}
+                      checked={c.allowArgs ?? false}
+                      onChange={(e) => patchCommand(i, { allowArgs: e.target.checked })}
+                    />
+                    extra args
+                  </label>
+                  <input
+                    style={{ width: 110 }}
+                    type="number"
+                    placeholder="timeout ms"
+                    value={c.timeoutMs ?? ""}
+                    onChange={(e) =>
+                      patchCommand(i, {
+                        timeoutMs: e.target.value ? Number(e.target.value) : undefined,
+                      })
+                    }
+                  />
+                  <button
+                    className="small"
+                    onClick={() => setDraft((d) => (d ?? []).filter((_, idx) => idx !== i))}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                  runs: <code>{c.argv.join(" ") || "(nothing — enter a command)"}</code>
+                  {c.allowArgs && " + model-supplied arguments"}
+                </div>
+                {c.allowArgs && (
+                  <input
+                    style={{ marginTop: 4, fontSize: 11 }}
+                    placeholder="argument pattern (regex, default ^[A-Za-z0-9._/:@=+-]+$)"
+                    value={c.argPattern ?? ""}
+                    onChange={(e) => patchCommand(i, { argPattern: e.target.value || undefined })}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="row" style={{ justifyContent: "flex-start", gap: 8, marginTop: 8 }}>
+            <button
+              className="small"
+              onClick={() => setDraft((d) => [...(d ?? []), { name: "", argv: [] }])}
+            >
+              + command
+            </button>
+            {["test", "typecheck", "lint", "build"].map((preset) => (
+              <button
+                key={preset}
+                className="small"
+                title={`Add a "${preset}" entry to fill in`}
+                disabled={draft.some((c) => c.name === preset)}
+                onClick={() =>
+                  setDraft((d) => [
+                    ...(d ?? []),
+                    {
+                      name: preset,
+                      argv:
+                        preset === "typecheck"
+                          ? ["npx", "tsc", "--noEmit"]
+                          : preset === "test"
+                            ? ["npm", "test"]
+                            : ["npm", "run", preset],
+                    },
+                  ])
+                }
+              >
+                + {preset}
+              </button>
+            ))}
+          </div>
+
+          <div className="row" style={{ justifyContent: "flex-start", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
+            <label style={{ width: "auto", fontSize: 11 }}>
+              default timeout (ms)
+              <input
+                type="number"
+                style={{ width: 110 }}
+                value={caps.execTimeoutMs ?? ""}
+                onChange={(e) => setCaps({ ...caps, execTimeoutMs: Number(e.target.value) })}
+              />
+            </label>
+            <label style={{ width: "auto", fontSize: 11 }}>
+              output cap (bytes)
+              <input
+                type="number"
+                style={{ width: 110 }}
+                value={caps.execMaxOutputBytes ?? ""}
+                onChange={(e) => setCaps({ ...caps, execMaxOutputBytes: Number(e.target.value) })}
+              />
+            </label>
+            <label style={{ width: "auto", fontSize: 11 }} title="Maximum executions per role run">
+              runs per turn
+              <input
+                type="number"
+                style={{ width: 80 }}
+                value={caps.execMaxRuns ?? ""}
+                onChange={(e) => setCaps({ ...caps, execMaxRuns: Number(e.target.value) })}
+              />
+            </label>
+          </div>
+
+          <div style={{ marginTop: 8 }}>
+            <button
+              className="primary"
+              disabled={!dirty || save.isPending}
+              onClick={() =>
+                save.mutate({
+                  execAllowlist: draft.filter((c) => c.name.trim() && c.argv.length),
+                  ...caps,
+                })
+              }
+            >
+              {save.isPending ? "Saving…" : "Save exec policy"}
+            </button>
+            {dirty && (
+              <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+                unsaved changes
+              </span>
+            )}
+          </div>
+          <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            Once at least one command is approved, <code>run_command</code> can be added to a role's
+            tools below. Commands named <code>test</code> and <code>typecheck</code> additionally
+            become <em>gating</em> for code-change tasks: the task cannot reach merge review until a
+            recorded run of them exits 0.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Kill-switch + schedule/budget editor for a project's autonomy policy
+ *  (PLANNING/overhaul/08 §3). Mirrors HarnessPolicyCard's draft-adopted-once
+ *  pattern; PATCHes only this card's own slice of the config, so it can't
+ *  clobber the watcher list WatchersListCard below edits independently. */
+function AutonomyPolicyCard({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["autonomy-config", projectId],
+    queryFn: () => api.autonomyConfig(projectId),
+  });
+  const cfg = data?.config;
+
+  const [restrictHours, setRestrictHours] = useState(false);
+  const [hours, setHours] = useState({ start: "22:00", end: "07:00", weekendsAllDay: true });
+  const [idleAfterMinutes, setIdleAfterMinutes] = useState(10);
+  const [autoQueueDepth, setAutoQueueDepth] = useState(5);
+  const [budgets, setBudgets] = useState({ maxTaskStarts: 10, maxTokens: 2_000_000, maxExecRuns: 50 });
+  const [adopted, setAdopted] = useState(false);
+
+  useEffect(() => {
+    if (!cfg || adopted) return;
+    setRestrictHours(cfg.activeHours != null);
+    if (cfg.activeHours) setHours(cfg.activeHours);
+    setIdleAfterMinutes(cfg.idleAfterMinutes);
+    setAutoQueueDepth(cfg.autoQueueDepth);
+    setBudgets(cfg.budgets);
+    setAdopted(true);
+  }, [cfg, adopted]);
+
+  const save = useMutation({
+    mutationFn: (patch: Parameters<typeof api.saveAutonomyConfig>[1]) => api.saveAutonomyConfig(projectId, patch),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["autonomy-config", projectId] });
+      qc.invalidateQueries({ queryKey: ["autonomy-budget", projectId] });
+    },
+  });
+
+  if (!cfg) return null;
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ justifyContent: "flex-start", gap: 10 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
+          <input
+            type="checkbox"
+            style={{ width: "auto" }}
+            checked={cfg.enabled}
+            disabled={save.isPending}
+            onChange={(e) => save.mutate({ enabled: e.target.checked })}
+          />
+          Autonomy enabled (self-generated watcher tasks)
+        </label>
+        {save.isError && <span className="pill bad" style={{ fontSize: 10 }}>{(save.error as Error).message}</span>}
+      </div>
+      <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+        The kill-switch. Off (default) is fully inert — no scans, no self-generated tasks. Human-created
+        tasks are never affected by this switch either way.
+      </p>
+
+      <div className="row" style={{ justifyContent: "flex-start", gap: 8, marginTop: 8 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
+          <input
+            type="checkbox"
+            style={{ width: "auto" }}
+            checked={restrictHours}
+            onChange={(e) => setRestrictHours(e.target.checked)}
+          />
+          Restrict to a schedule window
+        </label>
+        {restrictHours && (
+          <>
+            <input
+              type="time"
+              style={{ width: 100 }}
+              value={hours.start}
+              onChange={(e) => setHours((h) => ({ ...h, start: e.target.value }))}
+            />
+            <span className="muted">to</span>
+            <input
+              type="time"
+              style={{ width: 100 }}
+              value={hours.end}
+              onChange={(e) => setHours((h) => ({ ...h, end: e.target.value }))}
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 4, width: "auto", fontSize: 11 }}>
+              <input
+                type="checkbox"
+                style={{ width: "auto" }}
+                checked={hours.weekendsAllDay}
+                onChange={(e) => setHours((h) => ({ ...h, weekendsAllDay: e.target.checked }))}
+              />
+              weekends all day
+            </label>
+          </>
+        )}
+      </div>
+
+      <div className="row" style={{ justifyContent: "flex-start", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
+        <label style={{ width: "auto", fontSize: 11 }} title="How many minutes of no mutating API activity count as 'idle'">
+          idle after (minutes)
+          <input
+            type="number"
+            style={{ width: 80 }}
+            value={idleAfterMinutes}
+            onChange={(e) => setIdleAfterMinutes(Number(e.target.value))}
+          />
+        </label>
+        <label style={{ width: "auto", fontSize: 11 }} title="Max open self-generated tasks at once">
+          auto queue depth
+          <input
+            type="number"
+            style={{ width: 80 }}
+            value={autoQueueDepth}
+            onChange={(e) => setAutoQueueDepth(Number(e.target.value))}
+          />
+        </label>
+        <label style={{ width: "auto", fontSize: 11 }} title="Max watcher-originated task dispatches per idle window">
+          max task starts / window
+          <input
+            type="number"
+            style={{ width: 100 }}
+            value={budgets.maxTaskStarts}
+            onChange={(e) => setBudgets((b) => ({ ...b, maxTaskStarts: Number(e.target.value) }))}
+          />
+        </label>
+        <label style={{ width: "auto", fontSize: 11 }} title="Max summed tokens across watcher-originated runs per idle window">
+          max tokens / window
+          <input
+            type="number"
+            style={{ width: 120 }}
+            value={budgets.maxTokens}
+            onChange={(e) => setBudgets((b) => ({ ...b, maxTokens: Number(e.target.value) }))}
+          />
+        </label>
+        <label style={{ width: "auto", fontSize: 11 }} title="Max watcher scan command executions per idle window">
+          max exec runs / window
+          <input
+            type="number"
+            style={{ width: 100 }}
+            value={budgets.maxExecRuns}
+            onChange={(e) => setBudgets((b) => ({ ...b, maxExecRuns: Number(e.target.value) }))}
+          />
+        </label>
+      </div>
+
+      <div style={{ marginTop: 8 }}>
+        <button
+          className="primary"
+          disabled={save.isPending}
+          onClick={() =>
+            save.mutate({
+              activeHours: restrictHours ? hours : null,
+              idleAfterMinutes,
+              autoQueueDepth,
+              budgets,
+            })
+          }
+        >
+          {save.isPending ? "Saving…" : "Save autonomy schedule/budgets"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Project default for how far a task's own pipeline may progress unattended
+ *  — a single-field select, so unlike AutonomyPolicyCard above it mutates
+ *  directly on change with no separate Save button. Distinct from (and
+ *  unrelated to) that card's watcher-scheduling config. */
+function AutonomyLevelCard({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["autonomy-level", projectId],
+    queryFn: () => api.autonomyLevel(projectId),
+  });
+  const save = useMutation({
+    mutationFn: (level: AutonomyLevel) => api.saveAutonomyLevel(projectId, level),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["autonomy-level", projectId] }),
+  });
+
+  if (!data) return null;
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <label style={{ width: "auto", fontSize: 12 }}>
+        Default autonomy level
+        <select
+          value={data.level}
+          disabled={save.isPending}
+          onChange={(e) => save.mutate(e.target.value as AutonomyLevel)}
+          style={{ marginLeft: 8, width: "auto" }}
+        >
+          <option value="plan">plan — stop before any code is written</option>
+          <option value="edit">edit — write code, park for human merge approval (default)</option>
+          <option value="auto">auto — write code, auto-merge once checks pass (falls back to human on conflict)</option>
+        </select>
+      </label>
+      {save.isError && (
+        <p className="pill bad" style={{ fontSize: 10, marginTop: 6 }}>{(save.error as Error).message}</p>
+      )}
+      <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+        How far a task's own pipeline may progress unattended, project-wide.
+        Any task can override this individually from its own detail page.
+      </p>
+    </div>
+  );
+}
+
+/** Project default for how much the family-wide decomposition budget is
+ *  scaled relative to a task's effort_size — mirrors AutonomyLevelCard above
+ *  exactly. Labeled "Planning depth" (not "rigor") to avoid colliding with
+ *  the unrelated counter-reviewer gate rigor and FLOW_TEMPLATES rigor tag. */
+function PlanningRigorCard({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["planning-rigor", projectId],
+    queryFn: () => api.planningRigor(projectId),
+  });
+  const save = useMutation({
+    mutationFn: (rigor: PlanningRigor) => api.savePlanningRigor(projectId, rigor),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["planning-rigor", projectId] }),
+  });
+
+  if (!data) return null;
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <label style={{ width: "auto", fontSize: 12 }}>
+        Default planning depth
+        <select
+          value={data.rigor}
+          disabled={save.isPending}
+          onChange={(e) => save.mutate(e.target.value as PlanningRigor)}
+          style={{ marginLeft: 8, width: "auto" }}
+        >
+          <option value="minimal">minimal — fewer/smaller subtasks, favor executing directly</option>
+          <option value="standard">standard — default budget (default)</option>
+          <option value="thorough">thorough — allow more structure/review even for small work</option>
+        </select>
+      </label>
+      {save.isError && (
+        <p className="pill bad" style={{ fontSize: 10, marginTop: 6 }}>{(save.error as Error).message}</p>
+      )}
+      <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+        Scales the family-wide decomposition budget (how many subtasks a feature may spawn) relative
+        to its estimated effort size, project-wide. Any task can override this individually from its
+        own detail page.
+      </p>
+    </div>
+  );
+}
+
+/** Watcher menu editor. Only "test-suite" ships this pass (PLANNING/overhaul/08
+ *  §1) — the "+ watcher" affordance is deliberately disabled rather than
+ *  pretending this is a general multi-watcher editor yet. */
+function WatchersListCard({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["autonomy-config", projectId],
+    queryFn: () => api.autonomyConfig(projectId),
+  });
+  const watchers = data?.config.watchers ?? [];
+  const testSuite = watchers.find((w) => w.name === "test-suite");
+
+  const save = useMutation({
+    mutationFn: (patch: Parameters<typeof api.saveAutonomyConfig>[1]) => api.saveAutonomyConfig(projectId, patch),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["autonomy-config", projectId] }),
+  });
+
+  if (!data || !testSuite) return null;
+
+  const patchTestSuite = (patch: Partial<typeof testSuite>) =>
+    save.mutate({ watchers: watchers.map((w) => (w.name === "test-suite" ? { ...w, ...patch } : w)) });
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <h3 style={{ margin: "0 0 8px" }}>Watchers</h3>
+      <div style={{ border: "1px solid var(--border, #333)", borderRadius: 6, padding: 8 }}>
+        <div className="row" style={{ justifyContent: "flex-start", gap: 10, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
+            <input
+              type="checkbox"
+              style={{ width: "auto" }}
+              checked={testSuite.enabled}
+              disabled={save.isPending}
+              onChange={(e) => patchTestSuite({ enabled: e.target.checked })}
+            />
+            <strong>test-suite</strong>
+          </label>
+          <label style={{ width: "auto", fontSize: 11 }} title="Minimum minutes between two runs of this watcher">
+            cadence (minutes)
+            <input
+              type="number"
+              style={{ width: 80 }}
+              value={testSuite.cadenceMinutes}
+              onChange={(e) => patchTestSuite({ cadenceMinutes: Number(e.target.value) })}
+            />
+          </label>
+          <label style={{ width: "auto", fontSize: 11 }} title="Max candidates from this watcher that may become tasks per day">
+            daily cap
+            <input
+              type="number"
+              style={{ width: 70 }}
+              value={testSuite.perWatcherDailyCap}
+              onChange={(e) => patchTestSuite({ perWatcherDailyCap: Number(e.target.value) })}
+            />
+          </label>
+        </div>
+        <p className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          Runs this project's <code>test</code>/<code>typecheck</code> exec-allowlist commands (configured
+          above) against a dedicated, read-only scan worktree of the default branch. Requires the same
+          fingerprinted failure twice in a row before proposing a task, to filter out flakiness.
+        </p>
+        {save.isError && <span className="pill bad" style={{ fontSize: 10 }}>{(save.error as Error).message}</span>}
+      </div>
+      <div className="row" style={{ justifyContent: "flex-start", marginTop: 8 }}>
+        <button className="small" disabled title="More watchers (todo-scan, lint-drift, dep-staleness, branch-triage, doc-drift) ship in a later pass">
+          + watcher
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function RolesEditor() {
   const { projectId } = useParams({ strict: false }) as { projectId: string };
   const pid = Number(projectId);
@@ -468,7 +1065,11 @@ export function RolesEditor() {
     queryKey: ["harness-policy", pid],
     queryFn: () => api.harnessPolicy(pid),
   });
-  const allowWrite = policyData?.policy.allowWrite ?? false;
+  const policy = policyData?.policy;
+  const allowWrite = policy?.allowWrite ?? false;
+  // Both halves are required for the grant to mean anything (mirrors the
+  // server's execEnabled): a switch with an empty menu registers no tool.
+  const allowExec = (policy?.allowExec ?? false) && (policy?.execAllowlist?.length ?? 0) > 0;
 
   const configs = mcData?.configs ?? [];
   const defaultModelConfigName =
@@ -499,6 +1100,11 @@ export function RolesEditor() {
       </div>
       <p className="muted">Global defaults shown; saving creates a project-specific override that wins by key.</p>
       <HarnessPolicyCard projectId={pid} />
+      <ExecPolicyCard projectId={pid} />
+      <AutonomyLevelCard projectId={pid} />
+      <PlanningRigorCard projectId={pid} />
+      <AutonomyPolicyCard projectId={pid} />
+      <WatchersListCard projectId={pid} />
       {isLoading ? (
         <p className="muted">Loading…</p>
       ) : (
@@ -512,6 +1118,7 @@ export function RolesEditor() {
             defaultModelConfigName={defaultModelConfigName}
             stats={statsByKey.get(r.key)}
             allowWrite={allowWrite}
+            allowExec={allowExec}
           />
         ))
       )}

@@ -11,12 +11,17 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, displayModelName, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph } from "../api";
+import { api, displayModelName, isEvidenceGreen, parseEvidence, verdictClass, type TaskDetail as TD, type RoleRun, type AgentNetworkGraph, type NetworkPingTarget } from "../api";
+import { blockedDeps } from "../relations";
+import { rolesWithWriteTools, taskWriteCapability } from "../writeCapability";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
 import { ModelBubble } from "../components/ModelBubble";
-import { DiffPanel } from "../components/DiffPanel";
-import { ReviewCTA, collectQuestions, type ClientOpenQuestion } from "../components/ReviewCTA";
+import { DiffPanel, RunDiffSection } from "../components/DiffPanel";
+import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
+import { HealthBadge } from "../components/HealthBadge";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { QuestionDecomposeButton, DecomposedChildCard } from "../components/QuestionDecompose";
+import { CollapsibleCard } from "../components/CollapsibleCard";
 
 /** Parse an open-question string into structured parts: the clean question, a suggested default, and options. */
 interface ParsedQuestion {
@@ -103,6 +108,164 @@ function ElapsedTime({ startTime }: { startTime: number }) {
   const m = Math.floor(elapsed / 60);
   const s = elapsed % 60;
   return <>{m > 0 ? `${m}m ${s}s` : `${s}s`}</>;
+}
+
+/** Format a duration in milliseconds to a compact human-readable string. */
+function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+interface TimelineSegment {
+  roleKey: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  runIds: number[];
+}
+
+/**
+ * Group primary runs into timeline segments.
+ * Consecutive runs with the same role_key are bundled into one segment.
+ * A loopback (role A → role B → role A) creates separate segments.
+ */
+function buildTimelineSegments(runs: RoleRun[]): TimelineSegment[] {
+  const primary = runs
+    .filter((r) => !r.run_kind || r.run_kind === "primary")
+    .sort((a, b) => a.id - b.id);
+
+  if (primary.length === 0) return [];
+
+  const segments: TimelineSegment[] = [];
+  let current: TimelineSegment | null = null;
+
+  for (let i = 0; i < primary.length; i++) {
+    const run = primary[i]!;
+    // Use started_at / ended_at if available; fall back to created_at
+    const startedAt = run.started_at ? new Date(run.started_at).getTime() : new Date(run.created_at).getTime();
+    let endedAt = run.ended_at ? new Date(run.ended_at).getTime() : 0;
+
+    // If no ended_at, borrow the next run's start as the boundary so this
+    // segment shows meaningful width instead of collapsing to zero.
+    if (!run.ended_at && i + 1 < primary.length) {
+      const nextRun = primary[i + 1]!;
+      endedAt = nextRun.started_at
+        ? new Date(nextRun.started_at).getTime()
+        : new Date(nextRun.created_at).getTime();
+    }
+    // Last run with no ended_at — can't borrow, keep it as a sliver
+    if (endedAt === 0) endedAt = startedAt;
+
+    // If same role as previous, bundle
+    if (current && current.roleKey === run.role_key) {
+      current.endedAt = Math.max(current.endedAt, endedAt);
+      current.durationMs = current.endedAt - current.startedAt;
+      current.runIds.push(run.id);
+    } else {
+      if (current) segments.push(current);
+      current = {
+        roleKey: run.role_key,
+        startedAt,
+        endedAt,
+        durationMs: endedAt - startedAt,
+        runIds: [run.id],
+      };
+    }
+  }
+  if (current) segments.push(current);
+
+  return segments;
+}
+
+/** Role-keyed color palette — deterministic colors for consistent display. */
+function roleColor(roleKey: string): string {
+  const palette = [
+    "#4caf50", "#2196f3", "#ff9800", "#e91e63", "#9c27b0",
+    "#00bcd4", "#ff5722", "#607d8b", "#795548", "#3f51b5",
+    "#8bc34a", "#ffc107", "#673ab7", "#cddc39", "#009688",
+  ];
+  let hash = 0;
+  for (let i = 0; i < roleKey.length; i++) {
+    hash = ((hash << 5) - hash) + roleKey.charCodeAt(i);
+    hash |= 0;
+  }
+  return palette[Math.abs(hash) % palette.length] ?? palette[0]!;
+}
+
+function TimelineSidebarCard({ runs, activeRunRole }: { runs: RoleRun[]; activeRunRole: string | null }) {
+  const [hovered, setHovered] = useState<TimelineSegment | null>(null);
+
+  const segments = useMemo(() => buildTimelineSegments(runs), [runs]);
+
+  // Compute total: sum of all segment durations (fills bar completely, no dead tail)
+  const totalMs = useMemo(() => {
+    if (segments.length === 0) return 0;
+    return segments.reduce((sum, seg) => sum + seg.durationMs, 0);
+  }, [segments]);
+
+  if (segments.length === 0) return null;
+
+  const handleSegmentClick = (seg: TimelineSegment) => {
+    // Scroll to the first run in this segment
+    const firstRunId = seg.runIds[0];
+    const run = runs.find((r) => r.id === firstRunId);
+    if (run) {
+      const el = document.getElementById(`run-${run.role_key}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+  };
+
+  return (
+    <div className="panel timeline-sidebar-card">
+      <h2>Role Timeline · {formatDuration(totalMs)}</h2>
+
+      <div className="timeline-bar-container">
+        {segments.map((seg, i) => {
+          const pct = totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
+          const isActive = activeRunRole === seg.roleKey;
+          return (
+            <div
+              key={i}
+              className={`timeline-segment ${isActive ? "timeline-segment--active" : ""}`}
+              style={{
+                width: `${pct}%`,
+                backgroundColor: roleColor(seg.roleKey),
+              }}
+              onMouseEnter={() => setHovered(seg)}
+              onClick={() => handleSegmentClick(seg)}
+              title={`${seg.roleKey}: ${formatDuration(seg.durationMs)}`}
+            />
+          );
+        })}
+      </div>
+
+      <div className="timeline-tooltip">
+        {hovered ? (
+          <>
+            <span className="timeline-tooltip-role" style={{ color: roleColor(hovered.roleKey) }}>
+              {hovered.roleKey}
+            </span>
+            <span className="muted">{formatDuration(hovered.durationMs)}</span>
+            <span className="muted" style={{ fontSize: 10 }}>
+              {new Date(hovered.startedAt).toLocaleTimeString()} – {new Date(hovered.endedAt).toLocaleTimeString()}
+            </span>
+            {hovered.runIds.length > 1 && (
+              <span className="pill dim" style={{ fontSize: 10 }}>{hovered.runIds.length} runs</span>
+            )}
+          </>
+        ) : (
+          <span className="muted" style={{ fontSize: 11 }}>Hover a segment</span>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export interface ActivityState {
@@ -678,6 +841,325 @@ function TaskNetworkGraph({
   );
 }
 
+function RefinementNetworkPanel({
+  networkId,
+  runs,
+  plan,
+  currentRole,
+  lastRole,
+  projectId,
+  selectedNodeRole,
+  onSelectNodeRole,
+  onJumpToRole,
+}: {
+  networkId: string | null;
+  runs: RoleRun[];
+  plan: { steps: { role: string; status: string; depth: number }[] } | null;
+  currentRole: string | null;
+  lastRole: { role: string; tokens: number; elapsedSec: number; model: string | null } | null;
+  projectId: number | null;
+  selectedNodeRole: string | null;
+  onSelectNodeRole: (role: string | null) => void;
+  onJumpToRole: (roleKey: string) => void;
+}) {
+  const rolesQ = useQuery({ queryKey: ["allRoles"], queryFn: () => api.allRoles() });
+  const networkQ = useQuery({
+    queryKey: ["network", networkId],
+    queryFn: () => api.network(networkId as string),
+    enabled: networkId != null,
+  });
+
+  const parsedGraph = useMemo<AgentNetworkGraph | null>(() => {
+    if (networkId && networkQ.data?.network?.graph_json) {
+      try {
+        return JSON.parse(networkQ.data.network.graph_json) as AgentNetworkGraph;
+      } catch {
+        return null;
+      }
+    }
+    // No stored network — derive a simple top-down graph from the plan steps.
+    if (!plan?.steps || plan.steps.length === 0) return null;
+    const planNodes = plan.steps.map((s, i) => ({
+      id: `plan-${s.role}`,
+      roleKey: s.role,
+      position: { x: 0, y: i * 130 },
+      overrides: { depth: s.depth },
+    }));
+    const planEdges = plan.steps.slice(1).map((s, i) => ({
+      id: `plan-edge-${i}`,
+      sourceNodeId: `plan-${plan.steps[i].role}`,
+      targetNodeId: `plan-${s.role}`,
+    }));
+    return {
+      version: 1 as const,
+      nodes: planNodes,
+      edges: planEdges,
+      layout: { gridSize: 20, snapToGrid: false },
+      metadata: { rigor: "standard" as const, maxLoopbacks: 0, mandatoryConcerns: [] },
+    };
+  }, [networkId, networkQ.data, plan]);
+
+  const nodeTypes = useMemo(() => ({ networkNode: NetworkNodeCard }), []);
+
+  /** Resolve which role to show in the right panel: selected node, last completed, current, most recent run, or first plan step. */
+  const displayRoleKey = useMemo<string | null>(() => {
+    if (selectedNodeRole) return selectedNodeRole;
+    if (lastRole) return lastRole.role;
+    if (currentRole) return currentRole;
+    // Fallback: most recent completed run
+    const latest = runs.filter((r) => !r.run_kind || r.run_kind === "primary").pop();
+    if (latest?.role_key) return latest.role_key;
+    // Fallback: first step in the plan (before any roles run)
+    return plan?.steps[0]?.role ?? null;
+  }, [selectedNodeRole, lastRole, currentRole, runs, plan]);
+
+  /** Find the network node for the displayed role. */
+  const displayNode = useMemo(() => {
+    if (!parsedGraph?.nodes || !displayRoleKey) return null;
+    return parsedGraph.nodes.find((n) => n.roleKey === displayRoleKey) ?? null;
+  }, [parsedGraph, displayRoleKey]);
+
+  /** Find the role config from project roles or allRoles. */
+  const roleConfig = useMemo(() => {
+    if (!displayRoleKey) return null;
+    return rolesQ.data?.roles.find((r) => r.key === displayRoleKey) ?? null;
+  }, [rolesQ.data, displayRoleKey]);
+
+  /** Find the persisted run for the displayed role. */
+  const displayRun = useMemo(() => {
+    if (!displayRoleKey) return null;
+    return runs.find((r) => r.role_key === displayRoleKey && (!r.run_kind || r.run_kind === "primary")) ?? null;
+  }, [runs, displayRoleKey]);
+
+  const planStep = plan?.steps.find((s) => s.role === displayRoleKey);
+  const isDisplayActive = currentRole === displayRoleKey;
+
+  const graphNodes: Node[] = useMemo(() => {
+    if (!parsedGraph?.nodes) return [];
+    return parsedGraph.nodes.map((n) => {
+      const roleTitle = rolesQ.data?.roles.find((r) => r.key === n.roleKey)?.title ?? n.roleKey;
+      const step = plan?.steps.find((s) => s.role === n.roleKey);
+      const isActive = currentRole === n.roleKey;
+      const status = isActive ? "active" : (step?.status ?? "pending");
+
+      return {
+        id: n.id,
+        type: "networkNode",
+        position: { x: n.position.x, y: n.position.y },
+        data: {
+          label: roleTitle,
+          roleKey: n.roleKey,
+          criteriaCount: n.criteria?.length ?? 0,
+          depth: n.overrides?.depth,
+        },
+        className: isActive
+          ? "task-network-node--active"
+          : status === "done"
+            ? "task-network-node--done"
+            : status === "skipped"
+              ? "task-network-node--skipped"
+              : "",
+      };
+    });
+  }, [parsedGraph, rolesQ.data, plan, currentRole]);
+
+  const graphEdges: Edge[] = useMemo(() => {
+    if (!parsedGraph?.edges) return [];
+    return parsedGraph.edges.map((e) => ({
+      id: e.id,
+      source: e.sourceNodeId,
+      target: e.targetNodeId,
+      label: e.label,
+      type: "smoothstep" as const,
+      animated: !!e.condition,
+    }));
+  }, [parsedGraph]);
+
+  const handleNetworkNodeClick = (_event: React.MouseEvent, node: Node) => {
+    const roleKey = (node.data as { roleKey?: string }).roleKey;
+    if (!roleKey) return;
+    onSelectNodeRole(roleKey);
+  };
+
+  if (networkQ.isLoading || rolesQ.isLoading || !parsedGraph) {
+    return null;
+  }
+
+  return (
+    <div className="panel">
+      <div className="plan-header">
+        <h2>Refinement plan</h2>
+      </div>
+      <div className="refinement-split">
+        <div className="refinement-network-left">
+          <ReactFlow
+            nodes={graphNodes}
+            edges={graphEdges}
+            nodeTypes={nodeTypes}
+            fitView
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={false}
+            panOnDrag={true}
+            zoomOnScroll={true}
+            onNodeClick={handleNetworkNodeClick}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+          </ReactFlow>
+        </div>
+        <div
+          className="refinement-role-right"
+          onClick={() => {
+            if (displayRoleKey) {
+              onJumpToRole(displayRoleKey);
+            }
+          }}
+          title={displayRoleKey ? `Click to jump to ${displayRoleKey} results` : undefined}
+        >
+          {displayRoleKey ? (
+            <>
+              <div className="refinement-role-header">
+                <span className="refinement-role-title">{displayRoleKey}</span>
+                {displayNode && (
+                  <Link
+                    to={projectId != null
+                      ? "/projects/$projectId/roles"
+                      : "/settings"}
+                    params={projectId != null ? { projectId: String(projectId) } : undefined}
+                    search={projectId != null ? { role: displayRoleKey } : undefined}
+                    className="small"
+                    title={`Edit ${displayRoleKey} configuration`}
+                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                    style={{ fontSize: 14, lineHeight: 1, textDecoration: "none" }}
+                  >
+                    👤
+                  </Link>
+                )}
+              </div>
+
+              <div className="refinement-role-status">
+                {isDisplayActive ? (
+                  <span className="pill warn">active</span>
+                ) : displayRun ? (
+                  <span className={`pill ${verdictClass(displayRun.verdict)}`}>
+                    {displayRun.verdict ?? "?"}
+                  </span>
+                ) : planStep ? (
+                  <span className={`pill ${planStep.status === "done" ? "ok" : planStep.status === "skipped" ? "dim" : "warn"}`}>
+                    {planStep.status}
+                  </span>
+                ) : null}
+                {displayRun && (
+                  <HealthBadge health={displayRun.health} reason={displayRun.health_reason} />
+                )}
+                {displayRun?.verdict_source && (
+                  <span className="pill dim" title="How the structured verdict was obtained">
+                    via {displayRun.verdict_source}
+                  </span>
+                )}
+                {displayRun?.tokens != null && (
+                  <span className="pill dim">{displayRun.tokens.toLocaleString()} tok</span>
+                )}
+                {displayRun?.context_tokens_est != null && (
+                  <span
+                    className={`pill ${displayRun.context_degraded ? "warn" : "dim"}`}
+                    title={
+                      displayRun.context_degraded
+                        ? "This run's context needed tier degradation to fit the model's budget (overhaul/07)"
+                        : "Estimated size of the context this run was given (overhaul/07)"
+                    }
+                  >
+                    ctx ~{displayRun.context_tokens_est.toLocaleString()} tok{displayRun.context_degraded ? " (degraded)" : ""}
+                  </span>
+                )}
+                {displayRun?.depth && displayRun.depth > 1 && (
+                  <span className="pill dim">depth {displayRun.depth}</span>
+                )}
+              </div>
+
+              {roleConfig && (
+                <div className="refinement-role-section">
+                  <div className="refinement-role-section-label">Role Configuration</div>
+                  <div className="refinement-role-override">
+                    <strong>Title:</strong> {roleConfig.title ?? displayRoleKey}
+                  </div>
+                  {roleConfig.model && (
+                    <div className="refinement-role-override">
+                      <strong>Model:</strong> <code>{displayModelName(roleConfig.model)}</code>
+                    </div>
+                  )}
+                  {roleConfig.system_prompt && (
+                    <div className="refinement-role-override">
+                      <strong>Prompt:</strong> {roleConfig.system_prompt.length > 120
+                        ? roleConfig.system_prompt.slice(0, 120) + "…"
+                        : roleConfig.system_prompt}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {displayNode?.overrides && Object.keys(displayNode.overrides).length > 0 && (
+                <div className="refinement-role-section">
+                  <div className="refinement-role-section-label">Network Overrides</div>
+                  {displayNode.overrides.systemPrompt && (
+                    <div className="refinement-role-override">
+                      <strong>Prompt override:</strong> {displayNode.overrides.systemPrompt.length > 100
+                        ? displayNode.overrides.systemPrompt.slice(0, 100) + "…"
+                        : displayNode.overrides.systemPrompt}
+                    </div>
+                  )}
+                  {displayNode.overrides.model && (
+                    <div className="refinement-role-override">
+                      <strong>Model:</strong> <code>{displayModelName(displayNode.overrides.model)}</code>
+                    </div>
+                  )}
+                  {displayNode.overrides.tools && displayNode.overrides.tools.length > 0 && (
+                    <div className="refinement-role-override">
+                      <strong>Tools:</strong> {displayNode.overrides.tools.join(", ")}
+                    </div>
+                  )}
+                  {displayNode.overrides.depth != null && (
+                    <div className="refinement-role-override">
+                      <strong>Depth:</strong> {displayNode.overrides.depth}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {projectId != null && (
+                <Link
+                  to="/projects/$projectId/roles"
+                  params={{ projectId: String(projectId) }}
+                  search={{ role: displayRoleKey }}
+                  className="refinement-role-config-link"
+                  onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                >
+                  ⚙ Configure {displayRoleKey} →
+                </Link>
+              )}
+            </>
+          ) : (
+            <div className="refinement-role-empty">
+              {parsedGraph.nodes.length > 0
+                ? "Click a node to see role details"
+                : "No roles configured in this network"}
+            </div>
+          )}
+
+          <div className="refinement-role-click-hint">
+            {displayRoleKey && displayRun
+              ? "Click card to jump to results ↓"
+              : displayRoleKey
+                ? "Click card to jump to plan ↓"
+                : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NetworkSelector({ taskId, projectId, intakeKind, onChanged }: { taskId: string; projectId: number; intakeKind: string | null; onChanged: () => void }) {
   const networksQ = useQuery({ queryKey: ["networks", projectId], queryFn: () => api.networks(projectId) });
   const setNetwork = useMutation({
@@ -709,6 +1191,90 @@ function NetworkSelector({ taskId, projectId, intakeKind, onChanged }: { taskId:
           {n.name} {n.is_system ? "" : "✦"}
         </option>
       ))}
+    </select>
+  );
+}
+
+/** Task-level override for how far this task's own pipeline may progress
+ *  unattended, or "(project default: X)" when unset. Rendered unconditionally
+ *  (unlike NetworkSelector, which is intake-only) since a task can be
+ *  re-leveled at any stage. Goes through the interventions route rather than
+ *  api.updateTask — the generic task PATCH route only recognizes intake-stage
+ *  fields (name/content/intake_kind), so it wouldn't actually persist this. */
+function AutonomyLevelSelector({
+  taskId,
+  projectId,
+  taskLevel,
+  onChanged,
+}: {
+  taskId: string;
+  projectId: number;
+  taskLevel: string | null;
+  onChanged: () => void;
+}) {
+  const projLevelQ = useQuery({ queryKey: ["autonomy-level", projectId], queryFn: () => api.autonomyLevel(projectId) });
+  const setLevel = useMutation({
+    mutationFn: (level: string | null) => api.intervene(taskId, "set_autonomy_level", { level }),
+    onSuccess: () => onChanged(),
+  });
+  const projDefault = projLevelQ.data?.level ?? "edit";
+
+  return (
+    <select
+      className="pill dim"
+      style={{ width: "auto", fontSize: 11, padding: "2px 6px" }}
+      value={taskLevel ?? ""}
+      disabled={setLevel.isPending}
+      onChange={(e) => setLevel.mutate(e.target.value || null)}
+      title="How far this task's own pipeline may progress unattended"
+    >
+      <option value="">autonomy: {projDefault} (project default)</option>
+      <option value="plan">autonomy: plan</option>
+      <option value="edit">autonomy: edit</option>
+      <option value="auto">autonomy: auto</option>
+    </select>
+  );
+}
+
+/** Task-level override for how much the family-wide decomposition budget is
+ *  scaled relative to this task's effort_size, or "(project default: X)" when
+ *  unset — mirrors AutonomyLevelSelector above exactly. Labeled "planning
+ *  depth" in the UI (not "rigor") to avoid colliding with the unrelated
+ *  counter-reviewer gate rigor pill shown elsewhere on this page. */
+function PlanningRigorSelector({
+  taskId,
+  projectId,
+  taskRigor,
+  onChanged,
+}: {
+  taskId: string;
+  projectId: number;
+  taskRigor: string | null;
+  onChanged: () => void;
+}) {
+  const projRigorQ = useQuery({
+    queryKey: ["planning-rigor", projectId],
+    queryFn: () => api.planningRigor(projectId),
+  });
+  const setRigor = useMutation({
+    mutationFn: (rigor: string | null) => api.intervene(taskId, "set_planning_rigor", { rigor }),
+    onSuccess: () => onChanged(),
+  });
+  const projDefault = projRigorQ.data?.rigor ?? "standard";
+
+  return (
+    <select
+      className="pill dim"
+      style={{ width: "auto", fontSize: 11, padding: "2px 6px" }}
+      value={taskRigor ?? ""}
+      disabled={setRigor.isPending}
+      onChange={(e) => setRigor.mutate(e.target.value || null)}
+      title="How much the family-wide decomposition budget is scaled for this task"
+    >
+      <option value="">planning depth: {projDefault} (project default)</option>
+      <option value="minimal">planning depth: minimal</option>
+      <option value="standard">planning depth: standard</option>
+      <option value="thorough">planning depth: thorough</option>
     </select>
   );
 }
@@ -745,17 +1311,24 @@ export function TaskDetail() {
   const [afterInput, setAfterInput] = useState("");
   const [noteInput, setNoteInput] = useState("");
   const [collapsedRuns, setCollapsedRuns] = useState<Set<number>>(new Set());
-  const [showAdvancedSteering, setShowAdvancedSteering] = useState(false);
+  const [runDiffOpen, setRunDiffOpen] = useState<Set<number>>(new Set());
+  const [steeringExpanded, setSteeringExpanded] = useState(false);
 
   // Question answer state: per-question-editing keyed by "${runId}:${qIndex}"
   const [questionEdits, setQuestionEdits] = useState<Record<string, string>>({});
+  // Keys the user has explicitly reopened for editing after the question was
+  // already answered (see findAnsweredQuestion) — an already-answered question
+  // renders as a locked "you answered" row unless its key is in this set.
+  const [editingKeys, setEditingKeys] = useState<Set<string>>(new Set());
 
   // Intake editing state
   const [editName, setEditName] = useState("");
   const [editContent, setEditContent] = useState("");
+  const [editKind, setEditKind] = useState("");
   const [saving, setSaving] = useState(false);
   const [showNetworkGraph, setShowNetworkGraph] = useState(true);
   const [hoveredCoverage, setHoveredCoverage] = useState<{ role: string; concern: string } | null>(null);
+  const [selectedNodeRole, setSelectedNodeRole] = useState<string | null>(null);
 
   // Scheduler state for banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -767,11 +1340,75 @@ export function TaskDetail() {
     return () => clearInterval(iv);
   }, []);
 
+  // ---- Network availability check (for the network_unavailable blocked state) ----
+  const [netPinging, setNetPinging] = useState(false);
+  const [netPingResults, setNetPingResults] = useState<NetworkPingTarget[] | null>(null);
+  const [netPingError, setNetPingError] = useState("");
+  const netPingEsRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (netPingEsRef.current) {
+        netPingEsRef.current.close();
+        netPingEsRef.current = null;
+      }
+    };
+  }, []);
+
+  function checkNetworkAvailability() {
+    if (netPingEsRef.current) {
+      netPingEsRef.current.close();
+      netPingEsRef.current = null;
+    }
+    setNetPinging(true);
+    setNetPingError("");
+    setNetPingResults(null);
+
+    const es = new EventSource(api.taskNetworkPingStreamUrl(taskId));
+    netPingEsRef.current = es;
+
+    es.addEventListener("init", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        targets: Array<{ target_id: string; label: string; kind: "override" | "default"; roles: string[] }>;
+      };
+      setNetPingResults(
+        data.targets.map((t) => ({ ...t, available: false, status: "checking" as const })),
+      );
+    });
+
+    es.addEventListener("result", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as { target_id: string; available: boolean; error?: string };
+      setNetPingResults((prev) =>
+        prev
+          ? prev.map((r) =>
+              r.target_id === data.target_id
+                ? { ...r, available: data.available, error: data.error, status: "done" as const }
+                : r,
+            )
+          : prev,
+      );
+    });
+
+    es.addEventListener("done", () => {
+      setNetPinging(false);
+      es.close();
+      netPingEsRef.current = null;
+    });
+
+    es.onerror = () => {
+      setNetPinging(false);
+      setNetPingError("Connection lost while checking availability");
+      es.close();
+      netPingEsRef.current = null;
+    };
+  }
+
   // Sync edit fields when task data loads
   useEffect(() => {
     if (q.data) {
       setEditName(q.data.task.name ?? "");
       setEditContent(q.data.task.content ?? "");
+      setEditKind(q.data.task.intake_kind ?? "manual");
     }
   }, [q.data]);
 
@@ -855,6 +1492,19 @@ export function TaskDetail() {
     return { map, roleKeys };
   }, [q.data]);
 
+  const coverageCounts = useMemo(() => {
+    const taxonomy = q.data?.taxonomy ?? [];
+    const counts = { considered: 0, skipped: 0, out_of_scope: 0, never: 0 };
+    for (const concern of taxonomy) {
+      for (const roleKey of coverageGrid.roleKeys) {
+        const status = coverageGrid.map[concern]?.[roleKey]?.status ?? "never";
+        if (status in counts) counts[status as keyof typeof counts]++;
+        else counts.never++;
+      }
+    }
+    return counts;
+  }, [q.data, coverageGrid]);
+
   /** Per-model API call counts and tokens derived from persisted role runs. */
   const modelConfigsQ = useQuery({ queryKey: ["modelConfigs"], queryFn: () => api.modelConfigs() });
 
@@ -865,6 +1515,28 @@ export function TaskDetail() {
     queryFn: () => api.project(taskProjectId as number),
     enabled: taskProjectId != null,
   });
+  const harnessPolicyQ = useQuery({
+    queryKey: ["harness-policy", taskProjectId],
+    queryFn: () => api.harnessPolicy(taskProjectId as number),
+    enabled: taskProjectId != null,
+  });
+  /** Sibling tasks, only fetched when this task actually has unmet dependencies to
+   *  resolve — shares ProjectBoard's ["tasks", projectId] cache key. */
+  const siblingsQ = useQuery({
+    queryKey: ["tasks", taskProjectId],
+    queryFn: () => api.tasks(taskProjectId as number),
+    enabled: taskProjectId != null && !!q.data?.task.depends_on_json,
+  });
+  const blockedOn = useMemo(() => {
+    if (!q.data?.task.depends_on_json) return null;
+    const byId = new Map((siblingsQ.data?.tasks ?? []).map((t) => [t.task_id, t]));
+    return blockedDeps(q.data.task, byId);
+  }, [q.data?.task, siblingsQ.data]);
+  const writeCap = useMemo(() => {
+    if (!q.data?.task) return null;
+    const writeRoles = rolesWithWriteTools(projectQ.data?.roles ?? []);
+    return taskWriteCapability(q.data.task, harnessPolicyQ.data?.policy.allowWrite ?? false, writeRoles);
+  }, [q.data?.task, projectQ.data?.roles, harnessPolicyQ.data?.policy.allowWrite]);
 
   const { modelCallCounts, modelTokens } = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -925,13 +1597,21 @@ export function TaskDetail() {
   nextRoleRef.current = nextPendingRole;
 
   const questionGroups = collectQuestions(d.runs);
+  const openQuestionsCount = questionGroups.reduce(
+    (sum, group) => sum + group.questions.filter((rawQ) => !findAnsweredQuestion(d.interventions, group.roleKey, parseQuestion(rawQ).text)).length,
+    0,
+  );
+  const steeringPendingCount = d.interventions.filter((iv) => iv.consumed_at == null).length;
 
   const submitAnswer = (roleKey: string, question: string, answer: string, editKey: string) => {
     if (!answer.trim()) return;
     intervene.mutate({ kind: "question_answer", payload: { role_key: roleKey, question, answer: answer.trim() } });
-    setQuestionEdits((prev) => {
-      const next = { ...prev };
-      delete next[editKey];
+    // Exit explicit-edit mode; the typed text stays in questionEdits so the
+    // input keeps showing it (not the stale default) until the refetched
+    // interventions confirm the answer and the row locks.
+    setEditingKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(editKey);
       return next;
     });
   };
@@ -1024,9 +1704,56 @@ export function TaskDetail() {
           />
         )}
         <span className={`pill ${t.stage === "ready" ? "ok" : t.stage === "review" ? "human" : "dim"}`}>{t.stage}</span>
+        {activity.currentRole && activity.disposition !== "done" && (
+          <span className="in-progress-pulse" title={`${activity.currentRole} running now`} />
+        )}
+        {blockedOn && blockedOn.length > 0 && (
+          <span
+            className="pill dim"
+            title={`waiting on: ${blockedOn.map((b) => `${b.name ?? b.task_id.slice(0, 8)} (${b.stage})`).join(", ")}`}
+          >
+            blocked
+          </span>
+        )}
+        {(t.stage === "ready" || t.stage === "review") && (() => {
+          const primaryRuns = d.runs.filter((r) => !r.run_kind || r.run_kind === "primary");
+          const lastRun = primaryRuns[primaryRuns.length - 1];
+          if (!lastRun?.ended_at) return null;
+          const finishedMs = Date.now() - new Date(lastRun.ended_at).getTime();
+          const finishedHrs = finishedMs / 3600000;
+          const label = finishedHrs >= 1
+            ? `Stopped ${finishedHrs.toFixed(1)} Hours Ago`
+            : `Stopped ${Math.floor(finishedMs / 60000)}m Ago`;
+          return <span className="pill dim stopped-indicator">{label}</span>;
+        })()}
+        {writeCap === "acting" && (
+          <span className="pill accent" title="This task's plan includes a role with write/edit tools, in a write-enabled project">acting</span>
+        )}
+        {writeCap === "acting" && t.wrote_source === 1 && (
+          <span className="pill warn" title="A role has already written to this task's worktree">wrote code</span>
+        )}
+        {writeCap === "planning" && <span className="pill dim">planning</span>}
         {t.exit_state === "wont_do" && <span className="pill dim">won't do</span>}
+        {t.exit_state === "network_unavailable" && <span className="pill bad">network unavailable</span>}
         <span className="pill dim">{t.intake_kind}</span>
         <span className="pill dim">exit: {t.exit_kind}</span>
+        {t.project_id != null && (
+          <AutonomyLevelSelector
+            taskId={t.task_id}
+            projectId={t.project_id}
+            taskLevel={t.autonomy_level}
+            onChanged={refresh}
+          />
+        )}
+        {t.project_id != null && (
+          <PlanningRigorSelector
+            taskId={t.task_id}
+            projectId={t.project_id}
+            taskRigor={t.planning_rigor}
+            onChanged={refresh}
+          />
+        )}
+        {t.effort_size && <span className="pill dim">size: {t.effort_size}</span>}
         {t.paused === 1 && <span className="pill warn">paused</span>}
         {t.reconcile_status === "pending_human_merge" && (
           t.github_pr_url ? (
@@ -1047,9 +1774,6 @@ export function TaskDetail() {
             onClose={() => setDiffOpen(false)}
             onMutate={refresh}
           />
-        )}
-        {t.stage === "intake" && t.project_id != null && (
-          <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={t.intake_kind} onChanged={refresh} />
         )}
       </div>
 
@@ -1111,38 +1835,31 @@ export function TaskDetail() {
             </div>
           )}
 
-          <div className="panel">
-            <div className="plan-header">
-              <h2>Refinement plan</h2>
-            </div>
-            <div className="row">
-              {d.plan?.steps.map((s, i) => (
-                <a
-                  key={i}
-                  href={`#run-${s.role}`}
-                  className={`pill ${s.status === "done" ? "ok" : s.status === "skipped" ? "dim" : "warn"}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    const el = document.getElementById(`run-${s.role}`);
-                    if (el) {
-                      el.scrollIntoView({ behavior: "smooth", block: "start" });
-                      setCollapsedRuns((prev) => {
-                        const run = d.runs.find((r) => r.role_key === s.role);
-                        if (run && prev.has(run.id)) {
-                          const next = new Set(prev);
-                          next.delete(run.id);
-                          return next;
-                        }
-                        return prev;
-                      });
-                    }
-                  }}
-                >
-                  {s.role}{s.depth > 1 ? `·d${s.depth}` : ""}
-                </a>
-              )) ?? <span className="muted">Not planned yet.</span>}
-            </div>
-          </div>
+          <RefinementNetworkPanel
+            networkId={t.network_id ?? null}
+            runs={d.runs}
+            plan={d.plan}
+            currentRole={activity.currentRole}
+            lastRole={activity.lastRole}
+            projectId={t.project_id}
+            selectedNodeRole={selectedNodeRole}
+            onSelectNodeRole={setSelectedNodeRole}
+            onJumpToRole={(roleKey: string) => {
+              const el = document.getElementById(`run-${roleKey}`);
+              if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "start" });
+                setCollapsedRuns((prev) => {
+                  const run = d.runs.find((r) => r.role_key === roleKey);
+                  if (run && prev.has(run.id)) {
+                    const next = new Set(prev);
+                    next.delete(run.id);
+                    return next;
+                  }
+                  return prev;
+                });
+              }
+            }}
+          />
 
           {/* In-progress role slat — shows as soon as role_start fires, before run is persisted */}
           {activity.currentRole && activity.disposition !== "done" && (
@@ -1269,9 +1986,32 @@ export function TaskDetail() {
                   <span className="collapse-caret">{isCollapsed ? "▸" : "▾"}</span>
                   <h2 style={{ margin: 0, cursor: "pointer" }}>{r.role_key}</h2>
                   <span className={`pill ${verdictClass(r.verdict)}`}>{r.verdict ?? "?"}</span>
+                  <HealthBadge health={r.health} reason={r.health_reason} />
                   {r.fallback === 1 && <span className="pill warn" title="Model never called record_findings — output was salvaged">no verdict</span>}
                   {r.stop_reason === "length" && <span className="pill bad" title="Output hit the token limit before finishing">truncated</span>}
                   {r.stalled === 1 && <span className="pill warn" title="Model narrated calling record_findings instead of invoking it — auto-aborted and retried">stalled</span>}
+                  {r.verdict_source && <span className="pill dim" title="How the structured verdict was obtained">via {r.verdict_source}</span>}
+                  {r.context_degraded === 1 && (
+                    <span className="pill warn" title="This run's context needed tier degradation to fit the model's budget (overhaul/07)">
+                      ctx degraded
+                    </span>
+                  )}
+                  {(() => {
+                    // Verification evidence at a glance (overhaul/05) — visible
+                    // even while the run is collapsed, because "did the tests
+                    // pass" is the first thing a reviewer scans for.
+                    const ev = parseEvidence(r.evidence_json);
+                    if (!ev.length) return null;
+                    const green = ev.every(isEvidenceGreen);
+                    return (
+                      <span
+                        className={`pill ${green ? "ok" : "bad"}`}
+                        title={ev.map((e) => `${e.name}: exit ${e.exitCode ?? "killed"}`).join(", ")}
+                      >
+                        {green ? "✓" : "✗"} {ev.length} run{ev.length === 1 ? "" : "s"}
+                      </span>
+                    );
+                  })()}
                   {r.tokens != null && <span className="muted">{r.tokens} tok</span>}
                   {r.depth > 1 && <span className="pill dim">depth {r.depth}</span>}
                   <div style={{ flex: 1 }} />
@@ -1296,6 +2036,22 @@ export function TaskDetail() {
                   >
                     restore
                   </button>
+                  <button
+                    className="small"
+                    disabled={!r.git_commit_sha}
+                    title={r.git_commit_sha ? "Show what this run changed" : "No checkpoint recorded for this run"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRunDiffOpen((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(r.id)) next.delete(r.id);
+                        else next.add(r.id);
+                        return next;
+                      });
+                    }}
+                  >
+                    diff
+                  </button>
                   {t.project_id != null && (
                     <Link
                       to="/projects/$projectId/roles"
@@ -1311,9 +2067,24 @@ export function TaskDetail() {
                   )}
                 </div>
                 {!isCollapsed && r.summary && <p className="muted" style={{ margin: "6px 0" }}>{r.summary}</p>}
+                {!isCollapsed && r.carry_forward && (
+                  <p className="muted" style={{ margin: "6px 0", fontSize: 13 }} title="Handoff contract for the next role (overhaul/07 §4)">
+                    <strong>Carry forward:</strong> {r.carry_forward}
+                  </p>
+                )}
+                {!isCollapsed && (r.health === "degraded" || r.health === "empty") && (
+                  <div className={`banner ${r.health === "empty" ? "bad" : "warn"}`} style={{ margin: "8px 0" }}>
+                    ⚠ Distrust this output — <strong>{r.health}</strong> run.{" "}
+                    <span className="banner-why">
+                      {r.health_reason || "The verdict may be synthesized or the report incomplete."}
+                    </span>
+                  </div>
+                )}
+                {!isCollapsed && <EvidencePanel evidence={parseEvidence(r.evidence_json)} />}
                 {!isCollapsed && r.output_md && (
                   <div className="section-md rendered-md" dangerouslySetInnerHTML={{ __html: marked.parse(r.output_md) as string }} />
                 )}
+                {!isCollapsed && runDiffOpen.has(r.id) && <RunDiffSection taskId={t.task_id} runId={r.id} />}
                 {!isCollapsed && r.thinking_md && (
                   <details className="reasoning-trace" style={{ marginTop: 8 }}>
                     <summary className="muted" style={{ cursor: "pointer" }}>💭 Reasoning trace ({r.thinking_md.length.toLocaleString()} chars)</summary>
@@ -1384,15 +2155,42 @@ export function TaskDetail() {
               recapMd={d.recap_md}
               coverage={d.coverage}
               runs={d.runs}
+              interventions={d.interventions}
               childTasks={d.children}
               onMutate={refresh}
+              onOpenDiff={() => setDiffOpen(true)}
             />
           )}
 
+          {/* Role timeline card — always visible when there are runs */}
+          <TimelineSidebarCard runs={d.runs} activeRunRole={activity.currentRole} />
+
           {/* Current state panel — shown whenever there's meaningful state */}
           {(activity.currentRole || activity.lastRole) && (
-            <div className="panel">
-              <h2>Current State</h2>
+            <CollapsibleCard
+              title="Current State"
+              summary={
+                <>
+                  {activity.currentRole && (
+                    <span className="pill warn">{activity.currentRole}</span>
+                  )}
+                  {activity.disposition && (
+                    <span className="pill">
+                      {activity.disposition === "reading" && "📖 reading"}
+                      {activity.disposition === "thinking" && "💭 thinking"}
+                      {activity.disposition === "responding" && "✍ responding"}
+                      {activity.disposition === "tool" && "🔧 tool use"}
+                      {activity.disposition === "done" && "✅ complete"}
+                    </span>
+                  )}
+                  {activity.roleStartTime && activity.disposition !== "done" && (
+                    <span className="pill dim">
+                      <ElapsedTime startTime={activity.roleStartTime} />
+                    </span>
+                  )}
+                </>
+              }
+            >
               <div className="current-state">
                 {activity.currentRole && (
                   <div className="current-state-row">
@@ -1448,13 +2246,25 @@ export function TaskDetail() {
                   </div>
                 )}
               </div>
-            </div>
+            </CollapsibleCard>
           )}
 
           {/* API Calls panel — expanded with local/API split, avg TPS, and per-model breakdown */}
           {Object.keys(modelCallCounts).length > 0 && (
-            <div className="panel">
-              <h2>API Calls</h2>
+            <CollapsibleCard
+              title="API Calls"
+              summary={
+                <>
+                  <span className="pill dim">{localApiAgg.local + localApiAgg.api} calls</span>
+                  {avgTps != null && <span className="pill dim">{avgTps.toFixed(0)} tps</span>}
+                  {localApiAgg.local + localApiAgg.api > 0 && (
+                    <span className="muted" style={{ fontSize: 11 }}>
+                      {localApiAgg.local} local / {localApiAgg.api} api
+                    </span>
+                  )}
+                </>
+              }
+            >
               <div className="calls-summary">
                 <div className="calls-total">
                   <span className="calls-total-num">
@@ -1515,34 +2325,76 @@ export function TaskDetail() {
                     })}
                 </div>
               </div>
+            </CollapsibleCard>
+          )}
+
+          {t.exit_state === "network_unavailable" && (
+            <div className="panel network-blocked-panel">
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <h2 style={{ margin: 0 }}>Network unavailable</h2>
+                <button className="small" disabled={netPinging} onClick={checkNetworkAvailability}>
+                  {netPinging ? "Checking…" : "Check availability"}
+                </button>
+              </div>
+              <p className="muted" style={{ marginTop: 8 }}>
+                Stopped before starting — {t.review_reason ?? "a model endpoint used by this task's network wasn't reachable"}.
+                Nothing is running; use Resume below once connectivity is confirmed.
+              </p>
+              {netPingError && <p className="pill bad" style={{ marginTop: 8 }}>{netPingError}</p>}
+              {netPingResults && (
+                <div className="ping-results" style={{ marginTop: 8 }}>
+                  {netPingResults.map((r) => (
+                    <div
+                      key={r.target_id}
+                      className={`ping-node ${r.status === "checking" ? "ping-checking" : r.available ? "ping-ok" : "ping-down"}`}
+                    >
+                      <span className={`ping-dot ${r.status === "checking" ? "ping-dot--checking" : r.available ? "ok" : "bad"}`} />
+                      <span className="ping-name">{r.label}</span>
+                      <span className="pill dim" style={{ fontSize: 10 }}>{r.kind}</span>
+                      <span className="muted" style={{ fontSize: 11 }}>{r.roles.join(", ")}</span>
+                      {r.status === "checking" && <span className="pill dim" style={{ fontSize: 10 }}>checking…</span>}
+                      {r.status === "done" && r.error && <span className="pill bad" style={{ fontSize: 10 }}>{r.error}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
-          <div className="panel">
+          <div
+            className={`panel${!steeringExpanded ? " panel--expandable" : ""}`}
+            onClick={() => { if (!steeringExpanded) setSteeringExpanded(true); }}
+          >
             <div className="steering-header">
               <h2 style={{ margin: 0 }}>Steering</h2>
               <div className="steer">
                 {t.paused === 1 ? (
-                  <button className="small primary" onClick={() => intervene.mutate({ kind: "resume" })}>Resume</button>
+                  <button className="small primary" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "resume" }); }}>Resume</button>
                 ) : (
-                  <button className="small" onClick={() => intervene.mutate({ kind: "pause" })}>Pause</button>
+                  <button className="small" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "pause" }); }}>Pause</button>
                 )}
-                <button className="small" onClick={() => setResetModal(true)} title="Reset to intake">
+                <button className="small" onClick={(e) => { e.stopPropagation(); setResetModal(true); }} title="Reset to intake">
                   🔄
                 </button>
-                <button className="small danger" onClick={() => { setRemovePlan(false); setDeleteModal(true); }} title="Delete task">
+                <button className="small danger" onClick={(e) => { e.stopPropagation(); setRemovePlan(false); setDeleteModal(true); }} title="Delete task">
                   🗑
                 </button>
               </div>
               <button
                 className="small"
-                onClick={() => setShowAdvancedSteering((p) => !p)}
-                title={showAdvancedSteering ? "Hide advanced controls" : "Show advanced controls"}
+                onClick={(e) => { e.stopPropagation(); setSteeringExpanded((p) => !p); }}
+                title={steeringExpanded ? "Hide details" : "Show advanced controls and steering log"}
               >
-                {showAdvancedSteering ? "Advanced ▾" : "Advanced ▸"}
+                {steeringExpanded ? "Details ▾" : "Details ▸"}
               </button>
             </div>
-            {showAdvancedSteering && (
+            {!steeringExpanded && (
+              <div className="row" style={{ marginTop: 6, gap: 8 }}>
+                <span className="pill dim">{steeringPendingCount} pending</span>
+                <span className="pill dim">{d.interventions.length} total</span>
+              </div>
+            )}
+            {steeringExpanded && (
               <>
                 <div className="steer" style={{ marginTop: 8 }}>
                   <button className="small" onClick={() => api.tick().then(refresh)}>Tick now</button>
@@ -1564,55 +2416,63 @@ export function TaskDetail() {
                   <input value={noteInput} onChange={(e) => setNoteInput(e.target.value)} placeholder="focus on token handling…" />
                   <button className="small" disabled={!noteInput} onClick={() => { intervene.mutate({ kind: "steer_note", payload: { text: noteInput } }); setNoteInput(""); }}>add</button>
                 </div>
+
+                {d.interventions.length > 0 && (
+                  <div style={{ marginTop: 14 }}>
+                    <h2 style={{ marginBottom: 6 }}>Steering log</h2>
+                    <div className="steering-log">
+                      {[...d.interventions].reverse().map((iv) => {
+                        let payload: Record<string, unknown> = {};
+                        try { payload = iv.payload_json ? JSON.parse(iv.payload_json) : {}; } catch { /* skip */ }
+
+                        const kindLabel = {
+                          steer_note: "NOTE",
+                          pin_question: "PIN",
+                          question_answer: "ANSWER",
+                          inject_role: "INJECT",
+                          deepen: "DEEPEN",
+                          promote_role: "PROMOTE",
+                          pause: "PAUSE",
+                          resume: "RESUME",
+                          run_now: "RUN NOW",
+                        }[iv.kind] ?? iv.kind.toUpperCase();
+
+                        const detail =
+                          iv.kind === "steer_note" || iv.kind === "pin_question"
+                            ? (payload.text as string ?? "")
+                            : iv.kind === "inject_role"
+                              ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
+                              : iv.kind === "deepen" || iv.kind === "promote_role"
+                                ? (payload.role as string ?? "?")
+                                : "";
+
+                        const isConsumed = iv.consumed_at != null;
+
+                        return (
+                          <div key={iv.id} className={`steering-entry ${isConsumed ? "consumed" : "pending"}`}>
+                            <span className={`pill ${isConsumed ? "dim" : "warn"}`}>{kindLabel}</span>
+                            {detail && <span className={isConsumed ? "muted" : ""}>{detail}</span>}
+                            <span className="muted" style={{ fontSize: 11 }}>{iv.created_at.replace("T", " ").slice(0, 16)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </>
-            )}
-
-            {d.interventions.length > 0 && (
-              <div style={{ marginTop: 14 }}>
-                <h2 style={{ marginBottom: 6 }}>Steering log</h2>
-                <div className="steering-log">
-                  {[...d.interventions].reverse().map((iv) => {
-                    let payload: Record<string, unknown> = {};
-                    try { payload = iv.payload_json ? JSON.parse(iv.payload_json) : {}; } catch { /* skip */ }
-
-                    const kindLabel = {
-                      steer_note: "NOTE",
-                      pin_question: "PIN",
-                      question_answer: "ANSWER",
-                      inject_role: "INJECT",
-                      deepen: "DEEPEN",
-                      promote_role: "PROMOTE",
-                      pause: "PAUSE",
-                      resume: "RESUME",
-                      run_now: "RUN NOW",
-                    }[iv.kind] ?? iv.kind.toUpperCase();
-
-                    const detail =
-                      iv.kind === "steer_note" || iv.kind === "pin_question"
-                        ? (payload.text as string ?? "")
-                        : iv.kind === "inject_role"
-                          ? `${payload.role ?? "?"}${payload.after ? " after " + payload.after : ""}`
-                          : iv.kind === "deepen" || iv.kind === "promote_role"
-                            ? (payload.role as string ?? "?")
-                            : "";
-
-                    const isConsumed = iv.consumed_at != null;
-
-                    return (
-                      <div key={iv.id} className={`steering-entry ${isConsumed ? "consumed" : "pending"}`}>
-                        <span className={`pill ${isConsumed ? "dim" : "warn"}`}>{kindLabel}</span>
-                        {detail && <span className={isConsumed ? "muted" : ""}>{detail}</span>}
-                        <span className="muted" style={{ fontSize: 11 }}>{iv.created_at.replace("T", " ").slice(0, 16)}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
             )}
           </div>
 
-          <div className="panel">
-            <h2>Coverage map</h2>
+          <CollapsibleCard
+            title="Coverage map"
+            summary={
+              <>
+                <span className="pill ok">{coverageCounts.considered} considered</span>
+                {coverageCounts.skipped > 0 && <span className="pill warn">{coverageCounts.skipped} skipped</span>}
+                {coverageCounts.never > 0 && <span className="pill bad">{coverageCounts.never} never</span>}
+              </>
+            }
+          >
             {coverageGrid.roleKeys.length > 0 ? (
               <>
                 <div className="coverage-grid" style={{ gridTemplateColumns: `120px repeat(${coverageGrid.roleKeys.length}, minmax(28px, 1fr))` }}>
@@ -1703,12 +2563,17 @@ export function TaskDetail() {
             ) : (
               <p className="muted">No coverage recorded yet.</p>
             )}
-          </div>
+          </CollapsibleCard>
 
-          <div className="panel">
-            <div className="plan-header">
-              <h2>Intake — original request</h2>
-            </div>
+          <CollapsibleCard
+            title="Intake — original request"
+            summary={
+              <>
+                <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
+                <span className="pill dim">name: {t.name ?? t.task_id.slice(0, 8)}</span>
+              </>
+            }
+          >
             <div className="intake-content">
               <div className="row" style={{ marginBottom: 6 }}>
                 <span className="pill dim">kind: {t.intake_kind ?? "—"}</span>
@@ -1724,6 +2589,17 @@ export function TaskDetail() {
                     onChange={(e) => setEditName(e.target.value)}
                     placeholder="Task name"
                   />
+                  <label className="muted" style={{ display: "block", marginBottom: 4 }}>Kind</label>
+                  <div className="row" style={{ marginBottom: 8, gap: 8, alignItems: "center" }}>
+                    <select value={editKind} onChange={(e) => setEditKind(e.target.value)}>
+                      {["manual", "error_file", "feature", "bug", "chore", "spike", "research", "ux", "question"].map((k) => (
+                        <option key={k} value={k}>{k}</option>
+                      ))}
+                    </select>
+                    {t.project_id != null && (
+                      <NetworkSelector taskId={t.task_id} projectId={t.project_id!} intakeKind={editKind} onChanged={refresh} />
+                    )}
+                  </div>
                   <label className="muted" style={{ display: "block", marginBottom: 4 }}>Content</label>
                   <textarea
                     className="intake-textarea"
@@ -1743,7 +2619,7 @@ export function TaskDetail() {
                       onClick={async () => {
                         setSaving(true);
                         try {
-                          await api.updateTask(taskId, { name: editName, content: editContent });
+                          await api.updateTask(taskId, { name: editName, content: editContent, intake_kind: editKind });
                           refresh();
                         } catch (e: unknown) {
                           // error will show via query refetch
@@ -1759,6 +2635,7 @@ export function TaskDetail() {
                       onClick={() => {
                         setEditName(t.name ?? "");
                         setEditContent(t.content ?? "");
+                        setEditKind(t.intake_kind ?? "manual");
                       }}
                     >
                       Revert
@@ -1787,11 +2664,17 @@ export function TaskDetail() {
                 </>
               )}
             </div>
-          </div>
+          </CollapsibleCard>
 
           {questionGroups.length > 0 && t.stage !== "review" && t.stage !== "ready" && (
-            <div className="panel">
-              <h2>Questions</h2>
+            <CollapsibleCard
+              title="Questions"
+              summary={
+                <span className="pill warn">
+                  {openQuestionsCount} open question{openQuestionsCount === 1 ? "" : "s"}
+                </span>
+              }
+            >
               <div className="questions-panel">
                 {questionGroups.map((group) => (
                   <div key={group.runId} className="questions-role-group">
@@ -1821,11 +2704,13 @@ export function TaskDetail() {
                     {group.questions.map((rawQ, qi) => {
                       const pq = parseQuestion(rawQ);
                       const editKey = `${group.runId}:${qi}`;
-                      const editVal = questionEdits[editKey] ?? pq.defaultAnswer ?? "";
+                      const answered = findAnsweredQuestion(d.interventions, group.roleKey, pq.text);
+                      const isEditing = !answered || editingKeys.has(editKey);
+                      const editVal = questionEdits[editKey] ?? answered?.answer ?? pq.defaultAnswer ?? "";
                       return (
                         <div key={qi} className="question-item">
                           <p className="question-text">{pq.text}</p>
-                          {pq.options.length > 0 && (
+                          {isEditing && pq.options.length > 0 && (
                             <div className="question-options">
                               {pq.options.map((opt, oi) => (
                                 <button
@@ -1843,32 +2728,82 @@ export function TaskDetail() {
                               suggested: <strong>{pq.defaultAnswer}</strong>
                             </p>
                           )}
-                          <div className="question-answer-row">
-                            <input
-                              className="question-answer-input"
-                              value={editVal}
-                              onChange={(e) => setQuestionEdits((prev) => ({ ...prev, [editKey]: e.target.value }))}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" && editVal.trim()) {
-                                  submitAnswer(group.roleKey, pq.text, editVal, editKey);
-                                }
-                              }}
-                              placeholder={pq.defaultAnswer ? `or edit default: ${pq.defaultAnswer}` : "your answer…"}
-                            />
-                            <button
-                              className="small primary"
-                              disabled={!editVal.trim()}
-                              onClick={() => submitAnswer(group.roleKey, pq.text, editVal, editKey)}
-                            >
-                              ✓
-                            </button>
-                            <QuestionDecomposeButton
-                              parentTaskId={taskId}
-                              roleKey={group.roleKey}
-                              question={rawQ.question}
-                              onMutate={refresh}
-                            />
-                          </div>
+                          {answered && !isEditing && (
+                            <p className="question-default">
+                              you answered: <strong>{answered.answer}</strong>
+                              <span className="pill ok" style={{ marginLeft: 6 }}>
+                                answered
+                              </span>{" "}
+                              <button
+                                className="link"
+                                style={{
+                                  background: "none",
+                                  border: "none",
+                                  color: "var(--brass)",
+                                  cursor: "pointer",
+                                  padding: 0,
+                                  textDecoration: "underline",
+                                  fontSize: 11,
+                                }}
+                                onClick={() => {
+                                  setEditingKeys((prev) => new Set(prev).add(editKey));
+                                  setQuestionEdits((prev) => ({ ...prev, [editKey]: answered.answer }));
+                                }}
+                              >
+                                change answer
+                              </button>
+                            </p>
+                          )}
+                          {isEditing && (
+                            <div className="question-answer-row">
+                              <input
+                                className="question-answer-input"
+                                value={editVal}
+                                onChange={(e) => setQuestionEdits((prev) => ({ ...prev, [editKey]: e.target.value }))}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && editVal.trim()) {
+                                    submitAnswer(group.roleKey, pq.text, editVal, editKey);
+                                  }
+                                }}
+                                placeholder={pq.defaultAnswer ? `or edit default: ${pq.defaultAnswer}` : "your answer…"}
+                              />
+                              <button
+                                className="small primary"
+                                disabled={!editVal.trim()}
+                                onClick={() => submitAnswer(group.roleKey, pq.text, editVal, editKey)}
+                              >
+                                ✓
+                              </button>
+                              {answered && (
+                                <button
+                                  className="link"
+                                  style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "var(--ink-dim)",
+                                    cursor: "pointer",
+                                    padding: "0 4px",
+                                    fontSize: 11,
+                                  }}
+                                  onClick={() =>
+                                    setEditingKeys((prev) => {
+                                      const next = new Set(prev);
+                                      next.delete(editKey);
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  cancel
+                                </button>
+                              )}
+                              <QuestionDecomposeButton
+                                parentTaskId={taskId}
+                                roleKey={group.roleKey}
+                                question={rawQ.question}
+                                onMutate={refresh}
+                              />
+                            </div>
+                          )}
                           {(() => {
                             const decomposedChild = d.children.find(
                               (c) =>
@@ -1885,7 +2820,7 @@ export function TaskDetail() {
                   </div>
                 ))}
               </div>
-            </div>
+            </CollapsibleCard>
           )}
         </div>
       </div>

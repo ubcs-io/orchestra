@@ -244,6 +244,14 @@ export function headSha(repoPath: string): string {
   return git(repoPath, ["rev-parse", "HEAD"]);
 }
 
+/** Resolve any ref (branch, tag, sha) to a full commit SHA, without touching
+ *  what's checked out at `repoPath`. Used by the scan-worktree reset
+ *  (PLANNING/overhaul/08) to find the default branch's current tip from a
+ *  worktree sitting on its own dedicated branch. */
+export function resolveRef(repoPath: string, ref: string): string {
+  return git(repoPath, ["rev-parse", ref]);
+}
+
 function branchExists(repoPath: string, branch: string): boolean {
   try {
     git(repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
@@ -296,7 +304,7 @@ export function resetHardTo(repoPath: string, sha: string): void {
 // Worktrees: per-task working directories sharing one object store
 // ---------------------------------------------------------------------------
 
-const WORKTREES_DIR = ".orchestra-worktrees";
+export const WORKTREES_DIR = ".orchestra-worktrees";
 
 /** The dedicated worktree directory for a task, nested under the project repo. */
 export function worktreePath(repoPath: string, taskId: string): string {

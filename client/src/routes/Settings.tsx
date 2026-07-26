@@ -250,6 +250,12 @@ function RolesSummary({ data }: { data: SafetyResponse }) {
 function HarnessPolicySummary({ data }: { data: SafetyResponse }) {
   const hp = data.harness_policy;
   const withWrite = hp.projects.filter((p) => p.allow_write || p.roles_with_write.length > 0);
+  // Execution posture (PLANNING/overhaul/05) is reported alongside write
+  // access because it is the strictly larger capability: a write is confined to
+  // the task worktree, an executed command is not confined at all.
+  const withExec = hp.projects.filter(
+    (p) => p.allow_exec || (p.roles_with_exec?.length ?? 0) > 0,
+  );
 
   return (
     <div className="panel" style={{ marginTop: 12 }}>
@@ -274,6 +280,44 @@ function HarnessPolicySummary({ data }: { data: SafetyResponse }) {
             </div>
           ))}
         </div>
+      )}
+
+      <strong style={{ marginBottom: 8, marginTop: 14, display: "block" }}>
+        Command Execution (per project)
+      </strong>
+      {withExec.length === 0 ? (
+        <span className="pill dim" style={{ fontSize: 11 }}>
+          no project can run commands
+        </span>
+      ) : (
+        <>
+          <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+            Approved commands run this repo's own code with this server's OS privileges — the task
+            worktree isolates file edits, not spawned processes. There is no shell: only the exact
+            argv below can run.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {withExec.map((p) => (
+              <div key={p.id} className="row" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
+                <span
+                  className={`pill ${(p.roles_with_exec?.length ?? 0) > 0 ? "bad" : "dim"}`}
+                  style={{ fontSize: 10 }}
+                >
+                  {(p.roles_with_exec?.length ?? 0) > 0 ? "exec live" : "exec allowed, unused"}
+                </span>
+                <strong style={{ fontSize: 12 }}>{p.name}</strong>
+                {(p.roles_with_exec ?? []).map((key) => (
+                  <span key={key} className="pill dim" style={{ fontSize: 10 }}>{key}</span>
+                ))}
+                {(p.exec_commands ?? []).map((c) => (
+                  <code key={c.name} style={{ fontSize: 10, opacity: 0.7 }} title={c.argv.join(" ")}>
+                    {c.name}
+                  </code>
+                ))}
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );

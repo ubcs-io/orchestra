@@ -10,6 +10,7 @@
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai/compat";
 import { resolveConnection, type Connection } from "./settings.js";
+import { hashSig } from "./profiles.js";
 
 const OPENAI_COMPAT: Api = "openai-completions";
 
@@ -26,16 +27,6 @@ function ensureRegistry(): ModelRegistry {
   const auth = AuthStorage.inMemory();
   registry = ModelRegistry.inMemory(auth);
   return registry;
-}
-
-/** Small non-cryptographic string hash — just needs to be a stable, short,
- *  secret-free provider id derived from the connection signature. */
-function hashSig(sig: string): string {
-  let h = 0;
-  for (let i = 0; i < sig.length; i++) {
-    h = (Math.imul(h, 31) + sig.charCodeAt(i)) | 0;
-  }
-  return (h >>> 0).toString(36);
 }
 
 /** Build a flat compat object from the connection's thinkingFormat + ModelCompat overrides. */
@@ -117,6 +108,34 @@ export function ensureModel(modelId: string, connection?: Connection): Model<Api
 
 export function getRegistry(): ModelRegistry {
   return ensureRegistry();
+}
+
+/**
+ * Check whether an OpenAI-compatible endpoint is reachable by hitting its
+ * /models route. Shared by the manual ping routes and the orchestrator's
+ * pre-flight gate — the latter uses a shorter timeout since it sits on the
+ * hot path of every step dispatch.
+ */
+export async function checkReachable(
+  baseUrl: string,
+  apiKey?: string,
+  timeoutMs = 6_000,
+): Promise<{ ok: boolean; error?: string }> {
+  const trimmed = (baseUrl ?? "").trim();
+  if (!trimmed) return { ok: false, error: "No base URL configured" };
+  try {
+    const url = trimmed.replace(/\/+$/, "") + "/models";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    clearTimeout(timer);
+    return { ok: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+  } catch (err) {
+    const msg = (err as Error).message;
+    return { ok: false, error: msg === "This operation was aborted" ? "aborted" : msg };
+  }
 }
 
 /**

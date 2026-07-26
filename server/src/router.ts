@@ -21,8 +21,11 @@
  *                 and should roll the task back to right after the guess)
  */
 
+import { Type, type Static } from "@sinclair/typebox";
 import type { RoleRunner, PlanStep, CoverageMap as OrchestratorCoverageMap } from "./orchestrator.js";
 import type { CriteriaResult } from "./agent.js";
+import type { Connection } from "./settings.js";
+import { runConstrainedCompletion } from "./structured.js";
 
 // Re-export CoverageMap so callers don't need the orchestrator type.
 export type CoverageMap = OrchestratorCoverageMap;
@@ -45,6 +48,9 @@ export interface RouterConfig {
   /** Call Point 5: compare a human's later answer against a role's recorded guess,
    *  and roll the task back to right after the guess if it was wrong. */
   answerReincorporation: boolean;
+  /** Call Point 6 (PLANNING/overhaul/08): triage a watcher-produced candidate
+   *  into worth_doing/priority/suggested_kind before it may become a task. */
+  candidateTriage: boolean;
   /** Override model for router calls (falls back to project connection default). */
   model?: string;
   /** Token budget per router call. Default 1024. */
@@ -60,6 +66,7 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   borderlineGateAssessment: false,
   secondReview: false,
   answerReincorporation: false,
+  candidateTriage: false,
 };
 
 /** Resolve router config from a project's config_json or return defaults. */
@@ -129,6 +136,40 @@ async function routerCall<T>(
   return extractJson<T>(result.findings.section_md || result.findings.summary || "{}");
 }
 
+/**
+ * Attempt a router mini-call via the sampler-guaranteed rung
+ * (PLANNING/overhaul/02) instead of `routerCall`'s roleRunner+extractJson path.
+ * Returns null (never throws) on any failure — unsupported connection, network
+ * error, or schema mismatch — so callers fall straight through to their
+ * existing heuristic-backed `routerCall` path unchanged. `connection` is
+ * optional only so existing call sites that haven't threaded it through yet
+ * degrade to the unconstrained path rather than failing to compile/run.
+ */
+async function tryConstrained<T extends import("@sinclair/typebox").TSchema>(
+  connection: Connection | undefined,
+  modelId: string,
+  systemPrompt: string,
+  userPrompt: string,
+  schema: T,
+): Promise<Static<T> | null> {
+  if (!connection || connection.structuredOutputs.mode === "off") return null;
+  try {
+    return await runConstrainedCompletion(
+      connection,
+      modelId,
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      schema,
+      1024,
+    );
+  } catch (err) {
+    console.warn(`[router] constrained call failed, falling back: ${(err as Error).message}`);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Call Point 1: Question Distillation
 // ---------------------------------------------------------------------------
@@ -154,6 +195,21 @@ export interface DistillationResult {
   merged_count: number;
   dropped_duplicates: number;
 }
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors DistillationResult. */
+const DistillationResultSchema = Type.Object({
+  questions: Type.Array(
+    Type.Object({
+      text: Type.String(),
+      context: Type.Union([Type.String(), Type.Null()]),
+      priority: Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
+      duplicate_of: Type.Union([Type.String(), Type.Null()]),
+      suggested_answer: Type.Union([Type.String(), Type.Null()]),
+    }),
+  ),
+  merged_count: Type.Number(),
+  dropped_duplicates: Type.Number(),
+});
 
 const DISTILL_SYSTEM_PROMPT = `You are a question editor for an automated code refinement pipeline.
 Your job is to clean, deduplicate, and prioritize questions that role agents ask of humans.
@@ -207,7 +263,16 @@ async function defaultDistill(
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ): Promise<DistillationResult> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    DISTILL_SYSTEM_PROMPT,
+    buildDistillPrompt(input),
+    DistillationResultSchema,
+  );
+  if (constrained) return constrained;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -273,6 +338,25 @@ export interface EscalationAssessmentResult {
   };
   human_review_still_needed_after?: boolean;
 }
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors EscalationAssessmentResult. */
+const EscalationAssessmentResultSchema = Type.Object({
+  decision: Type.Union([
+    Type.Literal("escalate"),
+    Type.Literal("reroute"),
+    Type.Literal("rerun"),
+    Type.Literal("close"),
+  ]),
+  reasoning: Type.String(),
+  action: Type.Optional(
+    Type.Object({
+      role: Type.Optional(Type.String()),
+      after: Type.Optional(Type.String()),
+      steer_note: Type.Optional(Type.String()),
+    }),
+  ),
+  human_review_still_needed_after: Type.Optional(Type.Boolean()),
+});
 
 const ESCALATION_SYSTEM_PROMPT = `You are a routing decision assistant for an automated code refinement pipeline.
 Your job is to assess whether a task flagged for human review can instead be resolved by another specialized role agent.
@@ -351,7 +435,16 @@ async function defaultAssessEscalation(
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ): Promise<EscalationAssessmentResult> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    ESCALATION_SYSTEM_PROMPT,
+    buildEscalationPrompt(input),
+    EscalationAssessmentResultSchema,
+  );
+  if (constrained) return constrained;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -415,6 +508,21 @@ export interface BorderlineAssessmentResult {
   steer_note?: string;
   target_roles?: string[];
 }
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors BorderlineAssessmentResult. */
+const BorderlineAssessmentResultSchema = Type.Object({
+  decision: Type.Union([
+    Type.Literal("loopback"),
+    Type.Literal("proceed"),
+    Type.Literal("proceed_with_note"),
+    Type.Literal("escalate"),
+    Type.Literal("narrow_loopback"),
+  ]),
+  reasoning: Type.String(),
+  override_unmet: Type.Optional(Type.Array(Type.String())),
+  steer_note: Type.Optional(Type.String()),
+  target_roles: Type.Optional(Type.Array(Type.String())),
+});
 
 const BORDERLINE_SYSTEM_PROMPT = `You are a quality-gate decision assistant for an automated code refinement pipeline.
 Your job is to assess whether unmet acceptance criteria after a reviewer pass warrant another loop-back or can be accepted.
@@ -487,7 +595,16 @@ async function defaultAssessBorderline(
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ): Promise<BorderlineAssessmentResult> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    BORDERLINE_SYSTEM_PROMPT,
+    buildBorderlinePrompt(input),
+    BorderlineAssessmentResultSchema,
+  );
+  if (constrained) return constrained;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -540,6 +657,18 @@ export interface SecondReviewResult {
   reasoning: string;
   steer_note?: string;
 }
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors SecondReviewResult. */
+const SecondReviewResultSchema = Type.Object({
+  decision: Type.Union([
+    Type.Literal("accept"),
+    Type.Literal("accept_with_note"),
+    Type.Literal("escalate"),
+    Type.Literal("loopback"),
+  ]),
+  reasoning: Type.String(),
+  steer_note: Type.Optional(Type.String()),
+});
 
 const SECOND_REVIEW_SYSTEM_PROMPT = `You are the orchestrator's own second reviewer for an automated code refinement pipeline.
 A role just produced a finding, and — if enabled — an adversarial critic judged whether that
@@ -601,7 +730,16 @@ async function defaultAssessSecondReview(
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ): Promise<SecondReviewResult> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    SECOND_REVIEW_SYSTEM_PROMPT,
+    buildSecondReviewPrompt(input),
+    SecondReviewResultSchema,
+  );
+  if (constrained) return constrained;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -650,6 +788,12 @@ export interface AnswerMatchResult {
   reasoning: string;
 }
 
+/** JSON-schema payload for the constrained-decoding rung — mirrors AnswerMatchResult. */
+const AnswerMatchResultSchema = Type.Object({
+  decision: Type.Union([Type.Literal("confirms"), Type.Literal("contradicts")]),
+  reasoning: Type.String(),
+});
+
 const ANSWER_MATCH_SYSTEM_PROMPT = `You are comparing a human's answer to a question against the best-effort guess an automated role made earlier, in order to decide whether that guess's downstream work still stands or needs to be redone.
 
 Available decisions:
@@ -685,7 +829,16 @@ async function defaultAssessAnswerMatch(
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ): Promise<AnswerMatchResult> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    ANSWER_MATCH_SYSTEM_PROMPT,
+    buildAnswerMatchPrompt(input),
+    AnswerMatchResultSchema,
+  );
+  if (constrained) return constrained;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -717,6 +870,144 @@ async function defaultAssessAnswerMatch(
 }
 
 // ---------------------------------------------------------------------------
+// Call Point 6: Candidate Triage (PLANNING/overhaul/08)
+// ---------------------------------------------------------------------------
+
+export interface CandidateTriageInput {
+  projectName: string;
+  /** Watcher registry key, e.g. "test-suite". */
+  watcher: string;
+  /** The watcher's own suggested intake kind, e.g. "error_file". */
+  candidateKind: string;
+  /** Condensed evidence — failing test names + a capped log excerpt. */
+  payloadSummary: string;
+  /** Currently open self-generated tasks for this project (any watcher). */
+  openAutoTaskCount: number;
+  autoQueueDepth: number;
+  /** Recent human "won't do" reasons for the same/a similar fingerprint —
+   *  context only, never a hard rule the model must obey. */
+  recentSuppressions: string[];
+}
+
+export type CandidateTriagePriority = 1 | 2 | 3 | 4 | 5;
+
+export interface CandidateTriageDecision {
+  worth_doing: boolean;
+  priority: CandidateTriagePriority;
+  rationale: string;
+  suggested_kind: string;
+}
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors CandidateTriageDecision. */
+const CandidateTriageResultSchema = Type.Object({
+  worth_doing: Type.Boolean(),
+  priority: Type.Union([
+    Type.Literal(1),
+    Type.Literal(2),
+    Type.Literal(3),
+    Type.Literal(4),
+    Type.Literal(5),
+  ]),
+  rationale: Type.String(),
+  suggested_kind: Type.String(),
+});
+
+const CANDIDATE_TRIAGE_SYSTEM_PROMPT = `You are the triage gate for an autonomous local code companion. A background
+watcher just observed something in the repository (e.g. a failing test suite) and is proposing it as a
+candidate for the automated work queue. Your job is to decide whether it is actually worth an automated
+task, so the queue doesn't fill up with noise the human never asked for.
+
+Guidelines:
+- "worth_doing: true" only for a genuine, concrete problem worth an automated pass — a real test failure,
+  not flakiness or a transient environment issue.
+- Weigh the existing queue depth: if it's already near the cap, raise the bar for "worth_doing".
+- If similar candidates were recently marked "won't do" by a human, treat that as a signal this kind of
+  thing isn't wanted right now (but not an absolute rule — a different underlying cause can still be real).
+- priority 1 (lowest) to 5 (highest) — reflect genuine urgency, not enthusiasm. Most candidates should be
+  2-3; reserve 4-5 for something a human would drop other work to look at.
+- suggested_kind should usually match the watcher's own candidateKind unless the evidence clearly suggests
+  a different intake kind fits better.
+- When genuinely unsure, prefer "worth_doing: false" — a missed candidate just waits for the next scan,
+  which is cheap; a bad auto-queued task is queue pollution a human has to clean up.
+
+Respond ONLY with valid JSON matching this schema — no markdown, no explanation outside the JSON:
+{
+  "worth_doing": true | false,
+  "priority": 1 | 2 | 3 | 4 | 5,
+  "rationale": "brief explanation",
+  "suggested_kind": "intake kind this should become, e.g. error_file"
+}`;
+
+function buildCandidateTriagePrompt(input: CandidateTriageInput): string {
+  const suppressions = input.recentSuppressions.length
+    ? input.recentSuppressions.map((s) => `- ${s}`).join("\n")
+    : "(none)";
+
+  return `Project: ${input.projectName}
+Watcher: ${input.watcher}
+Candidate kind: ${input.candidateKind}
+Open self-generated tasks: ${input.openAutoTaskCount} / ${input.autoQueueDepth} (autoQueueDepth)
+
+## Evidence
+${input.payloadSummary}
+
+## Recent human "won't do" reasons for similar candidates
+${suppressions}
+
+Decide whether this candidate is worth an automated task.`;
+}
+
+async function defaultTriageCandidate(
+  input: CandidateTriageInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+  connection?: Connection,
+): Promise<CandidateTriageDecision> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    CANDIDATE_TRIAGE_SYSTEM_PROMPT,
+    buildCandidateTriagePrompt(input),
+    CandidateTriageResultSchema,
+  );
+  if (constrained) return constrained;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const json = await routerCall<CandidateTriageDecision>(
+      roleRunner,
+      repoPath,
+      planningDir,
+      modelId,
+      CANDIDATE_TRIAGE_SYSTEM_PROMPT,
+      buildCandidateTriagePrompt(input),
+      controller.signal,
+    );
+
+    clearTimeout(timeout);
+
+    if (typeof json.worth_doing !== "boolean") throw new Error("missing worth_doing");
+    if (![1, 2, 3, 4, 5].includes(json.priority)) throw new Error(`invalid priority: ${json.priority}`);
+    return json;
+  } catch (err) {
+    console.warn(`[router] candidate triage failed: ${(err as Error).message}`);
+    // Fail toward NOT queuing — the opposite bias from Call Point 5's
+    // "fail toward redoing work": a missed candidate just waits for the next
+    // scan (cheap), while a broken router silently auto-queuing junk is the
+    // doc's own #1 named risk (queue pollution).
+    return {
+      worth_doing: false,
+      priority: 3,
+      rationale: "Router triage failed — defaulting to not queuing this candidate.",
+      suggested_kind: input.candidateKind,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Injector seam (same pattern as orchestrator's setRoleRunner)
 // ---------------------------------------------------------------------------
 
@@ -726,6 +1017,7 @@ type DistillParams = [
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ];
 
 type EscalationParams = [
@@ -734,6 +1026,7 @@ type EscalationParams = [
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ];
 
 type BorderlineParams = [
@@ -742,6 +1035,7 @@ type BorderlineParams = [
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ];
 
 type SecondReviewParams = [
@@ -750,6 +1044,7 @@ type SecondReviewParams = [
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
 ];
 
 type AnswerMatchParams = [
@@ -758,6 +1053,16 @@ type AnswerMatchParams = [
   repoPath: string,
   planningDir: string,
   modelId: string,
+  connection?: Connection,
+];
+
+type CandidateTriageParams = [
+  input: CandidateTriageInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+  connection?: Connection,
 ];
 
 export type DistillFn = (...args: DistillParams) => Promise<DistillationResult>;
@@ -765,18 +1070,21 @@ export type EscalationFn = (...args: EscalationParams) => Promise<EscalationAsse
 export type BorderlineFn = (...args: BorderlineParams) => Promise<BorderlineAssessmentResult>;
 export type SecondReviewFn = (...args: SecondReviewParams) => Promise<SecondReviewResult>;
 export type AnswerMatchFn = (...args: AnswerMatchParams) => Promise<AnswerMatchResult>;
+export type TriageFn = (...args: CandidateTriageParams) => Promise<CandidateTriageDecision>;
 
 let _distill: DistillFn = defaultDistill;
 let _assessEscalation: EscalationFn = defaultAssessEscalation;
 let _assessBorderline: BorderlineFn = defaultAssessBorderline;
 let _assessSecondReview: SecondReviewFn = defaultAssessSecondReview;
 let _assessAnswerMatch: AnswerMatchFn = defaultAssessAnswerMatch;
+let _triageCandidate: TriageFn = defaultTriageCandidate;
 
 export function setDistillFn(fn: DistillFn): void { _distill = fn; }
 export function setEscalationFn(fn: EscalationFn): void { _assessEscalation = fn; }
 export function setBorderlineFn(fn: BorderlineFn): void { _assessBorderline = fn; }
 export function setSecondReviewFn(fn: SecondReviewFn): void { _assessSecondReview = fn; }
 export function setAnswerMatchFn(fn: AnswerMatchFn): void { _assessAnswerMatch = fn; }
+export function setTriageFn(fn: TriageFn): void { _triageCandidate = fn; }
 
 export function resetRouterFns(): void {
   _distill = defaultDistill;
@@ -784,6 +1092,7 @@ export function resetRouterFns(): void {
   _assessBorderline = defaultAssessBorderline;
   _assessSecondReview = defaultAssessSecondReview;
   _assessAnswerMatch = defaultAssessAnswerMatch;
+  _triageCandidate = defaultTriageCandidate;
 }
 
 /** Public entry points that tests can override via the seam. */
@@ -792,3 +1101,4 @@ export const assessEscalation: EscalationFn = (...args) => _assessEscalation(...
 export const assessBorderline: BorderlineFn = (...args) => _assessBorderline(...args);
 export const assessSecondReview: SecondReviewFn = (...args) => _assessSecondReview(...args);
 export const assessAnswerMatch: AnswerMatchFn = (...args) => _assessAnswerMatch(...args);
+export const triageCandidate: TriageFn = (...args) => _triageCandidate(...args);

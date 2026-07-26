@@ -17,6 +17,13 @@
 
 import { getConfig } from "./config.js";
 import { getGlobalConfig, getProjectConfig, listModelConfigs, upsertConfig, type ConfigRow } from "./db.js";
+import type { ProbeResult } from "./probe.js";
+import {
+  effectiveDecisions,
+  loadProfile,
+  profileConnectionSig,
+  type ProfileOverrides,
+} from "./profiles.js";
 
 /** Per-thinking-level reasoning token budgets (mirrors pi's ThinkingBudgets). */
 export interface ThinkingBudgets {
@@ -99,6 +106,47 @@ export interface ModelCompat {
   /** Text-mode counterpart of nudgeThresholdChars (overrides
    *  DEFAULT_PREEMPTIVE_NUDGE_CHARS_TEXT_MODE). */
   nudgeThresholdCharsTextMode?: number;
+  /** Reasoning/thinking-channel counterpart of nudgeThresholdChars (overrides
+   *  DEFAULT_PREEMPTIVE_NUDGE_CHARS_THINKING) — guards against a role that
+   *  reasons at length without emitting answer text (e.g. twoPhase Phase 1)
+   *  running until an external/provider timeout discards it. */
+  nudgeThresholdCharsThinking?: number;
+  /** Which role output contract this endpoint's models are prompted with
+   *  (PLANNING/overhaul/01). "artifact-first" (the default when unset): the
+   *  report streams to the task artifact (report_section / answer prose) and
+   *  the structured payload shrinks to a small verdict trailer. "v1": the
+   *  legacy contract — the full markdown report embedded in one terminal JSON
+   *  blob as section_md. Per-endpoint revert switch for a model that
+   *  misbehaves under the new contract; no deploy needed. Parsing always
+   *  accepts both shapes regardless of this setting. */
+  outputContract?: "v1" | "artifact-first";
+  /** Manual override of which structured-output rung to use (PLANNING/overhaul/02).
+   *  "off" forces the legacy tool-call/text-fence path even if a probe found
+   *  json_schema/guided_json/grammar support. Unset: derived from the cached probe
+   *  result on the config row (highest supported rung), or "off" if never probed. */
+  structuredOutputsOverride?: "json_schema" | "guided_json" | "grammar" | "off";
+  /** Softer stall handling (PLANNING/overhaul/03 §3). When true, the pre-emptive
+   *  character-count nudges and the narration-pattern stall stop firing a
+   *  mid-stream `session.abort()` — they only note the signal and let the turn
+   *  finish (bounded by the provider's own max_tokens), after which the
+   *  repair/resume ladder recovers the verdict. A true repetition-loop stall
+   *  (the same sentence repeated past threshold) still aborts, since the rest of
+   *  that stream is provably worthless. Default (unset/false) preserves today's
+   *  abort-on-nudge behavior; flip it per connection only once repair+resume are
+   *  proven to cover the truncation cases the nudges were protecting against
+   *  (the doc's migration step 3). Retiring it hinges on the two-turn shape from
+   *  overhaul/02: the working turn is allowed to end without a verdict because
+   *  the verdict comes from a separate constrained/repair turn. */
+  retirePreemptiveNudge?: boolean;
+}
+
+/** The resolved structured-output rung for a connection: the highest mode the
+ *  cached probe found (or the manual override, which always wins), collapsed to
+ *  the two rungs agent.ts/router.ts actually request — "json_object" alone isn't
+ *  enough to guarantee schema conformance, so it never resolves to "on". */
+export interface ResolvedStructuredOutputs {
+  mode: "json_schema" | "guided_json" | "grammar" | "off";
+  probedAt?: string;
 }
 
 /** Fully resolved connection settings for a single model call. */
@@ -130,6 +178,16 @@ export interface Connection {
   compat: ModelCompat;
   /** Per-thinking-level reasoning token budgets (merged from config row's thinking_budgets). */
   thinkingBudgets?: ThinkingBudgets;
+  /** Resolved server-side structured-decoding rung (PLANNING/overhaul/02): cached
+   *  probe result (`configs.structured_outputs_json`) + compat.structuredOutputsOverride,
+   *  override wins. "off" until a probe has run (or the probe found nothing usable). */
+  structuredOutputs: ResolvedStructuredOutputs;
+  /** Measured effective context window from the model's capability profile
+   *  (PLANNING/overhaul/06 `BehaviorProbes.effectiveContext`, PLANNING/overhaul/07's
+   *  context ledger). null/undefined = never probed or the endpoint didn't expose
+   *  it — callers fall back to `contextWindow`. Only ever set by
+   *  `applyProfileToConnection`; the hand-flag resolution paths leave it unset. */
+  effectiveContext?: number | null;
 }
 
 /**
@@ -180,6 +238,61 @@ function parseCompat(raw: string | null | undefined): ModelCompat {
   }
 }
 
+/** Parse a `structured_outputs_json` string into a cached ProbeResult. */
+function parseProbeResult(raw: string | null | undefined): ProbeResult | undefined {
+  if (!raw) return undefined;
+  try {
+    const obj = JSON.parse(raw) as Partial<ProbeResult>;
+    if (!obj || typeof obj !== "object" || !obj.modes) return undefined;
+    return obj as ProbeResult;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Normalize a base URL for probe-freshness comparison: trailing slashes are
+ *  insignificant (fetch strips them before appending the route), so a probe
+ *  taken against `…/v1` still matches a connection resolved to `…/v1/`. */
+function normalizeBaseUrl(url: string | null | undefined): string {
+  return (url ?? "").replace(/\/+$/, "");
+}
+
+/** A cached probe describes a specific (baseUrl, modelId) pair. If either has
+ *  since changed — the user edited the connection, or an ORCHESTRA_BASE_URL env
+ *  override now points elsewhere than what was probed — the cached modes no
+ *  longer describe the endpoint we're about to call, so the probe is stale and
+ *  must be ignored (resolving to "off", the fail-safe rung) rather than trusted.
+ *  The doc's design: results are invalidated when the base URL or model id
+ *  changes; since probing is manual, this check enforces it at resolve time. */
+function probeIsFresh(probe: ProbeResult, baseUrl: string, modelId: string): boolean {
+  return normalizeBaseUrl(probe.baseUrl) === normalizeBaseUrl(baseUrl) && probe.modelId === modelId;
+}
+
+/** Resolve the highest server-side structured-decoding rung a connection can use:
+ *  a manual `structuredOutputsOverride` always wins (it's a deliberate operator
+ *  choice, independent of any probe); otherwise derive it from the cached probe
+ *  result (json_schema preferred over guided_json over grammar; json_object
+ *  alone never resolves "on" — it doesn't guarantee schema conformance). A probe
+ *  taken against a different baseUrl/modelId than the connection now resolves to
+ *  is treated as absent (stale). No usable probe resolves to "off", not an
+ *  optimistic guess. `baseUrl`/`modelId` are the values the connection will
+ *  actually call with (the probe stored the pair it was taken against). */
+function resolveStructuredOutputs(
+  compat: ModelCompat,
+  probe: ProbeResult | undefined,
+  baseUrl: string,
+  modelId: string,
+): ResolvedStructuredOutputs {
+  const fresh = probe && probeIsFresh(probe, baseUrl, modelId) ? probe : undefined;
+  if (compat.structuredOutputsOverride) {
+    return { mode: compat.structuredOutputsOverride, probedAt: fresh?.probedAt };
+  }
+  if (fresh?.modes.json_schema) return { mode: "json_schema", probedAt: fresh.probedAt };
+  if (fresh?.modes.guided_json) return { mode: "guided_json", probedAt: fresh.probedAt };
+  if (fresh?.modes.grammar) return { mode: "grammar", probedAt: fresh.probedAt };
+  return { mode: "off", probedAt: fresh?.probedAt };
+}
+
 /** Parse a `thinking_budgets` JSON string into a ThinkingBudgets object. */
 function parseThinkingBudgets(raw: string | null | undefined): ThinkingBudgets | undefined {
   if (!raw) return undefined;
@@ -215,12 +328,18 @@ export function resolveConnection(projectId?: number | null): Connection {
   const globalCompat = parseCompat(global?.compat_json);
   const projectCompat = parseCompat(project?.compat_json);
   const compat: ModelCompat = { ...globalCompat, ...projectCompat };
+  const probe = parseProbeResult(pick(project?.structured_outputs_json, global?.structured_outputs_json));
+
+  // Resolved before the return object so the structured-outputs probe-freshness
+  // check can compare against the exact baseUrl/modelId this connection calls.
+  const baseUrl = pick(envBaseUrl, project?.base_url, global?.base_url, cfg.providerBaseUrl)!;
+  const defaultModelId = pick(project?.default_model, global?.default_model, cfg.defaultModelId)!;
 
   return {
-    baseUrl: pick(envBaseUrl, project?.base_url, global?.base_url, cfg.providerBaseUrl)!,
+    baseUrl,
     apiKey: pick(envApiKey, project?.api_key, global?.api_key, cfg.apiKey) ?? "",
     api: pick(project?.api, global?.api) ?? "openai-completions",
-    defaultModelId: pick(project?.default_model, global?.default_model, cfg.defaultModelId)!,
+    defaultModelId,
     contextWindow: pick(project?.context_window, global?.context_window, cfg.contextWindow)!,
     maxTokens: pick(project?.max_tokens, global?.max_tokens, cfg.maxTokens)!,
     requestTimeoutMs: pick(project?.request_timeout_ms, global?.request_timeout_ms, cfg.requestTimeoutMs)!,
@@ -235,6 +354,7 @@ export function resolveConnection(projectId?: number | null): Connection {
       parseThinkingBudgets(project?.thinking_budgets),
       parseThinkingBudgets(global?.thinking_budgets),
     ),
+    structuredOutputs: resolveStructuredOutputs(compat, probe, baseUrl, defaultModelId),
   };
 }
 
@@ -244,16 +364,21 @@ export function resolveConnection(projectId?: number | null): Connection {
  * row — a named config (created via the Models UI) is a complete, standalone
  * profile with its own base_url/api_key/text_mode/two_phase/compat. Bootstrap
  * config only fills in fields the row itself leaves unset.
+ *
+ * Exported for the capability-profile probe route (routes/api.ts), which needs
+ * the row's HAND-FLAG resolution (no profile applied) to import as overrides.
  */
-function connectionFromConfigRow(row: ConfigRow): Connection {
+export function connectionFromConfigRow(row: ConfigRow): Connection {
   const cfg = getConfig();
   const envBaseUrl = process.env.ORCHESTRA_BASE_URL;
   const envApiKey = process.env.ORCHESTRA_API_KEY;
+  const baseUrl = pick(envBaseUrl, row.base_url, cfg.providerBaseUrl)!;
+  const defaultModelId = pick(row.default_model, cfg.defaultModelId)!;
   return {
-    baseUrl: pick(envBaseUrl, row.base_url, cfg.providerBaseUrl)!,
+    baseUrl,
     apiKey: pick(envApiKey, row.api_key, cfg.apiKey) ?? "",
     api: row.api ?? "openai-completions",
-    defaultModelId: pick(row.default_model, cfg.defaultModelId)!,
+    defaultModelId,
     contextWindow: pick(row.context_window, cfg.contextWindow)!,
     maxTokens: pick(row.max_tokens, cfg.maxTokens)!,
     requestTimeoutMs: pick(row.request_timeout_ms, cfg.requestTimeoutMs)!,
@@ -264,7 +389,102 @@ function connectionFromConfigRow(row: ConfigRow): Connection {
     twoPhase: boolFromDb(row.two_phase) ?? false,
     compat: parseCompat(row.compat_json),
     thinkingBudgets: parseThinkingBudgets(row.thinking_budgets),
+    structuredOutputs: resolveStructuredOutputs(
+      parseCompat(row.compat_json),
+      parseProbeResult(row.structured_outputs_json),
+      baseUrl,
+      defaultModelId,
+    ),
   };
+}
+
+/**
+ * Overlay a stored capability profile's effective decisions onto a hand-flag
+ * Connection (PLANNING/overhaul/06 §4). The Connection shape stays — downstream
+ * code (runRole, providers) doesn't care where the flags came from.
+ *
+ * Precedence, by field:
+ *  - textMode/twoPhase: profile-first. Zero behavior change at import time is
+ *    guaranteed by the probe route seeding the profile's `overrides` from the
+ *    hand flags, not by consulting the hand flags here.
+ *  - structuredOutputs: profile verdictDelivery, EXCEPT when the config row
+ *    sets `compat.structuredOutputsOverride` — that stays a deliberate,
+ *    always-winning operator switch (same rule as resolveStructuredOutputs).
+ *  - reasoning: profile value when the dialect sniff produced one.
+ *  - compat booleans (supportsDeveloperRole/supportsReasoningEffort/
+ *    maxTokensField): the config row's explicit compat values remain the
+ *    override layer (doc §Detailed changes 3) — the profile only fills fields
+ *    the row leaves unset.
+ *
+ * No stored profile for (connection, model) → the connection is returned
+ * untouched, i.e. exactly today's hand-flag behavior.
+ */
+export function applyProfileToConnection(conn: Connection, modelId: string): Connection {
+  const profile = loadProfile(profileConnectionSig(conn.baseUrl), modelId);
+  if (!profile) return conn;
+  const eff = effectiveDecisions(profile);
+
+  const next: Connection = { ...conn, compat: { ...conn.compat } };
+  next.textMode = eff.runShape === "text";
+  next.twoPhase = eff.runShape === "two-turn";
+  // Only overlay when the profile actually resolved a constrained-decoding
+  // rung — otherwise leave conn.structuredOutputs exactly as the hand-flag
+  // path computed it (already "off" absent a cached endpoint probe). Forcing
+  // a fabricated `probedAt` onto the "off" case would break the "zero
+  // behavior change on day one" guarantee: a profile that measures no
+  // constrained decoding must be indistinguishable from no profile at all.
+  if (
+    !conn.compat.structuredOutputsOverride &&
+    (eff.verdictDelivery === "json_schema" || eff.verdictDelivery === "guided_json" || eff.verdictDelivery === "grammar")
+  ) {
+    next.structuredOutputs = { mode: eff.verdictDelivery, probedAt: profile.probedAt ?? undefined };
+  }
+  if (eff.reasoning !== undefined) next.reasoning = eff.reasoning;
+  if (conn.compat.supportsDeveloperRole === undefined && eff.supportsDeveloperRole !== undefined) {
+    next.compat.supportsDeveloperRole = eff.supportsDeveloperRole;
+  }
+  if (conn.compat.supportsReasoningEffort === undefined && eff.supportsReasoningEffort !== undefined) {
+    next.compat.supportsReasoningEffort = eff.supportsReasoningEffort;
+  }
+  if (conn.compat.maxTokensField === undefined && eff.maxTokensField !== undefined) {
+    next.compat.maxTokensField = eff.maxTokensField;
+  }
+  // effectiveContext (overhaul/07): a raw probe observation, not a derived
+  // decision — no ProfileOverrides field for it, so it applies whenever the
+  // probe found one, independent of the rest of the override machinery above.
+  if (profile.probes.effectiveContext != null && profile.probes.effectiveContext > 0) {
+    next.effectiveContext = profile.probes.effectiveContext;
+  }
+  return next;
+}
+
+/**
+ * Snapshot a Connection's current hand-tuned decisions as profile overrides —
+ * the auto-import of the doc's rollout step 2. Seeding these on first probe
+ * makes flipping resolution to profile-first a no-op by construction; removing
+ * them model-by-model as measured decisions prove out is rollout step 3.
+ */
+export function importedOverridesForConnection(conn: Connection): ProfileOverrides {
+  const overrides: ProfileOverrides = {
+    runShape: conn.textMode ? "text" : conn.twoPhase ? "two-turn" : "single-turn",
+    verdictDelivery:
+      conn.structuredOutputs.mode !== "off"
+        ? conn.structuredOutputs.mode
+        : conn.textMode
+          ? "fence"
+          : "tool_call",
+    reasoning: conn.reasoning,
+  };
+  if (conn.compat.supportsDeveloperRole !== undefined) {
+    overrides.supportsDeveloperRole = conn.compat.supportsDeveloperRole;
+  }
+  if (conn.compat.supportsReasoningEffort !== undefined) {
+    overrides.supportsReasoningEffort = conn.compat.supportsReasoningEffort;
+  }
+  if (conn.compat.maxTokensField !== undefined) {
+    overrides.maxTokensField = conn.compat.maxTokensField;
+  }
+  return overrides;
 }
 
 export interface ResolvedModel {
@@ -290,6 +510,10 @@ export interface ResolvedModel {
  * This is what lets textMode/twoPhase vary per model: two roles pointed at
  * two different named configs each get that config's own tool-calling mode,
  * instead of both being governed by whichever connection is flagged default.
+ *
+ * Profile-first (PLANNING/overhaul/06): after the hand-flag resolution, a
+ * stored capability profile for the (connection, modelId) pair overlays its
+ * measured decisions via applyProfileToConnection. No profile → unchanged.
  */
 export function resolveConnectionForModel(
   modelRef: string | null | undefined,
@@ -298,9 +522,11 @@ export function resolveConnectionForModel(
   if (modelRef) {
     const match = listModelConfigs().find((c) => c.name === modelRef);
     if (match) {
-      return { connection: connectionFromConfigRow(match), modelId: match.default_model || modelRef };
+      const modelId = match.default_model || modelRef;
+      return { connection: applyProfileToConnection(connectionFromConfigRow(match), modelId), modelId };
     }
   }
   const connection = resolveConnection(projectId);
-  return { connection, modelId: modelRef || connection.defaultModelId };
+  const modelId = modelRef || connection.defaultModelId;
+  return { connection: applyProfileToConnection(connection, modelId), modelId };
 }
