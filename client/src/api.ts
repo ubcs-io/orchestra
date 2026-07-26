@@ -893,6 +893,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ task_ids: taskIds }),
     }),
+  bulkDelete: (projectId: number, taskIds: string[]) =>
+    req<{ ok: boolean; deleted: number }>(`/api/projects/${projectId}/tasks/bulk-delete`, {
+      method: "POST",
+      body: JSON.stringify({ task_ids: taskIds }),
+    }),
 
   resetTask: (taskId: string) => req<{ task: Task }>(`/api/tasks/${taskId}/reset`, { method: "POST" }),
 

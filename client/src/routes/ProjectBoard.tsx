@@ -219,6 +219,10 @@ export function ProjectBoard() {
   const [isCleanupMode, setIsCleanupMode] = useState(false);
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
   const [showCleanupModal, setShowCleanupModal] = useState(false);
+  // "Clean slate" — the select-all flavor of cleanup mode: instead of
+  // archiving the selection as wont_do, it hard-deletes every selected task
+  // (and its todos/decompositions) so the board comes back empty.
+  const [isCleanSlate, setIsCleanSlate] = useState(false);
 
   // Scheduler state for the intake column banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
@@ -247,6 +251,17 @@ export function ProjectBoard() {
     onSuccess: () => {
       setSelectedTaskIds(new Set());
       setIsCleanupMode(false);
+      setShowCleanupModal(false);
+      qc.invalidateQueries({ queryKey: ["tasks", pid] });
+    },
+  });
+
+  const bulkDelete = useMutation({
+    mutationFn: () => api.bulkDelete(pid, [...selectedTaskIds]),
+    onSuccess: () => {
+      setSelectedTaskIds(new Set());
+      setIsCleanupMode(false);
+      setIsCleanSlate(false);
       setShowCleanupModal(false);
       qc.invalidateQueries({ queryKey: ["tasks", pid] });
     },
@@ -358,13 +373,16 @@ export function ProjectBoard() {
     } else if (isCleanupMode) {
       setIsCleanupMode(false);
       setSelectedTaskIds(new Set());
+      setIsCleanSlate(false);
     } else {
       setIsCleanupMode(true);
       setSelectedTaskIds(new Set());
+      setIsCleanSlate(false);
     }
   }
 
   function toggleSelectTask(taskId: string) {
+    setIsCleanSlate(false);
     setSelectedTaskIds((prev) => {
       const next = new Set(prev);
       if (next.has(taskId)) {
@@ -376,8 +394,22 @@ export function ProjectBoard() {
     });
   }
 
+  function toggleCleanSlate() {
+    if (isCleanSlate) {
+      setIsCleanSlate(false);
+      setSelectedTaskIds(new Set());
+    } else {
+      setIsCleanSlate(true);
+      setSelectedTaskIds(new Set((tasksQ.data?.tasks ?? []).map((t) => t.task_id)));
+    }
+  }
+
   function handleCleanupConfirm() {
-    bulkWontDo.mutate();
+    if (isCleanSlate) {
+      bulkDelete.mutate();
+    } else {
+      bulkWontDo.mutate();
+    }
   }
 
   function handleCleanupCancel() {
@@ -387,6 +419,7 @@ export function ProjectBoard() {
   function exitCleanupMode() {
     setIsCleanupMode(false);
     setSelectedTaskIds(new Set());
+    setIsCleanSlate(false);
     setShowCleanupModal(false);
   }
 
@@ -491,20 +524,29 @@ export function ProjectBoard() {
         <>
           {isCleanupMode && (
             <div className="cleanup-banner" style={{ marginBottom: 12 }}>
-              <span>🗑️ Cleanup mode — click tasks to select them for archival</span>
+              <span>
+                {isCleanSlate
+                  ? "🧹 Clean slate — every task selected for permanent deletion"
+                  : "🗑️ Cleanup mode — click tasks to select them for archival"}
+              </span>
               <div className="spacer" style={{ flex: 1 }} />
               <span className="muted" style={{ fontSize: 12, marginRight: 8 }}>
                 {selectedTaskIds.size} selected
               </span>
+              <button className="small" onClick={toggleCleanSlate} style={{ marginRight: 4 }}>
+                {isCleanSlate ? "Deselect all" : "🧹 Select all (Clean slate)"}
+              </button>
               <button className="small" onClick={exitCleanupMode} style={{ marginRight: 4 }}>
                 Cancel
               </button>
               <button
-                className="primary small"
+                className={isCleanSlate ? "danger small" : "primary small"}
                 disabled={selectedTaskIds.size === 0}
                 onClick={() => setShowCleanupModal(true)}
               >
-                Archive selected ({selectedTaskIds.size})
+                {isCleanSlate
+                  ? `Wipe everything (${selectedTaskIds.size})`
+                  : `Archive selected (${selectedTaskIds.size})`}
               </button>
             </div>
           )}
@@ -616,21 +658,40 @@ export function ProjectBoard() {
       {showCleanupModal && (
         <div className="modal-overlay">
           <div className="modal">
-            <h3>🗑️ Archive tasks</h3>
-            <p style={{ color: "var(--ink-dim)", fontSize: 13, marginTop: 8 }}>
-              Mark <strong>{selectedTaskIds.size}</strong> selected task{selectedTaskIds.size === 1 ? "" : "s"} as
-              "won't do" and archive them? They will be paused and removed from active scheduling.
-            </p>
+            {isCleanSlate ? (
+              <>
+                <h3>🧹 Clean slate</h3>
+                <p style={{ color: "var(--ink-dim)", fontSize: 13, marginTop: 8 }}>
+                  Permanently delete <strong>all {selectedTaskIds.size}</strong> task
+                  {selectedTaskIds.size === 1 ? "" : "s"} in this project — including their todos, plans, and
+                  decompositions? This cannot be undone.
+                </p>
+              </>
+            ) : (
+              <>
+                <h3>🗑️ Archive tasks</h3>
+                <p style={{ color: "var(--ink-dim)", fontSize: 13, marginTop: 8 }}>
+                  Mark <strong>{selectedTaskIds.size}</strong> selected task{selectedTaskIds.size === 1 ? "" : "s"} as
+                  "won't do" and archive them? They will be paused and removed from active scheduling.
+                </p>
+              </>
+            )}
             <div className="modal-actions">
               <button onClick={handleCleanupCancel}>
                 Cancel
               </button>
               <button
                 className="danger"
-                disabled={bulkWontDo.isPending}
+                disabled={bulkWontDo.isPending || bulkDelete.isPending}
                 onClick={handleCleanupConfirm}
               >
-                {bulkWontDo.isPending ? "Archiving…" : `Yes, archive ${selectedTaskIds.size} task${selectedTaskIds.size === 1 ? "" : "s"}`}
+                {isCleanSlate
+                  ? bulkDelete.isPending
+                    ? "Wiping…"
+                    : `Yes, permanently delete ${selectedTaskIds.size} task${selectedTaskIds.size === 1 ? "" : "s"}`
+                  : bulkWontDo.isPending
+                    ? "Archiving…"
+                    : `Yes, archive ${selectedTaskIds.size} task${selectedTaskIds.size === 1 ? "" : "s"}`}
               </button>
             </div>
           </div>

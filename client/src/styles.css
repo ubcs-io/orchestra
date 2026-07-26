@@ -37,6 +37,8 @@ button {
 }
 button:hover { border-color: var(--brass); }
 button.primary { background: var(--brass-dim); border-color: var(--brass); color: #fff; }
+button.danger { background: rgba(204, 91, 91, 0.15); border-color: var(--bad); color: var(--bad); }
+button.danger:hover { background: rgba(204, 91, 91, 0.3); }
 button.small { padding: 2px 7px; font-size: 12px; }
 input, textarea, select {
   font: inherit; background: #0f1216; color: var(--ink);

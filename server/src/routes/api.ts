@@ -58,7 +58,7 @@ import {
 import { resolveAutonomyConfig, validateAutonomyConfig, getOrResetIdleWindowBudget, recordHumanActivity } from "../autonomy.js";
 import { resolveAutonomyLevel, validateAutonomyLevel } from "../autonomy-level.js";
 import { resolvePlanningRigor, validatePlanningRigor } from "../planning-rigor.js";
-import { abortWatcherScan } from "../watchers.js";
+import { abortWatcherScan, startWatcherLoop, stopWatcherLoop } from "../watchers.js";
 import type { HealthStatGroupBy, RoleRunRow } from "../db.js";
 import { computeRunHealth, runHealthReason, roleRunHealthInput } from "../health.js";
 import { resolveHarnessPolicy, validateExecAllowlist, validateToolsJson } from "../harness-policy.js";
@@ -616,10 +616,15 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   app.get("/api/scheduler", async () => ({ running: isSchedulerRunning(), stopping: isSchedulerStopping() }));
   app.post("/api/scheduler/start", async () => {
     startScheduler();
+    startWatcherLoop();
     return { running: true };
   });
   app.post("/api/scheduler/stop", () => {
     stopScheduler();
+    // The watcher loop is a second, independent heartbeat (autonomy scans +
+    // triage + self-generated task creation) — it must stop in lockstep with
+    // the main scheduler, or "Stop loop" in the UI silently leaves it running.
+    stopWatcherLoop();
     return { running: false, stopping: isSchedulerStopping() };
   });
   app.post("/api/tick", async () => ({ worked: await tick() }));
@@ -1454,6 +1459,29 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       }
     }
     return { ok: true, updated: tasks.length };
+  });
+
+  // "Clean slate" — hard-deletes tasks (and their worktrees/plans) rather than
+  // just archiving them as wont_do, for when the user wants to wipe a project
+  // back to empty instead of keeping a won't-do trail.
+  app.post("/api/projects/:id/tasks/bulk-delete", async (req: FastifyRequest, reply: FastifyReply) => {
+    const projectId = Number((req.params as { id: string }).id);
+    const project = getProject(projectId);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { task_ids?: string[] };
+    if (!body.task_ids || !Array.isArray(body.task_ids) || body.task_ids.length === 0) {
+      return bad(reply, 400, "task_ids must be a non-empty array");
+    }
+    const tasks = body.task_ids.map((tid) => getTask(tid)).filter((t): t is NonNullable<typeof t> => !!t);
+    for (const t of tasks) {
+      if (t.project_id !== projectId) {
+        return bad(reply, 400, `task ${t.task_id} does not belong to this project`);
+      }
+    }
+    for (const t of tasks) {
+      await deleteTaskAndWorktree(t.task_id, true);
+    }
+    return { ok: true, deleted: tasks.length };
   });
 
   // ---- Interventions (steering) ----

@@ -144,10 +144,6 @@ export function Projects() {
               <span className="stat-value">{stats.paused}</span>
               <span className="stat-label">Paused</span>
             </div>
-            <div className="stat-card">
-              <span className="stat-value">{stats.projects_count}</span>
-              <span className="stat-label">Projects</span>
-            </div>
           </div>
           <div className="stage-breakdown">
             {Object.entries(stats.by_stage).map(([stage, count]) => (

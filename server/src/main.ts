@@ -18,11 +18,7 @@ import { apiRoutes } from "./routes/api.js";
 import { safetyRoutes } from "./routes/safety.js";
 import { sseRoutes } from "./routes/sse.js";
 import { startScheduler, stopScheduler } from "./orchestrator.js";
-import { tickWatchers, stopWatcherLoop } from "./watchers.js";
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+import { startWatcherLoop, stopWatcherLoop, watcherLoopIdle } from "./watchers.js";
 
 async function main(): Promise<void> {
   const cfg = getConfig();
@@ -60,24 +56,16 @@ async function main(): Promise<void> {
   // Autonomy watchers (PLANNING/overhaul/08): a second, independent loop —
   // deliberately not folded into tickOnce/startScheduler, so watchers.ts can
   // import from orchestrator.ts (materializeIntakeTask, getRoleRunner)
-  // without orchestrator.ts ever needing to import watchers.ts back.
-  let watcherLoopStopped = false;
-  const watcherLoop = (async () => {
-    while (!watcherLoopStopped) {
-      try {
-        await tickWatchers();
-      } catch (err) {
-        console.error(`[watchers] tick error: ${(err as Error).message}`);
-      }
-      await sleep(getConfig().schedulerIdleMs);
-    }
-  })();
+  // without orchestrator.ts ever needing to import watchers.ts back. It has
+  // its own start/stop lifecycle (see watchers.ts) that routes/api.ts's
+  // scheduler start/stop endpoints drive in lockstep with startScheduler/
+  // stopScheduler, so stopping the loop from the UI actually stops both.
+  startWatcherLoop();
 
   const shutdown = async (sig: string) => {
     app.log.info(`received ${sig}, shutting down`);
-    watcherLoopStopped = true;
     stopWatcherLoop();
-    await watcherLoop;
+    await watcherLoopIdle();
     await stopScheduler();
     await app.close();
     try {

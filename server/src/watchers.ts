@@ -14,13 +14,16 @@
  *
  * Module boundary: this file imports FROM `orchestrator.ts` (materializeIntakeTask,
  * getRoleRunner) — `orchestrator.ts` does NOT import this file back. Instead
- * `main.ts` wires `tickWatchers()` into its own loop, parallel to how it wires
- * `startScheduler()`. This keeps the import graph one-directional.
+ * this module owns its own start/stop loop (`startWatcherLoop`/`stopWatcherLoop`),
+ * parallel to `orchestrator.ts`'s `startScheduler`/`stopScheduler`, and `main.ts`
+ * / `routes/api.ts` start and stop both loops together. This keeps the import
+ * graph one-directional while still giving the two loops one shared on/off switch.
  */
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { getConfig } from "./config.js";
 import {
   createCandidate,
   findLatestCandidateByFingerprint,
@@ -357,10 +360,50 @@ export function abortWatcherScan(projectId: number): void {
   activeScanAborts.get(projectId)?.abort();
 }
 
-/** Aborts every in-progress scan across every project — the bulk shutdown
- *  path, called alongside `stopScheduler()`. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let loopStopped = true;
+let loopHandle: Promise<void> | undefined;
+
+/** Start the watcher heartbeat — a second, independent loop from the main
+ *  task scheduler (see module comment), but with the identical start/stop
+ *  lifecycle so it can be driven by the exact same UI control. Idempotent. */
+export function startWatcherLoop(): void {
+  if (!loopStopped) return;
+  loopStopped = false;
+  loopHandle = (async () => {
+    while (!loopStopped) {
+      try {
+        await tickWatchers();
+      } catch (err) {
+        console.error(`[watchers] tick error: ${(err as Error).message}`);
+      }
+      await sleep(getConfig().schedulerIdleMs);
+    }
+  })();
+}
+
+/** Signal the watcher loop to stop and abort every in-progress scan — the
+ *  same "stop everything now" contract as `stopScheduler()`. Must be wired
+ *  to every place that stops the main scheduler (the UI's "Stop loop" button
+ *  and process shutdown alike); a watcher loop left running after the user
+ *  stops the primary loop can still fire LLM calls and queue new tasks
+ *  invisibly, which is exactly the trust violation this pairing prevents. */
 export function stopWatcherLoop(): void {
+  loopStopped = true;
   for (const ac of activeScanAborts.values()) ac.abort();
+}
+
+/** Resolves once the loop has actually exited its current iteration — used
+ *  by process shutdown to wait for a graceful stop before closing the DB. */
+export function watcherLoopIdle(): Promise<void> {
+  return loopHandle ?? Promise.resolve();
+}
+
+export function isWatcherLoopRunning(): boolean {
+  return !loopStopped;
 }
 
 function watcherDueMetaKey(projectId: number, watcherName: string): string {
@@ -380,11 +423,12 @@ function markWatcherRan(projectId: number, wc: WatcherConfig): void {
 }
 
 /**
- * Called once per scheduler round (wired into `main.ts`'s own loop, parallel
- * to `startScheduler`). For every project: resolves autonomy config, checks
- * enabled + active-hours + idle-window budget, runs any due+enabled watcher,
- * and triages every candidate it produces. Returns true if any watcher scan
- * ran this round, so the caller's idle-sleep can treat it like other work.
+ * Called once per round of this module's own loop (`startWatcherLoop`),
+ * parallel to `startScheduler`'s. For every project: resolves autonomy
+ * config, checks enabled + active-hours + idle-window budget, runs any
+ * due+enabled watcher, and triages every candidate it produces. Returns true
+ * if any watcher scan ran this round, so the caller's idle-sleep can treat
+ * it like other work.
  */
 export async function tickWatchers(): Promise<boolean> {
   let didWork = false;
