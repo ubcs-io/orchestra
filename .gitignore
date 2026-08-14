@@ -2,6 +2,11 @@
 config.json
 !config.example.json
 
+# Instance encryption key for secrets at rest (PLANNING/overhaul-2/02).
+# Generated on first boot when ORCHESTRA_SECRET_KEY isn't set. Losing it means
+# re-entering any stored GitHub token / API key.
+secret.key
+
 # SQLite database (task state)
 orchestra.db
 *.db-journal

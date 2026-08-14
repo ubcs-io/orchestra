@@ -226,3 +226,66 @@ describe("getOrResetIdleWindowBudget", () => {
     expect(fresh.consumed.taskStarts).toBe(0);
   });
 });
+
+describe("selfMaintenance config", () => {
+  it("defaults every flag on — the parent kill-switch is what ships off", () => {
+    const c = resolveAutonomyConfig(null);
+    expect(c.selfMaintenance).toEqual({
+      enabled: true,
+      reprobeModels: true,
+      backfillDigests: true,
+      reapWorkspaces: true,
+    });
+  });
+
+  it("honours individually-disabled sub-flags and ignores non-boolean junk", () => {
+    const c = resolveAutonomyConfig(cfg({ selfMaintenance: { reprobeModels: false, backfillDigests: "yes" } }));
+    expect(c.selfMaintenance.reprobeModels).toBe(false);
+    expect(c.selfMaintenance.backfillDigests).toBe(true); // junk → default, never coerced
+    expect(c.selfMaintenance.enabled).toBe(true);
+  });
+
+  it("rejects a non-object selfMaintenance at save time with a reportable error", () => {
+    const result = validateAutonomyConfig({ selfMaintenance: [] });
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("watcher config", () => {
+  it("ships all six watchers, with only test-suite enabled", () => {
+    const c = resolveAutonomyConfig(null);
+    expect(c.watchers.map((w) => w.name)).toEqual([
+      "test-suite",
+      "todo-scan",
+      "branch-triage",
+      "doc-drift",
+      "lint-drift",
+      "dep-staleness",
+    ]);
+    expect(c.watchers.filter((w) => w.enabled).map((w) => w.name)).toEqual(["test-suite"]);
+  });
+
+  it("clamps thresholdDays and leaves it undefined when unset", () => {
+    const c = resolveAutonomyConfig(
+      cfg({
+        watchers: [
+          { name: "todo-scan", enabled: true, thresholdDays: -10 },
+          { name: "doc-drift", enabled: true },
+        ],
+      }),
+    );
+    expect(c.watchers[0]!.thresholdDays).toBe(0);
+    expect(c.watchers[1]!.thresholdDays).toBeUndefined();
+  });
+
+  it("a resolved config is fully detached from the shared defaults", () => {
+    const a = resolveAutonomyConfig(null);
+    a.watchers[0]!.enabled = false;
+    a.selfMaintenance.enabled = false;
+    a.budgets.maxTaskStarts = 1;
+    const b = resolveAutonomyConfig(null);
+    expect(b.watchers[0]!.enabled).toBe(true);
+    expect(b.selfMaintenance.enabled).toBe(true);
+    expect(b.budgets.maxTaskStarts).toBe(DEFAULT_AUTONOMY_CONFIG.budgets.maxTaskStarts);
+  });
+});

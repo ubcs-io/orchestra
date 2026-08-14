@@ -89,6 +89,19 @@ export interface HarnessPolicy {
   /** Extra environment variables for executed commands, on top of exec.ts's
    *  minimal passthrough allowlist (e.g. { "NODE_ENV": "test" }). */
   execEnv?: Record<string, string>;
+  /**
+   * Which role keys, if any, may have a stored secret (the project's GitHub
+   * PAT) resolved into their run context (PLANNING/overhaul-2/02 §2).
+   *
+   * A documented NO-OP today, and deliberately so. No role currently receives a
+   * secret: the PAT is used server-side, by github.ts, for pushes and PRs a
+   * human triggers — it is never handed to a model. Today's default is
+   * therefore "no role sees secrets", and this field exists to make that
+   * enforced-and-explicit rather than incidental, so the day a role gains its
+   * own push capability the grant has to be written down here rather than
+   * inherited by accident. An empty array (the default) means no role.
+   */
+  secretScope?: string[];
 }
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 120_000;
@@ -103,6 +116,7 @@ export const DEFAULT_HARNESS_POLICY: HarnessPolicy = {
   execTimeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
   execMaxOutputBytes: DEFAULT_EXEC_MAX_OUTPUT_BYTES,
   execMaxRuns: DEFAULT_EXEC_MAX_RUNS,
+  secretScope: [],
 };
 
 /** Clamp a numeric policy knob to a sane range, falling back to the default for
@@ -185,7 +199,33 @@ export function resolveHarnessPolicy(projectConfigJson: string | null): HarnessP
     ),
     execMaxRuns: clampNumber(harness.execMaxRuns, DEFAULT_EXEC_MAX_RUNS, 1, 50),
     execEnv: sanitizeExecEnv(harness.execEnv),
+    secretScope: sanitizeSecretScope(harness.secretScope),
   };
+}
+
+/** Anything that isn't a list of non-empty role keys reads as "no role" — the
+ *  safe direction for a field that grants credential access. */
+function sanitizeSecretScope(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out = new Set<string>();
+  for (const item of raw) {
+    if (typeof item === "string" && item.trim()) out.add(item.trim());
+  }
+  return [...out];
+}
+
+/**
+ * Whether a role may have the project's stored secrets resolved into its run
+ * context (PLANNING/overhaul-2/02 §2).
+ *
+ * Always false in this build: nothing calls it with a role that's in scope,
+ * because nothing puts a secret into a run context at all. It exists so that
+ * the "no role sees secrets" default is a checked rule rather than an
+ * unwritten one — a future role that can push on its own has to come through
+ * here, not around it.
+ */
+export function roleMaySeeSecrets(policy: HarnessPolicy, roleKey: string): boolean {
+  return (policy.secretScope ?? []).includes(roleKey);
 }
 
 export type ExecAllowlistValidation =

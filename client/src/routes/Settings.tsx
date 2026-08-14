@@ -70,6 +70,8 @@ function SafetyDashboard() {
         <div>
           <RolesSummary data={data} />
           <HarnessPolicySummary data={data} />
+          <BudgetSummary data={data} />
+          <SecretsSummary data={data} />
           <SecurityPosture data={data} />
         </div>
       </div>
@@ -323,6 +325,120 @@ function HarnessPolicySummary({ data }: { data: SafetyResponse }) {
   );
 }
 
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** Per-project spend ceilings (PLANNING/overhaul-2/01). Read-only here — this
+ *  is the "what stops this thing?" panel, and editing happens in the project's
+ *  own Roles Editor, same as the harness policy above. */
+function BudgetSummary({ data }: { data: SafetyResponse }) {
+  const bp = data.budget_policy;
+  if (!bp) return null;
+  const budgeted = bp.projects.filter((p) => p.enabled);
+
+  return (
+    <div className="panel" style={{ marginTop: 12 }}>
+      <strong style={{ marginBottom: 8, display: "block" }}>Spend Ceilings (per project)</strong>
+      {budgeted.length === 0 ? (
+        <span className="pill dim" style={{ fontSize: 11 }}>
+          no project has a spend ceiling — nothing stops a runaway task
+        </span>
+      ) : (
+        <>
+          <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>{bp.usd_note}</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {budgeted.map((p) => (
+              <div key={p.id} className="row" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
+                <span
+                  className={`pill ${p.over_cap ? "bad" : p.enforced ? "ok" : "warn"}`}
+                  style={{ fontSize: 10 }}
+                >
+                  {p.over_cap ? `over cap (${p.breached.join(" + ")})` : p.enforced ? "enforcing" : "no cap set"}
+                </span>
+                <strong style={{ fontSize: 12 }}>{p.name}</strong>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {fmtTokens(p.spent_tokens)}
+                  {p.cap_tokens != null ? ` / ${fmtTokens(p.cap_tokens)}` : ""} tokens
+                </span>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {/* A floor, not a total, whenever some runs had no price. */}
+                  {p.spent_usd_is_partial ? "≥ " : ""}${p.spent_usd.toFixed(2)}
+                  {p.cap_usd != null ? ` / $${p.cap_usd.toFixed(2)}` : ""}
+                </span>
+                <span className="muted" style={{ fontSize: 10 }}>last {p.period_days}d</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Which secrets exist, how old they are, and where the key that protects them
+ *  lives (PLANNING/overhaul-2/02 §3). Never a value — presence and age only. */
+function SecretsSummary({ data }: { data: SafetyResponse }) {
+  const qc = useQueryClient();
+  const secrets = data.secrets;
+  const clear = useMutation({
+    mutationFn: (projectId: number) => api.clearGithubToken(projectId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["safety"] });
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+  if (!secrets) return null;
+  const withToken = secrets.projects.filter((p) => p.has_github_token);
+
+  return (
+    <div className="panel" style={{ marginTop: 12 }}>
+      <strong style={{ marginBottom: 8, display: "block" }}>Stored Secrets</strong>
+      <div className="row" style={{ justifyContent: "flex-start", gap: 8, marginBottom: 8 }}>
+        <span className={`pill ${data.storage.secrets_encrypted_at_rest ? "ok" : "bad"}`} style={{ fontSize: 10 }}>
+          {data.storage.secrets_encrypted_at_rest ? "encrypted at rest" : "plaintext at rest"}
+        </span>
+        <span className="muted" style={{ fontSize: 11 }}>
+          key: <code style={{ fontSize: 10 }}>{secrets.key_source}</code>
+        </span>
+      </div>
+      <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>{secrets.key_loss_note}</p>
+
+      {withToken.length === 0 ? (
+        <span className="pill dim" style={{ fontSize: 11 }}>no project has a GitHub token stored</span>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {withToken.map((p) => (
+            <div key={p.id} className="row" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
+              <span className="pill ok" style={{ fontSize: 10 }}>GitHub PAT</span>
+              <strong style={{ fontSize: 12 }}>{p.name}</strong>
+              <span className="muted" style={{ fontSize: 10 }}>
+                row last written {new Date(p.last_updated_at).toLocaleDateString()}
+              </span>
+              <button
+                className="small danger"
+                disabled={clear.isPending}
+                title="Removes Orchestra's copy only — the token stays valid on GitHub until you revoke it there"
+                onClick={() => clear.mutate(p.id)}
+              >
+                clear
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+        {secrets.roles_with_secret_access.length === 0
+          ? "No role receives a secret in its run context. The GitHub token is used server-side for pushes and PRs you trigger — it is never handed to a model."
+          : `Roles granted secret access: ${secrets.roles_with_secret_access.map((r) => r.role).join(", ")}`}
+      </p>
+    </div>
+  );
+}
+
 function SummaryBadge({ label, value, tone }: { label: string; value: number; tone?: string }) {
   return (
     <div style={{
@@ -364,7 +480,11 @@ function SecurityPosture({ data }: { data: SafetyResponse }) {
           </span>
           {st.api_key_in_db && !st.api_key_in_env && (
             <span className="muted" style={{ fontSize: 10 }}>
-              stored in <code>{st.db_path}</code> — use ORCHESTRA_API_KEY env to keep it out of the DB
+              {st.secrets_encrypted_at_rest
+                ? // Still worth flagging: encryption keeps the key out of a
+                  // leaked DB file, but the key that unlocks it sits beside it.
+                  <>encrypted in <code>{st.db_path}</code> — use ORCHESTRA_API_KEY to keep it out of the DB entirely</>
+                : <>stored in <code>{st.db_path}</code> — use ORCHESTRA_API_KEY env to keep it out of the DB</>}
             </span>
           )}
         </div>

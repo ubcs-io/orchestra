@@ -21,15 +21,42 @@
 import { getMeta, setMeta, sumAutonomousTokensSince } from "./db.js";
 
 export interface WatcherConfig {
-  /** Registry key — "test-suite" is the only entry shipped this pass. */
+  /** Registry key — see `WATCHER_REGISTRY` in watchers.ts for the live list. */
   name: string;
   enabled: boolean;
   /** Minimum minutes between two runs of this watcher. */
   cadenceMinutes: number;
   /** Max candidates from this watcher that may reach "queued" per UTC day. */
   perWatcherDailyCap: number;
-  /** Exec-allowlist command names (harness-policy.ts) this watcher invokes. */
+  /** Exec-allowlist command names (harness-policy.ts) this watcher invokes.
+   *  Only meaningful for the exec-backed watchers (test-suite, lint-drift,
+   *  dep-staleness); the natively-read ones ignore it. */
   commands?: string[];
+  /** Age gate, for the watchers that have one: how old a TODO marker
+   *  (`todo-scan`) or a quiet branch (`branch-triage`) must be before it's
+   *  worth proposing. Ignored by watchers with no age dimension. */
+  thresholdDays?: number;
+}
+
+/** Idle-time upkeep of the system itself (PLANNING/overhaul/08 §5) — runs in
+ *  the same idle window, under the same budgets, as watcher work. Every flag
+ *  defaults ON because the parent `enabled` kill-switch is already OFF: a
+ *  project that has deliberately turned autonomy on wants its own upkeep done
+ *  too, and each sub-flag exists to turn one piece back off. */
+export interface SelfMaintenanceConfig {
+  enabled: boolean;
+  /** Probe + profile models seen in config but with no capability profile yet
+   *  (overhaul/06) — "a model pulled into Ollama at midnight is usable by
+   *  morning". */
+  reprobeModels: boolean;
+  /** Generate the rolling digests (overhaul/07) that runs missed because their
+   *  fire-and-forget digest call failed or was still in flight at shutdown. */
+  backfillDigests: boolean;
+  /** Reclaim `orchestra/*` branches and worktree directories with no owning
+   *  task row, so Orchestra's bookkeeping doesn't accumulate in the user's repo
+   *  and swamp plain `git branch`. Never force-deletes: an orphan holding
+   *  unmerged commits is left alone. */
+  reapWorkspaces: boolean;
 }
 
 export interface ActiveHours {
@@ -60,8 +87,20 @@ export interface AutonomyConfig {
   autoQueueDepth: number;
   budgets: AutonomyBudgets;
   watchers: WatcherConfig[];
+  selfMaintenance: SelfMaintenanceConfig;
 }
 
+/**
+ * Only `test-suite` ships enabled. The other five are present-but-off so the
+ * editor can list them without an operator hand-writing config_json, and so
+ * turning autonomy on for the first time doesn't hand a repo six simultaneous
+ * new sources of self-generated work — the doc's own rollout order is "the
+ * remaining watchers one at a time, each with its cap".
+ *
+ * `dep-staleness` is doubly inert: off here, and its commands must also be
+ * added to the exec allowlist, because it's the only watcher that reaches
+ * outside the operator's network.
+ */
 export const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   enabled: false,
   activeHours: null,
@@ -70,7 +109,13 @@ export const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   budgets: { maxTaskStarts: 10, maxTokens: 2_000_000, maxExecRuns: 50 },
   watchers: [
     { name: "test-suite", enabled: true, cadenceMinutes: 60, perWatcherDailyCap: 2, commands: ["test", "typecheck"] },
+    { name: "todo-scan", enabled: false, cadenceMinutes: 1440, perWatcherDailyCap: 1, thresholdDays: 30 },
+    { name: "branch-triage", enabled: false, cadenceMinutes: 1440, perWatcherDailyCap: 1, thresholdDays: 30 },
+    { name: "doc-drift", enabled: false, cadenceMinutes: 1440, perWatcherDailyCap: 1 },
+    { name: "lint-drift", enabled: false, cadenceMinutes: 360, perWatcherDailyCap: 2, commands: ["lint"] },
+    { name: "dep-staleness", enabled: false, cadenceMinutes: 1440, perWatcherDailyCap: 1, commands: ["outdated", "audit"] },
   ],
+  selfMaintenance: { enabled: true, reprobeModels: true, backfillDigests: true, reapWorkspaces: true },
 };
 
 function clampNumber(v: unknown, fallback: number, min: number, max: number): number {
@@ -92,7 +137,7 @@ function sanitizeActiveHours(raw: unknown): ActiveHours | null {
 }
 
 function sanitizeWatchers(raw: unknown): WatcherConfig[] {
-  if (!Array.isArray(raw)) return [...DEFAULT_AUTONOMY_CONFIG.watchers];
+  if (!Array.isArray(raw)) return DEFAULT_AUTONOMY_CONFIG.watchers.map((w) => ({ ...w }));
   const out: WatcherConfig[] = [];
   const seen = new Set<string>();
   for (const item of raw) {
@@ -110,9 +155,24 @@ function sanitizeWatchers(raw: unknown): WatcherConfig[] {
         Array.isArray(w.commands) && w.commands.every((c) => typeof c === "string")
           ? (w.commands as string[])
           : undefined,
+      thresholdDays:
+        w.thresholdDays == null ? undefined : clampNumber(w.thresholdDays, 30, 0, 3650),
     });
   }
-  return out.length ? out : [...DEFAULT_AUTONOMY_CONFIG.watchers];
+  return out.length ? out : DEFAULT_AUTONOMY_CONFIG.watchers.map((w) => ({ ...w }));
+}
+
+function sanitizeSelfMaintenance(raw: unknown): SelfMaintenanceConfig {
+  const d = DEFAULT_AUTONOMY_CONFIG.selfMaintenance;
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return { ...d };
+  const s = raw as Record<string, unknown>;
+  const flag = (v: unknown, fallback: boolean): boolean => (typeof v === "boolean" ? v : fallback);
+  return {
+    enabled: flag(s.enabled, d.enabled),
+    reprobeModels: flag(s.reprobeModels, d.reprobeModels),
+    backfillDigests: flag(s.backfillDigests, d.backfillDigests),
+    reapWorkspaces: flag(s.reapWorkspaces, d.reapWorkspaces),
+  };
 }
 
 function sanitizeBudgets(raw: unknown): AutonomyBudgets {
@@ -124,18 +184,30 @@ function sanitizeBudgets(raw: unknown): AutonomyBudgets {
   };
 }
 
+/** A fully-detached copy of the defaults — nested arrays/objects included, so a
+ *  caller mutating a resolved config can never write through to the shared
+ *  DEFAULT_AUTONOMY_CONFIG. */
+function defaultConfigClone(): AutonomyConfig {
+  return {
+    ...DEFAULT_AUTONOMY_CONFIG,
+    budgets: { ...DEFAULT_AUTONOMY_CONFIG.budgets },
+    watchers: DEFAULT_AUTONOMY_CONFIG.watchers.map((w) => ({ ...w })),
+    selfMaintenance: { ...DEFAULT_AUTONOMY_CONFIG.selfMaintenance },
+  };
+}
+
 /** Resolve autonomy config from a project's config_json `{ autonomy: {...} }`
  *  sub-key, spread over the default — mirrors harness-policy.ts's
  *  resolveHarnessPolicy(). Never throws: malformed JSON or a missing key both
  *  read as "fully inert defaults". */
 export function resolveAutonomyConfig(projectConfigJson: string | null): AutonomyConfig {
-  if (!projectConfigJson) return { ...DEFAULT_AUTONOMY_CONFIG, watchers: [...DEFAULT_AUTONOMY_CONFIG.watchers] };
+  if (!projectConfigJson) return defaultConfigClone();
   let autonomy: Partial<AutonomyConfig> = {};
   try {
     const parsed = JSON.parse(projectConfigJson) as { autonomy?: Partial<AutonomyConfig> };
     autonomy = parsed.autonomy ?? {};
   } catch {
-    return { ...DEFAULT_AUTONOMY_CONFIG, watchers: [...DEFAULT_AUTONOMY_CONFIG.watchers] };
+    return defaultConfigClone();
   }
   return {
     enabled: autonomy.enabled === true,
@@ -144,6 +216,7 @@ export function resolveAutonomyConfig(projectConfigJson: string | null): Autonom
     autoQueueDepth: clampNumber(autonomy.autoQueueDepth, DEFAULT_AUTONOMY_CONFIG.autoQueueDepth, 0, 100),
     budgets: sanitizeBudgets(autonomy.budgets),
     watchers: sanitizeWatchers(autonomy.watchers),
+    selfMaintenance: sanitizeSelfMaintenance(autonomy.selfMaintenance),
   };
 }
 
@@ -186,6 +259,9 @@ export function validateAutonomyConfig(raw: unknown): AutonomyValidation {
   }
   if (a.budgets != null && (typeof a.budgets !== "object" || Array.isArray(a.budgets))) {
     return { ok: false, error: "budgets must be an object" };
+  }
+  if (a.selfMaintenance != null && (typeof a.selfMaintenance !== "object" || Array.isArray(a.selfMaintenance))) {
+    return { ok: false, error: "selfMaintenance must be an object" };
   }
   return { ok: true, config: resolveAutonomyConfig(JSON.stringify({ autonomy: raw })) };
 }

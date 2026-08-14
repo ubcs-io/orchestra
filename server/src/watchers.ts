@@ -1,9 +1,13 @@
 /**
  * Watchers (PLANNING/overhaul/08 §1/§2): read-only scanners that turn repo
- * state into self-generated intake. This pass ships exactly one — `test-suite`,
- * the doc's own highest-value pick — running the project's configured
- * test/typecheck commands against a dedicated, read-only scan worktree of the
- * default branch, never a task worktree.
+ * state into self-generated intake. This module is the *orchestration* half —
+ * the registry, the per-round loop, fingerprint dedupe, the flake guard, triage
+ * and every cap. The scans themselves live in `watcher-scans.ts`, which this
+ * file imports (and never the other way round).
+ *
+ * All six watchers run against a dedicated, read-only scan worktree of the
+ * default branch, prepared once per project per round here — never a task
+ * worktree, and never twice in one round by two different watchers.
  *
  * A watcher never creates a task directly: it produces a candidate, which
  * `tickWatchers` dedupes against prior sightings and hands to
@@ -21,8 +25,6 @@
  */
 
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { getConfig } from "./config.js";
 import {
   createCandidate,
@@ -37,7 +39,6 @@ import {
   type CandidateRow,
   type ProjectRow,
 } from "./db.js";
-import { ensureWorktree, resetHardTo, resolveRef, currentBranch, WORKTREES_DIR } from "./git.js";
 import { buildExecEnv, isGreen, runExecCommand, type ExecEvidence } from "./exec.js";
 import {
   DEFAULT_EXEC_MAX_OUTPUT_BYTES,
@@ -58,52 +59,25 @@ import { resolveRouterConfig, triageCandidate } from "./router.js";
 import { resolveConnectionForModel } from "./settings.js";
 import { FLOW_TEMPLATES, type IntakeKind } from "./roles.js";
 import { getRoleRunner, materializeIntakeTask } from "./orchestrator.js";
+import {
+  ensureScanWorktree,
+  prepareScanWorktree,
+  resetScanWorktreeToBase,
+  runBranchTriageWatcher,
+  runDepStalenessWatcher,
+  runDocDriftWatcher,
+  runLintDriftWatcher,
+  runTodoScanWatcher,
+  type ScanContext,
+  type WatcherCandidate,
+  type WatcherScanFn,
+} from "./watcher-scans.js";
+import { runSelfMaintenance } from "./self-maintenance.js";
 
-// ---------------------------------------------------------------------------
-// Scan worktree lifecycle
-// ---------------------------------------------------------------------------
-
-const SCAN_BRANCH = "orchestra/_scan";
-
-function scanWorktreeDir(project: ProjectRow): string {
-  return path.join(project.repo_path, WORKTREES_DIR, "_scan");
-}
-
-/** Node/npm-specific workaround: a fresh git worktree has no `node_modules`
- *  (gitignored everywhere), which would fail `npm test`/`typecheck` for a
- *  reason that has nothing to do with the code under test. Symlinks the
- *  primary checkout's `node_modules` in if the scan worktree doesn't have one
- *  yet. Best-effort — never throws. A real gap for non-Node stacks, flagged as
- *  a follow-up rather than solved generally in this pass. */
-function symlinkNodeModulesIfMissing(repoPath: string, scanDir: string): void {
-  try {
-    const target = path.join(scanDir, "node_modules");
-    const source = path.join(repoPath, "node_modules");
-    if (fs.existsSync(target) || !fs.existsSync(source)) return;
-    fs.symlinkSync(source, target, "dir");
-  } catch (err) {
-    console.warn(`[watchers] could not link node_modules into scan worktree: ${(err as Error).message}`);
-  }
-}
-
-/** Create (once) a project's dedicated, read-only scan worktree on its own
- *  stable branch — never a task worktree. Idempotent, like `ensureTaskWorkspace`. */
-export function ensureScanWorktree(project: ProjectRow): string {
-  const dir = scanWorktreeDir(project);
-  const baseBranch = project.main_branch || currentBranch(project.repo_path);
-  ensureWorktree(project.repo_path, dir, SCAN_BRANCH, baseBranch);
-  symlinkNodeModulesIfMissing(project.repo_path, dir);
-  return dir;
-}
-
-/** Reset the scan worktree to the default branch's current tip before every
- *  scan, without touching whatever's checked out at the project's own
- *  repo_path (the scan worktree sits on its own branch throughout). */
-export function resetScanWorktreeToBase(project: ProjectRow, scanDir: string): void {
-  const baseBranch = project.main_branch || currentBranch(project.repo_path);
-  const tipSha = resolveRef(project.repo_path, baseBranch);
-  resetHardTo(scanDir, tipSha);
-}
+// The scan-worktree lifecycle moved to watcher-scans.ts (so the scans can own
+// it without importing this module back); re-exported here because it is part
+// of this subsystem's public surface.
+export { ensureScanWorktree, resetScanWorktreeToBase, type WatcherCandidate };
 
 // ---------------------------------------------------------------------------
 // Fingerprinting
@@ -184,34 +158,14 @@ export function confirmOrDeferFingerprint(
 // The test-suite watcher
 // ---------------------------------------------------------------------------
 
-export interface WatcherCandidate {
-  watcher: string;
-  kind: string;
-  fingerprint: string;
-  payload: Record<string, unknown>;
-}
-
 /**
  * Runs the project's configured exec-allowlist commands (default
- * `["test","typecheck"]`, or the watcher's own `commands` override) against a
- * freshly-reset scan worktree of the default branch. Never throws — a red
- * suite, a missing command, or a worktree-setup failure are all ordinary,
- * recordable-or-skippable outcomes, matching `runExecCommand`'s own contract.
+ * `["test","typecheck"]`, or the watcher's own `commands` override) against the
+ * freshly-reset scan worktree the loop prepared. Never throws — a red suite and
+ * a missing command are both ordinary, recordable-or-skippable outcomes,
+ * matching `runExecCommand`'s own contract.
  */
-export async function runTestSuiteWatcher(
-  project: ProjectRow,
-  watcherCfg: WatcherConfig,
-  signal?: AbortSignal,
-): Promise<WatcherCandidate[]> {
-  let scanDir: string;
-  try {
-    scanDir = ensureScanWorktree(project);
-    resetScanWorktreeToBase(project, scanDir);
-  } catch (err) {
-    console.warn(`[watchers] test-suite scan worktree setup failed for project ${project.id}: ${(err as Error).message}`);
-    return [];
-  }
-
+export const runTestSuiteWatcher: WatcherScanFn = async ({ project, cfg: watcherCfg, scanDir, signal }) => {
   const policy = resolveHarnessPolicy(project.config_json);
   const commandNames = watcherCfg.commands?.length ? watcherCfg.commands : ["test", "typecheck"];
   const env = buildExecEnv(policy);
@@ -254,7 +208,7 @@ export async function runTestSuiteWatcher(
     });
   }
   return candidates;
-}
+};
 
 // ---------------------------------------------------------------------------
 // Candidate -> task promotion (Call Point 6 triage + caps)
@@ -345,11 +299,68 @@ export async function triageAndMaybeQueue(
 // Registry + scheduler entry point
 // ---------------------------------------------------------------------------
 
-type WatcherFn = (project: ProjectRow, cfg: WatcherConfig, signal?: AbortSignal) => Promise<WatcherCandidate[]>;
-
-const WATCHER_REGISTRY: Record<string, WatcherFn> = {
+/** Every watcher the scheduler knows how to run. A config entry naming
+ *  something absent from here is ignored (not an error) — a config written
+ *  against a newer build must never crash an older one. */
+const WATCHER_REGISTRY: Record<string, WatcherScanFn> = {
   "test-suite": runTestSuiteWatcher,
+  "todo-scan": runTodoScanWatcher,
+  "branch-triage": runBranchTriageWatcher,
+  "doc-drift": runDocDriftWatcher,
+  "lint-drift": runLintDriftWatcher,
+  "dep-staleness": runDepStalenessWatcher,
 };
+
+export interface WatcherDescriptor {
+  name: string;
+  /** One line, shown in the watcher editor. */
+  description: string;
+  /** True when the watcher is inert until exec commands are configured. */
+  requiresExec: boolean;
+  /** True when the watcher honours `thresholdDays`. */
+  usesThresholdDays: boolean;
+}
+
+/** The registry, described for the UI — so the watcher editor lists what this
+ *  build can actually run instead of hardcoding a parallel list that drifts. */
+export const WATCHER_CATALOG: WatcherDescriptor[] = [
+  {
+    name: "test-suite",
+    description: "Runs the project's test/typecheck commands against a clean scan worktree; proposes a fix task when the same failure appears twice.",
+    requiresExec: true,
+    usesThresholdDays: false,
+  },
+  {
+    name: "todo-scan",
+    description: "Finds TODO/FIXME/HACK/XXX comments older than the age threshold (by git blame), so decayed markers get resolved or deleted.",
+    requiresExec: false,
+    usesThresholdDays: true,
+  },
+  {
+    name: "branch-triage",
+    description: "Asks about local branches with unmerged commits that have gone quiet — produces a question for the human, never deletes anything.",
+    requiresExec: false,
+    usesThresholdDays: true,
+  },
+  {
+    name: "doc-drift",
+    description: "Flags documentation referring to code symbols that no longer exist anywhere in the source.",
+    requiresExec: false,
+    usesThresholdDays: false,
+  },
+  {
+    name: "lint-drift",
+    description: "Runs the lint command and proposes cleanup only when the problem count grows against the previous observation.",
+    requiresExec: true,
+    usesThresholdDays: false,
+  },
+  {
+    name: "dep-staleness",
+    description: "Outdated dependencies and high/critical advisories. The only watcher that reaches the package registry — offline-tolerant, and off until you enable it.",
+    requiresExec: true,
+    usesThresholdDays: false,
+  },
+];
 
 /** Per-project abort controllers for an in-progress scan — lets the kill-switch
  *  (or a project-level autonomy PATCH) halt a mid-scan watcher immediately
@@ -426,9 +437,13 @@ function markWatcherRan(projectId: number, wc: WatcherConfig): void {
  * Called once per round of this module's own loop (`startWatcherLoop`),
  * parallel to `startScheduler`'s. For every project: resolves autonomy
  * config, checks enabled + active-hours + idle-window budget, runs any
- * due+enabled watcher, and triages every candidate it produces. Returns true
- * if any watcher scan ran this round, so the caller's idle-sleep can treat
- * it like other work.
+ * due+enabled watcher, triages every candidate it produces, and finally runs
+ * idle-time self-maintenance (§5). Returns true if any scan ran this round, so
+ * the caller's idle-sleep can treat it like other work.
+ *
+ * The scan worktree is prepared at most **once per project per round**, lazily
+ * on the first due watcher — six watchers must not each `git reset --hard` the
+ * same directory, still less reset it out from under one another.
  */
 export async function tickWatchers(): Promise<boolean> {
   let didWork = false;
@@ -438,18 +453,23 @@ export async function tickWatchers(): Promise<boolean> {
     if (!isWithinActiveHours(cfg.activeHours, new Date())) continue;
     if (getOrResetIdleWindowBudget(project.id, cfg).exhausted) continue;
 
+    let scanDir: string | null | undefined; // undefined = not yet attempted
     for (const wc of cfg.watchers) {
       if (!wc.enabled) continue;
       const fn = WATCHER_REGISTRY[wc.name];
       if (!fn) continue;
       if (!watcherIsDue(project.id, wc)) continue;
 
+      if (scanDir === undefined) scanDir = prepareScanWorktree(project);
+      if (scanDir === null) break; // worktree unavailable — no scan can run this round
+
       const controller = new AbortController();
       activeScanAborts.set(project.id, controller);
       didWork = true;
       try {
         markWatcherRan(project.id, wc);
-        const found = await fn(project, wc, controller.signal);
+        const ctx: ScanContext = { project, cfg: wc, scanDir, signal: controller.signal };
+        const found = await fn(ctx);
         for (const cand of found) {
           const existing = findLatestCandidateByFingerprint(project.id, cand.watcher, cand.fingerprint);
           if (existing) continue; // already tracked in some state — nothing new to do
@@ -468,6 +488,11 @@ export async function tickWatchers(): Promise<boolean> {
         activeScanAborts.delete(project.id);
       }
     }
+
+    // §5: the system's own upkeep runs in the same idle window, under the same
+    // budgets, after the watchers — repo work first, housekeeping with what's
+    // left.
+    if (await runSelfMaintenance(project, cfg)) didWork = true;
   }
   return didWork;
 }

@@ -8,6 +8,7 @@
  * is no external broker.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import {
   createIntervention,
@@ -19,6 +20,7 @@ import {
   familyMembersExcluding,
   familyRootId,
   getNetwork,
+  getNetworkByIntakeKind,
   getProject,
   getRole,
   getRoleRun,
@@ -26,6 +28,7 @@ import {
   listInterventions,
   listProjects,
   listRoleRuns,
+  listRoles,
   listTasks,
   listUnconsumedInterventions,
   markInterventionConsumed,
@@ -47,10 +50,16 @@ import {
   checkoutBranch,
   commitArtifacts,
   currentBranch,
+  deleteBranch,
   ensureWorktree,
+  ensureWorktreesIgnored,
   headSha,
+  listOrchestraBranches,
   moveArtifact,
+  ORCHESTRA_BRANCH_PREFIX,
+  SCAN_WORKSPACE_NAME,
   planningRoot,
+  pruneWorktrees,
   reconcileBranch,
   refineCommitMessage,
   removeFile,
@@ -61,6 +70,7 @@ import {
   scaffoldPlanning,
   scanIntake,
   worktreePath,
+  worktreesRoot,
   writeArtifact,
 } from "./git.js";
 import {
@@ -104,6 +114,7 @@ import {
 import { checkReachable } from "./providers.js";
 import { execEnabled, resolveHarnessPolicy } from "./harness-policy.js";
 import { getOrResetIdleWindowBudget, isWithinActiveHours, resolveAutonomyConfig } from "./autonomy.js";
+import { budgetOverrideActive, evaluateProjectBudget, shouldPublishBudgetWarning } from "./budget-policy.js";
 import { effectiveAutonomyLevel } from "./autonomy-level.js";
 import { DEFAULT_PLANNING_RIGOR, effectivePlanningRigor, type PlanningRigor } from "./planning-rigor.js";
 import {
@@ -127,9 +138,20 @@ import {
   assessBorderline,
   assessSecondReview,
   assessAnswerMatch,
+  planIntake,
   type RouterConfig,
   type SecondReviewResult,
 } from "./router.js";
+import {
+  buildHeuristicProposal,
+  buildNetworkCatalog,
+  intakeReviewState,
+  isScoutingIntake,
+  mergePlannerProposal,
+  resolveIntakeReviewConfig,
+  SCOUT_ROLES,
+  type IntakeProposal,
+} from "./intake-review.js";
 
 // ---------------------------------------------------------------------------
 // Role runner seam — injectable so the loop can be tested without a live LLM.
@@ -414,7 +436,7 @@ function mergeCriteriaResults(
   return [...reported.filter((r) => !evidenceIds.has(r.id)), ...checks.map(evidenceCheckToResult)];
 }
 
-function readPlan(task: TaskRow): RefinementPlan | null {
+export function readPlan(task: TaskRow): RefinementPlan | null {
   if (!task.refinement_plan_json) return null;
   try {
     return JSON.parse(task.refinement_plan_json) as RefinementPlan;
@@ -539,7 +561,7 @@ function loadEdges(plan: RefinementPlan): NetworkEdge[] {
  * Build an EdgeEvaluationContext from the most recent completed role run
  * and the rolled-up task coverage.
  */
-function buildEdgeContext(lastRun: RoleRunRow, taskId: string): EdgeEvaluationContext {
+export function buildEdgeContext(lastRun: RoleRunRow, taskId: string): EdgeEvaluationContext {
   const coverage = rollupCoverage(taskId);
   let criteriaResults: CriteriaResult[] = [];
   if (lastRun.criteria_results_json) {
@@ -678,7 +700,7 @@ export function mergeCoverageItems(itemsPerRun: CoverageItem[][]): CoverageMap {
   return map;
 }
 
-function rollupCoverage(taskId: string): CoverageMap {
+export function rollupCoverage(taskId: string): CoverageMap {
   const itemsPerRun: CoverageItem[][] = [];
   for (const run of listRoleRuns(taskId)) {
     if (!run.coverage_json) continue;
@@ -750,7 +772,19 @@ export function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow
     // the recursive call below guarantees exists. root_task_id is already
     // flattened at creation time, so this recursion is always exactly depth 1.
     let root = getTask(rootId);
-    if (!root) return task; // defensive: root row was deleted, see deleteTask route guard
+    if (!root) {
+      // The root row is gone despite `deleteTask`'s re-rooting (a crash between
+      // the two writes, or a row removed out-of-band). Promote this task to its
+      // own root and give it a real worktree rather than returning it
+      // unchanged: with no `git_worktree_path`, `taskRepoPath` falls back to
+      // the project's SHARED checkout, and running a role there loses worktree
+      // isolation entirely. A redundant worktree is a far cheaper failure.
+      console.warn(
+        `[git] family root ${rootId.slice(0, 8)} is missing — promoting ${task.task_id.slice(0, 8)} to its own root`,
+      );
+      const promoted = updateTask(task.task_id, { root_task_id: task.task_id, task_type: "root" }) ?? task;
+      return ensureTaskWorkspace(promoted, project);
+    }
     root = ensureTaskWorkspace(root, project);
     if (
       task.git_worktree_path === root.git_worktree_path &&
@@ -773,7 +807,13 @@ export function ensureTaskWorkspace(task: TaskRow, project: ProjectRow): TaskRow
     updateProject(project.id, { main_branch: baseBranch });
   }
   const branch = task.git_branch ?? taskBranchName(task);
-  const dir = worktreePath(project.repo_path, task.task_id);
+  // Prefer the recorded path over recomputing one from this task's id. A
+  // worktree directory is named for whichever task was root when it was
+  // created, and `reRootFamily` can hand it to an heir with a different id —
+  // recomputing would then try to `worktree add` the family's branch a second
+  // time, which git refuses ("already used by worktree at ..."). Null again
+  // after a reap, so a restore gets a fresh directory named for itself.
+  const dir = task.git_worktree_path ?? worktreePath(project.repo_path, task.task_id);
   ensureWorktree(project.repo_path, dir, branch, baseBranch);
   if (task.git_worktree_path === dir && task.git_branch === branch && task.git_base_branch === baseBranch) {
     return task;
@@ -814,7 +854,20 @@ const INTAKE_COMPACTION_TAIL_CHARS = 2000;
  */
 export function materializeIntakeTask(
   project: ProjectRow,
-  input: { name: string; content: string; intakeKind: IntakeKind; origin?: string; priority?: number },
+  input: {
+    name: string;
+    content: string;
+    intakeKind: IntakeKind;
+    origin?: string;
+    priority?: number;
+    /** Route this intake through the pre-flight review layer
+     *  (PLANNING/intake-refinement.md) instead of starting its filed kind's
+     *  flow directly. Callers decide explicitly — `ingestProject` and the
+     *  intake route consult the project's own default, while watcher-originated
+     *  intake deliberately does not, so enabling review for humans never
+     *  silently parks autonomous work on a human. */
+    review?: boolean;
+  },
 ): TaskRow {
   const planningDir = project.planning_dir || "PLANNING";
   const kind = input.intakeKind;
@@ -871,15 +924,48 @@ export function materializeIntakeTask(
     [relArtifact, ...(sidecarRelPath ? [sidecarRelPath] : [])],
     `intake(${kind}): ${input.name}`,
   );
+
+  // Pre-flight review (PLANNING/intake-refinement.md): instead of letting the
+  // filed intake kind's whole flow start, seed the flow-independent scout
+  // prefix and mark the task scouting. The scheduler runs those two steps
+  // exactly as it runs any other — no separate execution path — and
+  // runTaskStepOnce turns the finished prefix into a proposal a human steers.
+  if (input.review) {
+    const plan = scoutPlan();
+    updateTask(task.task_id, {
+      refinement_plan_json: JSON.stringify(plan),
+      intake_review_state: "scouting",
+      stage: "refining",
+    });
+    publish(task.task_id, "task_update", { stage: "refining", intakeReview: "scouting" });
+    return getTask(task.task_id)!;
+  }
+
   publish(task.task_id, "task_update", { stage: "intake" });
   return getTask(task.task_id)!;
 }
 
-export function ingestProject(project: ProjectRow): TaskRow[] {
+/** The scout prefix as a plan: intake_triage then explorer, nothing else. No
+ *  networkId/nodeIds, so nextStep falls back to plain linear order — correct,
+ *  since no network has been chosen yet. */
+function scoutPlan(): RefinementPlan {
+  return { steps: SCOUT_ROLES.map((role) => ({ role, status: "pending" as const, depth: 1 })) };
+}
+
+export function ingestProject(
+  project: ProjectRow,
+  /** Per-call override of the project's intake-review default. The intake route
+   *  passes the board's explicit choice; the scheduler's own sweep passes
+   *  nothing, so a file dropped into INTAKE — a human filing work with no UI in
+   *  front of them — follows the project default ("off" everywhere until an
+   *  operator opts in, see resolveIntakeReviewConfig). */
+  opts: { review?: boolean } = {},
+): TaskRow[] {
   const planningDir = project.planning_dir || "PLANNING";
   scaffoldPlanning(project.repo_path, planningDir);
   const files = scanIntake(project.repo_path, planningDir);
   const created: TaskRow[] = [];
+  const review = opts.review ?? resolveIntakeReviewConfig(project.config_json).default === "on";
   for (const f of files) {
     const kind = inferIntakeKind(f.fileName, f.content);
     // Consume the INTAKE original on the shared checkout first — before this
@@ -889,10 +975,306 @@ export function ingestProject(project: ProjectRow): TaskRow[] {
     removeFile(f.absPath);
     commitArtifacts(project.repo_path, [path.join(planningDir, "INTAKE")], `intake(${kind}): consumed ${f.fileName}`);
 
-    const task = materializeIntakeTask(project, { name: f.fileName, content: f.content, intakeKind: kind });
+    const task = materializeIntakeTask(project, {
+      name: f.fileName,
+      content: f.content,
+      intakeKind: kind,
+      review,
+    });
     created.push(task);
   }
   return created;
+}
+
+// ---------------------------------------------------------------------------
+// Intake review (PLANNING/intake-refinement.md)
+//
+// The orchestration half of the pre-flight review layer — the part that needs
+// plan seeding, the role runner, and the budget table, all of which live here.
+// The pure half (config, proposal type, heuristic proposal, validation) is
+// intake-review.ts, which this imports and never imports back.
+// ---------------------------------------------------------------------------
+
+/** What each effort size actually buys at this task's rigor, rendered from the
+ *  real budget table. Handed to the planner so it sizes against consequences
+ *  rather than adjectives, and to the client so the review card can say "M ×
+ *  standard → up to 12 subtasks, max depth 2" beside the control instead of
+ *  making a human guess what the letter costs. One source of truth: both go
+ *  through resolveFamilyBudget, the same function the decomposition gate uses. */
+export function effortBudgetPreview(
+  task: TaskRow,
+  rigor: PlanningRigor,
+): Array<{ size: EffortSize; maxCount: number; maxDepth: number }> {
+  return (Object.keys(EFFORT_BUDGET) as EffortSize[]).map((size) => ({
+    size,
+    ...resolveFamilyBudget({ ...task, effort_size: size }, rigor),
+  }));
+}
+
+function budgetPreviewText(preview: ReturnType<typeof effortBudgetPreview>): string {
+  return preview
+    .map(({ size, maxCount, maxDepth }) =>
+      maxCount === 0
+        ? `- ${size}: no decomposition at all — routes straight to implementation`
+        : `- ${size}: up to ${maxCount} subtasks, max depth ${maxDepth}`,
+    )
+    .join("\n");
+}
+
+/** A scout run's own report, capped for the planner prompt. */
+function scoutReport(run: RoleRunRow | undefined): string {
+  if (!run) return "";
+  return (run.output_md || run.summary || "").slice(0, 6000);
+}
+
+/**
+ * A warning to surface on the proposal card when the scout prefix itself
+ * flagged something — typically intake_triage judging the intake too vague to
+ * proceed. Nothing about the review changes; the human is the gate here by
+ * construction, so this rides along as a banner on the card rather than
+ * escalating the task somewhere the human has to dig it back out of.
+ */
+function scoutWarning(runs: Array<RoleRunRow | undefined>): string | null {
+  const flagged = runs.filter(
+    (r): r is RoleRunRow => !!r && (r.verdict === "blocker" || r.verdict === "needs_human"),
+  );
+  if (!flagged.length) return null;
+  return flagged
+    .map((r) => `${r.role_key} reported "${r.verdict}": ${r.summary ?? "(no summary recorded)"}`)
+    .join(" · ");
+}
+
+/**
+ * Turn a finished scout prefix into a proposal and park the task on a human.
+ *
+ * Always terminates the scouting state, on every path — planner off, planner
+ * failed, planner returned nonsense. That is a hard requirement, not a
+ * nicety: a task left `scouting` with no pending steps would be re-picked by
+ * the scheduler every tick, and applyGate's scouting guard would keep refusing
+ * to finalize it, spinning forever.
+ */
+async function completeScoutPass(task: TaskRow, project: ProjectRow): Promise<void> {
+  // A "Start as-is" that arrived mid-prefix, applied now that no step is
+  // holding the plan (see IntakeReviewState's skip_pending).
+  if (intakeReviewState(task) === "skip_pending") {
+    skipIntakeReview(task.task_id);
+    return;
+  }
+
+  const planningDir = project.planning_dir || "PLANNING";
+  const triageRun = latestPrimaryRun(task.task_id, "intake_triage");
+  const explorerRun = latestPrimaryRun(task.task_id, "explorer");
+  const intakeKind = (task.intake_kind as IntakeKind) || "manual";
+  const rigor = effectivePlanningRigor(task, project);
+  const defaultNetwork = getNetworkByIntakeKind(project.id, intakeKind);
+
+  const heuristic = buildHeuristicProposal({
+    intakeKind,
+    defaultNetworkId: defaultNetwork?.network_id ?? null,
+    effortSize: (task.effort_size as EffortSize | null) ?? null,
+    planningRigor: rigor,
+    scoutWarning: scoutWarning([triageRun, explorerRun]),
+  });
+
+  let proposal = heuristic;
+  const routerCfg = getRouterCfg(project);
+  if (routerCfg?.intakePlanning) {
+    const networks = buildNetworkCatalog(project.id);
+    const availableRoles = listRoles(project.id).map((r) => r.key);
+    const { connection, modelId } = resolveConnectionForModel(
+      routerCfg.model || project.default_model,
+      project.id,
+    );
+    try {
+      const result = await planIntake(
+        {
+          projectName: project.name,
+          taskName: task.name ?? task.task_id.slice(0, 8),
+          intakeContent: (task.content ?? "").slice(0, 8000),
+          currentIntakeKind: intakeKind,
+          triageSummary: scoutReport(triageRun),
+          explorerSummary: scoutReport(explorerRun),
+          explorerEffortSize: (task.effort_size as string | null) ?? null,
+          networks: networks.map((n) => ({
+            network_id: n.network_id,
+            name: n.name,
+            description: n.description,
+            intake_kind: n.intake_kind,
+            roles: n.roles,
+          })),
+          availableRoles,
+          budgetPreview: budgetPreviewText(effortBudgetPreview(task, rigor)),
+        },
+        getRoleRunner(),
+        taskRepoPath(task, project),
+        planningDir,
+        modelId,
+        connection,
+      );
+      if (result) proposal = mergePlannerProposal(heuristic, result, { networks, availableRoles });
+    } catch (err) {
+      // Never fatal: the heuristic proposal below is a complete, usable card.
+      console.warn(`[intake-review] planner call failed: ${(err as Error).message}`);
+    }
+  }
+
+  updateTask(task.task_id, {
+    intake_proposal_json: JSON.stringify(proposal),
+    intake_review_state: "proposed",
+    paused: 1,
+  });
+  publish(task.task_id, "task_update", { intakeReview: "proposed", stage: "refining" });
+}
+
+/**
+ * Apply an accepted (and possibly human-edited) proposal: seed the real plan
+ * from the chosen network/role list with the scout prefix already `done`, write
+ * every field the proposal decided, and release the task to the scheduler.
+ *
+ * The prefix is marked done rather than re-run because those two runs are
+ * already recorded in `role_runs` — buildRoleContext picks them up as priors
+ * exactly like any other completed step. This is the same reuse the
+ * decomposition-child path already performs when it strips intake_triage and
+ * explorer from a child's plan (see runTaskStepOnce).
+ */
+export function applyIntakeProposal(taskId: string, proposal: IntakeProposal): TaskRow | undefined {
+  const task = getTask(taskId);
+  if (!task) return undefined;
+  const project = task.project_id != null ? getProject(task.project_id) : undefined;
+  if (!project) return undefined;
+
+  // Write the routing decisions FIRST, then build the plan from the updated
+  // row. Order matters: withPromotedRoles keys off `intake_kind`, and both it
+  // and applyXsFastPath resolve the terminal role from `exit_kind` — reading
+  // those off the pre-accept row would apply the promoted roles of whatever
+  // kind the human just changed away from.
+  let updated =
+    updateTask(taskId, {
+      intake_kind: proposal.intake_kind,
+      network_id: proposal.network_id,
+      exit_kind: EXIT_KIND_BY_INTAKE[proposal.intake_kind],
+      effort_size: proposal.effort_size,
+      // "human" even when the human accepted the planner's number unchanged:
+      // they were shown it, beside what it costs, and chose to keep it. That
+      // is a decision, and a later explorer re-run must not overturn it.
+      effort_size_source: "human",
+      planning_rigor: proposal.planning_rigor,
+      autonomy_level: proposal.autonomy_level,
+      intake_proposal_json: JSON.stringify(proposal),
+      intake_review_state: "accepted",
+    }) ?? task;
+
+  // Start from the chosen network so edge routing data (nodeIdByRole/nodeIds)
+  // is carried when the role plan still matches the network's own nodes; the
+  // moment a human edits the role list, the edited list wins and the plan falls
+  // back to plain linear order, which nextStep already handles.
+  const base = planFromTemplate(proposal.intake_kind, proposal.network_id);
+  const baseRoles = base.steps.map((s) => s.role);
+  const matchesNetwork =
+    baseRoles.length === proposal.role_plan.length &&
+    baseRoles.every((r, i) => r === proposal.role_plan[i]);
+
+  let plan: RefinementPlan = matchesNetwork
+    ? base
+    : { steps: proposal.role_plan.map((role) => ({ role, status: "pending" as const, depth: 1 })) };
+
+  // The scout prefix already ran — mark those steps done wherever the chosen
+  // flow includes them, and prepend any it doesn't so the completed work is
+  // still represented in the plan the UI renders.
+  const scoutDone: PlanStep[] = [];
+  for (const role of SCOUT_ROLES) {
+    if (!latestPrimaryRun(taskId, role)) continue;
+    const existing = plan.steps.find((s) => s.role === role);
+    if (existing) existing.status = "done";
+    else scoutDone.push({ role, status: "done", depth: 1 });
+  }
+  if (scoutDone.length) plan = { ...plan, steps: [...scoutDone, ...plan.steps] };
+
+  plan = withPromotedRoles(project, updated, plan);
+
+  // XS chosen at review takes the same fast path the explorer step would have
+  // taken, through the same function and the same guards.
+  if (proposal.effort_size === "XS") {
+    const fastPathed = applyXsFastPath(updated, project, plan);
+    if (fastPathed) updated = fastPathed;
+  }
+
+  updated =
+    updateTask(taskId, {
+      refinement_plan_json: JSON.stringify(plan),
+      stage: "refining",
+      paused: 0,
+    }) ?? updated;
+
+  // Carry the human's own words into the flow. Without this, editing the
+  // restatement or correcting an assumption would change nothing a role ever
+  // sees — the proposal would be a form that only configures routing. A
+  // steer_note is the existing channel for exactly this (steeringNotes feeds
+  // buildRoleContext), so the corrections reach every subsequent role the same
+  // way any other mid-flight steer does.
+  const steer = renderProposalSteer(proposal);
+  if (steer) {
+    createIntervention({
+      task_id: taskId,
+      kind: "steer_note",
+      payload_json: JSON.stringify({ text: steer }),
+      created_by: "intake-review",
+    });
+  }
+
+  publish(taskId, "task_update", { stage: "refining", intakeReview: "accepted" });
+  return updated;
+}
+
+/** The human-authored parts of an accepted proposal, as a steer note — or null
+ *  when they left both blank (an accept-as-proposed with no restatement and no
+ *  assumptions has nothing to say that the intake itself doesn't). */
+function renderProposalSteer(proposal: IntakeProposal): string | null {
+  const parts: string[] = [];
+  if (proposal.restated_request.trim()) {
+    parts.push(`Reviewed problem statement: ${proposal.restated_request.trim()}`);
+  }
+  const answered = proposal.assumptions.filter((a) => a.assumed_answer.trim());
+  if (answered.length) {
+    parts.push(
+      `Assumptions confirmed at intake review (treat as given, not as open questions):\n` +
+        answered.map((a) => `- ${a.question} → ${a.assumed_answer}`).join("\n"),
+    );
+  }
+  return parts.length ? `[intake review] ${parts.join("\n\n")}` : null;
+}
+
+/**
+ * "Start as-is" — abandon the review and run the intake exactly as today's
+ * direct path would. Clears the plan so runTaskStepOnce seeds the filed intake
+ * kind's own flow from scratch; the scout runs stay on the record as priors,
+ * and the flow's own intake_triage/explorer steps are left pending so a task
+ * whose review was bypassed is byte-for-byte a normal task.
+ *
+ * Asked for while the scout prefix is still running, this only records the
+ * intent (`skip_pending`) — a step in flight is holding that plan and will
+ * write it back when it finishes. completeScoutPass applies the real skip at
+ * that boundary. Returns the row either way; callers can tell which happened
+ * from `intake_review_state`.
+ */
+export function skipIntakeReview(taskId: string): TaskRow | undefined {
+  const task = getTask(taskId);
+  if (!task) return undefined;
+
+  if (intakeReviewState(task) === "scouting") {
+    const deferred = updateTask(taskId, { intake_review_state: "skip_pending" });
+    publish(taskId, "task_update", { intakeReview: "skip_pending" });
+    return deferred;
+  }
+
+  const updated = updateTask(taskId, {
+    intake_review_state: "skipped",
+    refinement_plan_json: null,
+    stage: "intake",
+    paused: 0,
+  });
+  publish(taskId, "task_update", { stage: "intake", intakeReview: "skipped" });
+  return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1394,7 @@ function answeredQuestions(taskId: string): Array<{ question: string; answer: st
 
 /** Parse a role_run's open_questions_json, tolerating the legacy plain-string
  *  form stored before questions carried a guess/confidence/resolution. */
-function parseOpenQuestions(json: string | null): OpenQuestion[] {
+export function parseOpenQuestions(json: string | null): OpenQuestion[] {
   if (!json) return [];
   try {
     const raw = JSON.parse(json) as unknown[];
@@ -1575,6 +1957,57 @@ function isNetworkError(message: string): boolean {
 // Running one role step
 // ---------------------------------------------------------------------------
 
+/**
+ * XS fast path: truncate the planning gauntlet and route straight to the
+ * developer/critic execution flow (the same flow an execution_ready
+ * decomposition leaf gets — see createDecompositionChildren/runTaskStepOnce).
+ * This is the single highest-value fix for the runaway-decomposition case the
+ * whole effort-sizing/budget system was built for: a genuinely XS change (a
+ * two-file default-value flip, say) has no business entering the full planning
+ * gauntlet only to have decomposition conclude "no further work" several
+ * expensive steps later.
+ *
+ * Gated on exit_kind still being "spec" — question/research/ux flows target a
+ * research_brief, not code, and forcing those into a code_change routing would
+ * be nonsensical — on level being a plain "task", on autonomy not being "plan"
+ * (which must never let a task begin writing code), and on rigor not being
+ * "thorough" (an explicit ask for more process even on small work).
+ *
+ * Extracted from runOneStep so the two entry points that can reach it — the
+ * explorer step's own XS verdict, and a human choosing XS at intake review
+ * (PLANNING/intake-refinement.md) — cannot drift on those guard conditions.
+ * `anchor` is the step to splice after; without one (the review path, where no
+ * step is currently running) it splices after the last already-completed step.
+ * Returns the updated task, or null when a guard refused.
+ */
+function applyXsFastPath(
+  task: TaskRow,
+  project: ProjectRow,
+  plan: RefinementPlan,
+  anchor?: PlanStep,
+): TaskRow | null {
+  if (
+    (task.level ?? "task") !== "task" ||
+    (task.exit_kind as ExitKind) !== "spec" ||
+    effectiveAutonomyLevel(task, project) === "plan" ||
+    effectivePlanningRigor(task, project) === "thorough"
+  ) {
+    return null;
+  }
+
+  const idx = anchor
+    ? plan.steps.indexOf(anchor)
+    : plan.steps.reduce((last, s, i) => (s.status === "pending" ? last : i), -1);
+  if (idx < 0) return null;
+
+  const updated = updateTask(task.task_id, { exit_kind: "code_change" }) ?? task;
+  plan.steps = [
+    ...plan.steps.slice(0, idx + 1),
+    ...EXECUTION_FLOW_TEMPLATE.steps.map((role) => ({ role, status: "pending" as const, depth: 1 })),
+  ];
+  return updated;
+}
+
 async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, plan: RefinementPlan): Promise<void> {
   // Ensure this task's dedicated worktree exists before touching the repo —
   // idempotent, so this is cheap on every step after the first.
@@ -1840,6 +2273,9 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
       model: modelId,
       context_tokens_est: roleContext.tokensEst,
       context_degraded: roleContext.degraded ? 1 : 0,
+      // Stamped even on the failure path (PLANNING/overhaul-2/03): a version
+      // whose runs keep dying is exactly what a version score should reflect.
+      role_version_id: role.current_version_id,
     });
     step.status = "done";
     updateTask(task.task_id, {
@@ -2033,6 +2469,11 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
     context_tokens_est: roleContext.tokensEst,
     context_degraded: roleContext.degraded ? 1 : 0,
     carry_forward: findings.carry_forward?.trim()?.slice(0, 300) || null,
+    // The role definition that produced this run (PLANNING/overhaul-2/03).
+    // Read at dispatch time from the live role, so an edit made while this run
+    // was in flight scores against the version that actually ran, not the new
+    // one.
+    role_version_id: role.current_version_id,
   });
 
   // The explorer role is the first (and only) role in every flow that has
@@ -2040,39 +2481,27 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // effort_size onto the task row immediately so the family-wide
   // decomposition budget and the XS fast path can read it off later steps
   // without re-deriving it from role_runs.
-  if (step.role === "explorer" && findings.effort_size) {
-    task = updateTask(task.task_id, { effort_size: findings.effort_size }) ?? task;
+  //
+  // Never overwrites a size a HUMAN set at intake review
+  // (PLANNING/intake-refinement.md): correcting the estimate before the budget
+  // is drawn from it is the whole point of that layer, and a loop-back that
+  // re-runs explorer would otherwise silently undo the correction.
+  if (step.role === "explorer" && findings.effort_size && task.effort_size_source !== "human") {
+    task = updateTask(task.task_id, {
+      effort_size: findings.effort_size,
+      effort_size_source: "model",
+    }) ?? task;
   }
 
-  // XS fast path: skip architecture_review/test_strategy/spec_review/
-  // decomposition entirely and route straight to the developer/critic
-  // execution flow (the same flow an execution_ready decomposition leaf
-  // gets — see createDecompositionChildren/runTaskStepOnce). This is the
-  // single highest-value fix for the runaway-decomposition case this whole
-  // effort-sizing/budget system was built for: a genuinely XS change (a
-  // two-file default-value flip, say) has no business entering the full
-  // planning gauntlet only to have decomposition conclude "no further work"
-  // several expensive steps later. Gated on exit_kind still being "spec" —
-  // question/research/ux flows target a research_brief, not code, and
-  // forcing those into a code_change routing would be nonsensical — and on
-  // autonomy not being "plan" (which must never let a task begin writing
-  // code) and rigor not being "thorough" (an explicit ask for more process
-  // even on small work).
-  if (
-    step.role === "explorer" &&
-    findings.effort_size === "XS" &&
-    (task.level ?? "task") === "task" &&
-    (task.exit_kind as ExitKind) === "spec" &&
-    effectiveAutonomyLevel(task, project) !== "plan" &&
-    effectivePlanningRigor(task, project) !== "thorough"
-  ) {
-    task = updateTask(task.task_id, { exit_kind: "code_change" }) ?? task;
-    const idx = plan.steps.indexOf(step);
-    if (idx >= 0) {
-      plan.steps = [
-        ...plan.steps.slice(0, idx + 1),
-        ...EXECUTION_FLOW_TEMPLATE.steps.map((role) => ({ role, status: "pending" as const, depth: 1 })),
-      ];
+  // XS fast path — skipped while the intake-review scout prefix is running:
+  // the review's own card offers exactly this routing as a human choice (and
+  // applies it through the same function on accept), so taking it here would
+  // pre-empt the decision the review exists to ask for.
+  if (step.role === "explorer" && !isScoutingIntake(task)) {
+    const effortSize = (task.effort_size as EffortSize | null) ?? findings.effort_size ?? null;
+    if (effortSize === "XS") {
+      const fastPathed = applyXsFastPath(task, project, plan, step);
+      if (fastPathed) task = fastPathed;
     }
   }
 
@@ -2161,12 +2590,20 @@ async function runOneStep(task: TaskRow, project: ProjectRow, step: PlanStep, pl
   // the effective verdict below, never silently); the optional second-review
   // call adds an authoritative LLM-mediated synthesis on top when enabled, and
   // can downgrade a critique false-positive or independently escalate.
+  // Suppressed entirely during the intake-review scout prefix
+  // (PLANNING/intake-refinement.md): `flow` there is still the *filed* intake
+  // kind's flow — the one the review exists to reconsider — so an "every_step"
+  // reviewDepth inherited from a kind that may not survive the review would
+  // buy adversarial critique passes on two roles whose output is about to be
+  // read by a human anyway.
   const shouldCritique =
-    flow.reviewDepth === "every_step"
-      ? !isCritiqueExempt(step.role)
-      : flow.reviewDepth === "terminal_only"
-        ? isReviewerStep
-        : false;
+    isScoutingIntake(task)
+      ? false
+      : flow.reviewDepth === "every_step"
+        ? !isCritiqueExempt(step.role)
+        : flow.reviewDepth === "terminal_only"
+          ? isReviewerStep
+          : false;
 
   let effectiveVerdict: string = findings.verdict;
   let verdictNote: string | undefined;
@@ -2345,6 +2782,9 @@ async function runCritiquePass(
       phase: result.phase ?? null,
       failed_tool_calls: result.toolCalls.filter((tc) => tc.isError).length,
       artifact_bytes: result.artifactBytesAppended ?? 0,
+      // The critic's OWN definition version — a critique run is scored against
+      // the critic role, not the role it judged.
+      role_version_id: criticRole.current_version_id,
       target_run_id: run.id,
       run_kind: "critique",
       depth: step.depth,
@@ -2905,6 +3345,76 @@ function isTerminalForFamily(t: TaskRow): boolean {
 }
 
 /**
+ * Whether a family is genuinely finished with its shared worktree and branch.
+ *
+ * Deliberately stricter than `isTerminalForFamily` above, which is about "will
+ * this member ever write another commit" and so counts stage "review" as
+ * settled. That's the right question for *merging* but the wrong one for
+ * *reclaiming*: "review" includes `needs_merge_approval`, where a human still
+ * has the diff open and the branch is the thing they're reviewing. Reaping
+ * there would delete the artifact under them.
+ *
+ * So: every member has either landed (stage "ready") or been abandoned
+ * (`wont_do`), and the shared branch has actually reached base — unless nobody
+ * ever wrote anything worth landing, in which case there's nothing to wait for.
+ */
+function familyWorkspaceReclaimable(root: TaskRow, members: TaskRow[]): boolean {
+  const done = members.every((t) => t.stage === "ready" || t.exit_state === "wont_do");
+  if (!done) return false;
+  if (members.some((t) => t.stage === "review")) return false;
+  if (members.every((t) => t.exit_state === "wont_do")) return true;
+  return root.reconcile_status === "merged" || root.reconcile_status === "up_to_date";
+}
+
+/**
+ * Reclaim a settled family's shared worktree and branch (PLANNING: "reap
+ * branches and worktrees"). Before this existed, nothing ever removed either —
+ * `removeWorktree` had two callers (task delete/reset) and branch deletion had
+ * none — so a project accumulated one permanent branch and directory per task
+ * family forever, making plain `git branch` unreadable in the user's own repo.
+ *
+ * Three things, in this order (the order matters — git refuses to delete a
+ * branch that's still checked out in a worktree):
+ *  1. remove the worktree directory,
+ *  2. null `git_worktree_path` on EVERY member row, not just the root — the
+ *     diff/push/PR routes resolve through `taskRepoPath`, so a removed-but-
+ *     still-recorded worktree would send git at a directory that no longer
+ *     exists,
+ *  3. delete the branch, best-effort (`-d`, so git's own unmerged check vetoes
+ *     anything that still holds unlanded work).
+ *
+ * `git_branch` is deliberately LEFT on the rows: it's the historical record,
+ * `restoreCheckpoint` reads it, and after a merge the checkpoint commits are
+ * still reachable from base — so a restore can recreate the branch off base and
+ * `resetHardTo` the old sha successfully.
+ *
+ * Callers must already hold the family's `serializeTask` lock.
+ */
+function reapFamilyWorkspace(root: TaskRow, project: ProjectRow): void {
+  const members = familyMembers(root);
+  if (!familyWorkspaceReclaimable(root, members)) return;
+
+  const dir = root.git_worktree_path;
+  if (dir) removeWorktree(project.repo_path, dir);
+  for (const m of members) {
+    if (m.git_worktree_path) updateTask(m.task_id, { git_worktree_path: null });
+  }
+  if (root.git_branch && deleteBranch(project.repo_path, root.git_branch)) {
+    console.log(`[git] reaped branch "${root.git_branch}" (family ${root.task_id.slice(0, 8)} settled)`);
+  }
+}
+
+/** Reap the family `task` belongs to, if it's now finished with its workspace.
+ *  Resolves the family root first — `reapFamilyWorkspace` is root-keyed because
+ *  the worktree/branch belong to the family, not to whichever member happened
+ *  to finish last. */
+function maybeReapFamilyWorkspace(task: TaskRow, project: ProjectRow): void {
+  const root = getTask(familyRootId(task));
+  if (!root) return;
+  reapFamilyWorkspace(root, project);
+}
+
+/**
  * Runs the real `git merge` of a worktree family's shared branch into base —
  * but only once EVERY member has reached a terminal-for-family state.
  * Members share one branch (see ensureTaskWorkspace), so merging as soon as
@@ -2938,6 +3448,8 @@ function maybeReconcileFamily(task: TaskRow, project: ProjectRow, repoPath: stri
         );
       }
       publish(root.task_id, "task_update", { reconcileStatus: reconciled.status });
+      // Re-read: reclaimability turns on the reconcile_status just written.
+      reapFamilyWorkspace(getTask(root.task_id) ?? root, project);
       return;
     }
     updateTask(root.task_id, {
@@ -2955,6 +3467,8 @@ function maybeReconcileFamily(task: TaskRow, project: ProjectRow, repoPath: stri
     );
   }
   publish(root.task_id, "task_update", { reconcileStatus: reconciled.status });
+  // Re-read: reclaimability turns on the reconcile_status just written.
+  reapFamilyWorkspace(getTask(root.task_id) ?? root, project);
 }
 
 async function applyGate(
@@ -2984,6 +3498,29 @@ async function applyGate(
   const relArtifact = task.artifact_path ?? path.join(planningDir, "REFINING", artifactName(task));
   const coverageJson = JSON.stringify(coverage);
   const repoPath = taskRepoPath(task, project);
+
+  // Intake review (PLANNING/intake-refinement.md): while the scout prefix runs,
+  // the plan is deliberately a two-step probe with no reviewer and no terminal
+  // role, and no flow has been chosen yet. Running the gate against the *filed*
+  // intake kind's criteria would judge the task by a flow the review may be
+  // about to replace — and, worse, the terminal branch below fires on
+  // `!nextPending(plan)`, so finishing the prefix would finalize the task as
+  // READY without a single planning role having run. Record the step and get
+  // out; runTaskStepOnce turns the finished prefix into a proposal.
+  //
+  // Deliberately ahead of the blocker/escalation branches too: a scout flagging
+  // "too vague to proceed" is exactly what the human is being shown, so it
+  // becomes a warning banner on the proposal (see completeScoutPass) rather
+  // than a separate escalation the human has to dig the task out of.
+  if (isScoutingIntake(task)) {
+    updateTask(task.task_id, {
+      refinement_plan_json: JSON.stringify(plan),
+      coverage_json: coverageJson,
+      stage: "refining",
+    });
+    return;
+  }
+
   const flow = flowForTask(task, execCommandNames(project));
 
   // Grounded verification (PLANNING/overhaul/05). Evidence criteria are settled
@@ -4148,6 +4685,62 @@ function autonomyAllowsWatcherDispatch(project: ProjectRow): boolean {
   return !getOrResetIdleWindowBudget(project.id, cfg).exhausted;
 }
 
+/**
+ * Apply a project's spend ceiling to the tasks about to be dispatched
+ * (PLANNING/overhaul-2/01). Returns the tasks still allowed to run.
+ *
+ * The check lives here, at selection time, rather than inside a running step:
+ * an in-flight role run always finishes and is always paid for — the ceiling
+ * blocks the NEXT dispatch, exactly matching the existing pause/resume
+ * semantics rather than inventing an abort path mid-run.
+ *
+ * `budget_paused_at` is written on the transition into the stop (and cleared on
+ * the way out, once spend ages out of the rolling window or the cap is raised),
+ * so the flag is a live answer to "is the budget what's holding this?" rather
+ * than a sticky marker a human has to clear by hand.
+ */
+function applyBudgetGate(project: ProjectRow, candidates: TaskRow[]): TaskRow[] {
+  const status = evaluateProjectBudget(project);
+  if (!status.enforced) return candidates;
+
+  if (shouldPublishBudgetWarning(project.id, status)) {
+    for (const t of candidates) {
+      publish(t.task_id, "task_update", {
+        budgetWarning: true,
+        budgetUsagePct: status.usagePct,
+      });
+    }
+  }
+
+  if (!status.overCap) {
+    // Back under the ceiling: release anything the budget had stopped.
+    for (const t of candidates) {
+      if (t.budget_paused_at) {
+        updateTask(t.task_id, { budget_paused_at: null });
+        publish(t.task_id, "task_update", { budgetPaused: false });
+      }
+    }
+    return candidates;
+  }
+
+  const allowed: TaskRow[] = [];
+  for (const t of candidates) {
+    if (budgetOverrideActive(t.task_id)) {
+      allowed.push(t);
+      continue;
+    }
+    if (!t.budget_paused_at) {
+      updateTask(t.task_id, { budget_paused_at: new Date().toISOString() });
+      publish(t.task_id, "task_update", {
+        budgetPaused: true,
+        budgetBreached: status.breached,
+        budgetUsagePct: status.usagePct,
+      });
+    }
+  }
+  return allowed;
+}
+
 function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRow }> {
   const picked: Array<{ task: TaskRow; project: ProjectRow }> = [];
   // Claimed incrementally (not just checked against inFlightTasks) so two
@@ -4156,7 +4749,7 @@ function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRo
   const claimedFamilies = new Set<string>();
   for (const project of listProjects()) {
     let watcherDispatchAllowed: boolean | undefined;
-    const candidates = listTasks({ projectId: project.id })
+    const eligible = listTasks({ projectId: project.id })
       .filter(
         (t) => (t.stage === "intake" || t.stage === "refining") && (t.paused ?? 0) === 0 && dependenciesSatisfied(t),
       )
@@ -4166,7 +4759,10 @@ function pickNextTasks(limit: number): Array<{ task: TaskRow; project: ProjectRo
         // no watcher-origin candidates at all in the common case.
         watcherDispatchAllowed ??= autonomyAllowsWatcherDispatch(project);
         return watcherDispatchAllowed;
-      })
+      });
+    // Skipped entirely when nothing is eligible: an idle project shouldn't pay
+    // for a spend query every round.
+    const candidates = (eligible.length ? applyBudgetGate(project, eligible) : eligible)
       .sort((a, b) => {
         const classDiff = schedulingClass(a) - schedulingClass(b);
         if (classDiff) return classDiff;
@@ -4280,6 +4876,14 @@ async function runTaskStepOnce(taskId: string): Promise<void> {
 
   const step = lastRun ? nextStep(plan, lastRun.role_key, context) : nextPending(plan);
 
+  // The intake-review scout prefix just ran out of steps: build the proposal
+  // and park on a human, instead of the finalization below — which would
+  // promote a task to READY on the strength of two scout roles and no flow.
+  if (!step && isScoutingIntake(task)) {
+    await completeScoutPass(task, project);
+    return;
+  }
+
   if (!step) {
     // No pending steps but not terminal — finalize as ready to avoid wedging.
     const routerCfg = getRouterCfg(project);
@@ -4329,16 +4933,132 @@ export function deleteTaskAndWorktree(taskId: string, removePlan: boolean): Prom
     const task = getTask(taskId);
     const artifactRel = task?.artifact_path ?? null;
     const project = task?.project_id != null ? getProject(task.project_id) : undefined;
+    // Sampled BEFORE the delete: `deleteTask` re-roots any surviving family
+    // onto an heir, which re-points every member's root_task_id away from this
+    // task — so asking afterwards would report an empty family and reap the
+    // worktree the heir just inherited.
+    const familyOutlivesTask = task ? familyMembersExcluding(task).length > 0 : false;
 
     deleteTask(taskId);
 
     if (removePlan && artifactRel && project) {
       removeFile(path.join(task!.git_worktree_path ?? project.repo_path, artifactRel));
     }
-    if (task?.git_worktree_path && project && familyMembersExcluding(task).length === 0) {
-      removeWorktree(project.repo_path, task.git_worktree_path);
+    if (task && project && !familyOutlivesTask) {
+      if (task.git_worktree_path) removeWorktree(project.repo_path, task.git_worktree_path);
+      // `-d`, so a branch still holding unlanded commits survives the delete of
+      // its task row rather than taking the work with it. The orphan sweep
+      // reports those leftovers instead of force-deleting them.
+      if (task.git_branch) deleteBranch(project.repo_path, task.git_branch);
     }
   });
+}
+
+export interface WorkspaceSweepResult {
+  branchesDeleted: string[];
+  /** Orphaned branches git refused to delete because they still hold unmerged
+   *  commits. Reported, never force-deleted — surfaced so a human can decide. */
+  branchesKept: string[];
+  worktreesRemoved: string[];
+}
+
+/**
+ * Reclaim `orchestra/*` branches and `.orchestra-worktrees/` directories with
+ * no owning task row: tasks that were deleted, runs that crashed, and families
+ * created before decomposition children learned to share one workspace.
+ *
+ * The eager reaps above only help going forward. This is what cleans up what a
+ * project has already accumulated — a real repo here had 24 `orchestra/*`
+ * branches against 1 the database still knew about.
+ *
+ * Never force-deletes. `deleteBranch` is `-d`, so an orphan still holding
+ * unmerged commits survives into `branchesKept` for a human to look at, rather
+ * than being destroyed by a housekeeping pass.
+ */
+export function sweepOrphanWorkspaces(project: ProjectRow): WorkspaceSweepResult {
+  const result: WorkspaceSweepResult = { branchesDeleted: [], branchesKept: [], worktreesRemoved: [] };
+
+  // Registrations pointing at directories that no longer exist (crash residue),
+  // so the checks below see git's real view.
+  pruneWorktrees(project.repo_path);
+  // Heals projects whose worktree container predates the self-ignore file —
+  // `ensureWorktree` only writes it when creating a NEW worktree, so an
+  // existing project would otherwise keep showing `?? .orchestra-worktrees/`
+  // in the user's `git status` until its next task.
+  if (fs.existsSync(worktreesRoot(project.repo_path))) ensureWorktreesIgnored(worktreesRoot(project.repo_path));
+
+  const tasks = listTasks({ projectId: project.id });
+  const ownedBranches = new Set(tasks.map((t) => t.git_branch).filter((b): b is string => Boolean(b)));
+  // Keyed on the recorded path, NOT on "is there a task whose id matches this
+  // directory name": a worktree directory keeps the id of the family root it
+  // was created for, and `reRootFamily` can hand it to a survivor with a
+  // different id. Matching on ids would then reap a live worktree.
+  const ownedDirs = new Set(
+    tasks
+      .map((t) => t.git_worktree_path)
+      .filter((p): p is string => Boolean(p))
+      .map((p) => path.resolve(p)),
+  );
+
+  const root = worktreesRoot(project.repo_path);
+  let entries: string[] = [];
+  try {
+    entries = fs.existsSync(root) ? fs.readdirSync(root) : [];
+  } catch (err) {
+    console.warn(`[git] could not read "${root}": ${(err as Error).message}`);
+  }
+  for (const name of entries) {
+    if (name === SCAN_WORKSPACE_NAME || name.startsWith(".")) continue; // shared machinery / the self-ignore file
+    const dir = path.join(root, name);
+    if (ownedDirs.has(path.resolve(dir))) continue;
+    if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) continue;
+    removeWorktree(project.repo_path, dir);
+    result.worktreesRemoved.push(dir);
+  }
+
+  for (const branch of listOrchestraBranches(project.repo_path)) {
+    if (branch === ORCHESTRA_BRANCH_PREFIX + SCAN_WORKSPACE_NAME) continue;
+    if (ownedBranches.has(branch)) continue;
+    if (deleteBranch(project.repo_path, branch)) result.branchesDeleted.push(branch);
+    else result.branchesKept.push(branch);
+  }
+
+  if (result.branchesDeleted.length || result.worktreesRemoved.length) {
+    console.log(
+      `[git] swept "${project.name}": ${result.branchesDeleted.length} branch(es), ` +
+        `${result.worktreesRemoved.length} worktree(s); ${result.branchesKept.length} unmerged branch(es) kept`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Reclaim the shared worktree/branch of every family touched by `taskIds` that
+ * has just become finished with it. Deduped by family root — archiving six
+ * siblings is one reap, not six — and serialized per family like every other
+ * worktree-mutating entry point.
+ *
+ * Exists for the bulk-archive route, which marks tasks `wont_do` without ever
+ * touching git; without this, archiving a whole project left every branch and
+ * worktree behind permanently.
+ */
+export async function reapSettledWorkspaces(taskIds: string[]): Promise<void> {
+  const roots = new Map<string, TaskRow>();
+  for (const id of taskIds) {
+    const task = getTask(id);
+    if (!task) continue;
+    const root = getTask(familyRootId(task));
+    if (root) roots.set(root.task_id, root);
+  }
+  for (const root of roots.values()) {
+    const project = root.project_id != null ? getProject(root.project_id) : undefined;
+    if (!project) continue;
+    await serializeTask(familyLockKey(root.task_id), async () => {
+      // Re-read inside the lock: a concurrent step may have moved the family on.
+      const fresh = getTask(root.task_id);
+      if (fresh) reapFamilyWorkspace(fresh, project);
+    });
+  }
 }
 
 /**
@@ -4472,17 +5192,31 @@ export function reincorporateAnswer(taskId: string, question: string, answer: st
  * "pending_human_merge" independent of stage), the same path any other
  * wrote_source task already uses. This just records that a human has done so
  * (or accepted a no-op dry run) and closes out the task.
+ *
+ * Approval is the last thing holding the family's workspace open, so it also
+ * gets its own reap pass. `maybeReconcileFamily` can't cover this case: it
+ * refuses to merge a `wrote_source` family at "edit" autonomy and parks it at
+ * `pending_human_merge` instead, which is exactly the state this function
+ * resolves. Serialized on the family lock — unlike the reaps inside
+ * `applyGate`, this runs from a route handler with no scheduler lock held, and
+ * `removeWorktree` racing a live role run is the hazard documented on
+ * `deleteTaskAndWorktree`.
  */
-export function approveCodeChangeMerge(taskId: string): void {
-  const task = getTask(taskId);
-  if (!task || task.stage !== "review" || task.exit_state !== "needs_merge_approval") return;
-  updateTask(taskId, {
-    stage: "ready",
-    exit_state: "ready_for_work",
-    review_reason: null,
-    status: "complete",
+export function approveCodeChangeMerge(taskId: string): Promise<void> {
+  return serializeTask(familyLockKey(taskId), async () => {
+    const task = getTask(taskId);
+    if (!task || task.stage !== "review" || task.exit_state !== "needs_merge_approval") return;
+    updateTask(taskId, {
+      stage: "ready",
+      exit_state: "ready_for_work",
+      review_reason: null,
+      status: "complete",
+    });
+    publish(taskId, "task_update", { stage: "ready" });
+
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+    if (project) maybeReapFamilyWorkspace(task, project);
   });
-  publish(taskId, "task_update", { stage: "ready" });
 }
 
 /**

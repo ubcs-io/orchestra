@@ -16,25 +16,28 @@ hero:
 features:
   - icon: 🧩
     title: Role-Based Refinement
-    details: 24 specialized "software-company" roles — from Bug Investigator to Security Reviewer to an adversarial per-step Critic — each inspecting your real codebase through a chain of reasoning steps.
+    details: 25 specialized "software-company" roles — from Bug Investigator to Security Reviewer to an adversarial per-step Critic — each inspecting your real codebase through a chain of reasoning steps.
   - icon: 🗺️
     title: Coverage Maps
     details: Every role declares which concerns it examined and which it skipped. Omissions are visible — you can see, for example, that privacy was never reviewed.
   - icon: 🎮
     title: Live Steering
     details: Pause, resume, inject roles mid-plan, deepen analysis, add steer notes, or spin an open question off into its own child Question Flow subtask. Full control over the refinement loop in real time.
+  - icon: 🩺
+    title: Built for Local Models
+    details: Reports stream to disk as they're written, verdicts arrive by constrained decoding where the endpoint supports it, and every run carries a health record — so a truncated response costs a verdict, not the analysis.
+  - icon: 🔬
+    title: Self-Calibrating Models
+    details: Probe an endpoint and Orchestra measures what it can actually do — tool calling, structured output, thinking dialect — then picks the run shape itself and keeps adjusting as real runs accumulate.
+  - icon: 🛠️
+    title: From Plan to Patch
+    details: Opt roles into editing source and running your allowlisted test command inside the task's own worktree. Verdicts carry harness-recorded evidence, and code changes wait at an explicit merge gate.
+  - icon: 🌙
+    title: Works While You Don't
+    details: Watchers scan for failing tests, decayed TODOs, lint and doc drift during idle windows, propose candidates under hard budgets, and leave a morning report of what actually happened.
   - icon: 🌐
     title: Visual Agent Networks
     details: Build custom refinement graphs in a drag-and-drop editor. Replace the default linear flow with branching, parallel, or gated agent networks.
-  - icon: 🛡️
-    title: Adversarial Critique & Routing Advisors
-    details: A scoped Critic role checks high-risk steps for domain-ending violations, and optional LLM routing advisors can refine escalation and gate decisions — both off by default, always falling back to deterministic heuristics.
-  - icon: 📊
-    title: Model Dashboard & Network Ping
-    details: Manage named model configs, compare them on a radar chart and stats table with real usage history, and ping every configured endpoint live to see what's actually reachable.
-  - icon: 📦
-    title: Git-Backed Artifacts
-    details: Every refinement step produces version-controlled markdown artifacts in your repo. The planning history is reviewable, diffable, and PR-able.
   - icon: 🔌
     title: OpenAI-Compatible
     details: Works with any OpenAI-compatible endpoint — Ollama, LM Studio, vLLM, OpenWebUI, or cloud providers. Bring your own model.
@@ -42,4 +45,13 @@ features:
 
 ## Status
 
-Orchestra is in **alpha**. The full pipeline — ingest, planning, concurrent role execution across per-task git worktrees, per-step adversarial critique, gating with optional LLM routing advisors (including checkpoint restore and answer reincorporation), coverage rollup, decomposition, and the React UI — is implemented and typechecks/builds. Successful LLM refinement depends on a reachable, tool-capable model.
+Orchestra is in **alpha**, and developed in phases:
+
+- **Reliability** — artifact-first output, constrained decoding with per-endpoint probing, repair-and-resume instead of full reruns, and a run-health record that feeds the gates.
+- **Trust** — an allowlisted command runner inside the task worktree, so verdicts carry executed evidence rather than opinion; and measured model capability profiles that replace hand-tuned compatibility flags.
+- **Autonomy** — per-run context budgeting for small windows, plus watchers that generate their own work under idle-window budgets and report each morning.
+- **Transport** — a read-only MCP surface so an external agent can read task context and the candidate queue.
+
+All of the above is implemented and typechecks/builds, alongside the original pipeline: ingest, planning, concurrent role execution across per-task git worktrees, per-step adversarial critique, gating with optional LLM routing advisors, checkpoint restore, answer reincorporation, coverage rollup, decomposition, and the React UI. Successful LLM refinement still depends on a reachable, tool-capable endpoint.
+
+Not yet built: encryption at rest for stored tokens, per-task spend caps, and role prompt versioning with outcome scoring.

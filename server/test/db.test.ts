@@ -31,12 +31,14 @@ import {
   listCandidates,
   listModelProfileRows,
   listRoleRuns,
+  listRoleRunsSince,
   listRoles,
   listTasks,
   listUnconsumedInterventions,
   markInterventionConsumed,
   suppressCandidateForTask,
   sumAutonomousTokensSince,
+  toDbTimestamp,
   updateCandidate,
   updateProject,
   updateTask,
@@ -45,7 +47,7 @@ import {
   upsertRole,
 } from "../src/db";
 import { resolveConnection } from "../src/settings";
-import { freshDb } from "./helpers";
+import { freshDb, tempGitRepo } from "./helpers";
 
 afterEach(() => closeDb());
 
@@ -685,5 +687,46 @@ describe("listRoles merge", () => {
     expect(explorer.enabled).toBe(0);
     // The non-overridden global is still present.
     expect(merged.find((r) => r.key === "security_review")?.title).toBe("Global Sec");
+  });
+});
+
+describe("toDbTimestamp", () => {
+  it("normalizes an ISO string into the space-separated form rows are stored with", () => {
+    expect(toDbTimestamp("2026-07-28T01:02:03.456Z")).toBe("2026-07-28 01:02:03.456Z");
+    expect(toDbTimestamp(new Date("2026-07-28T01:02:03.456Z"))).toBe("2026-07-28 01:02:03.456Z");
+  });
+
+  it("range queries actually match — a raw toISOString() bound silently matches nothing", () => {
+    freshDb();
+    const project = createProject({ name: "p", repo_path: tempGitRepo() });
+    const task = createTask({
+      name: "t",
+      content: "c",
+      project_id: project.id,
+      stage: "refining",
+      level: "task",
+      intake_kind: "feature",
+      exit_kind: "spec",
+      origin: "watcher:test-suite",
+    });
+    createRoleRun({
+      task_id: task.task_id,
+      role_key: "developer",
+      verdict: "pass",
+      summary: "s",
+      depth: 0,
+      tokens: 1234,
+    } as Parameters<typeof createRoleRun>[0]);
+
+    const anHourAgo = new Date(Date.now() - 3_600_000).toISOString();
+    // Both of these are handed a raw "T"-separated ISO string, exactly as
+    // autonomy.ts's idle-window ledger does — the normalization has to happen
+    // inside the query or the budget never counts a single token.
+    expect(sumAutonomousTokensSince(project.id, anHourAgo)).toBe(1234);
+    expect(listRoleRunsSince(project.id, anHourAgo)).toHaveLength(1);
+
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    expect(sumAutonomousTokensSince(project.id, future)).toBe(0);
+    expect(listRoleRunsSince(project.id, future)).toHaveLength(0);
   });
 });

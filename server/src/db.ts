@@ -12,7 +12,8 @@
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { getConfig } from "./config.js";
-import { computeRunHealth, type RunHealth } from "./health.js";
+import { decryptSecret, encryptSecret, isEncrypted } from "./crypto.js";
+import { computeRunHealth, isTrustedHealth, roleRunHealthInput, type RunHealth } from "./health.js";
 
 export type DB = Database.Database;
 
@@ -48,6 +49,21 @@ function now(): string {
   return new Date().toISOString().replace("T", " ");
 }
 
+/**
+ * Normalize a timestamp into the exact textual form this schema stores, so a
+ * `created_at >= ?` comparison actually works.
+ *
+ * Rows are written by {@link now} as `"YYYY-MM-DD HH:MM:SS.sssZ"` — a space, not
+ * the `T` that `Date.toISOString()` produces. SQLite compares TEXT
+ * lexicographically, and `" "` (0x20) sorts *below* `"T"` (0x54), so passing a
+ * raw ISO string to a range query silently matches nothing at all rather than
+ * failing loudly. Every caller with a time bound must route through this.
+ */
+export function toDbTimestamp(value: Date | string): string {
+  const iso = value instanceof Date ? value.toISOString() : value;
+  return iso.replace("T", " ");
+}
+
 function genId(seed: string): string {
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
@@ -55,6 +71,83 @@ function genId(seed: string): string {
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Secret columns (PLANNING/overhaul-2/02)
+// ---------------------------------------------------------------------------
+//
+// `projects.github_token` and `configs.api_key` are encrypted at rest and
+// decrypted transparently on the way out, so every existing caller keeps
+// working against plaintext and no consumer has to know this happened. What
+// changes is the DB file: it no longer contains readable credentials.
+//
+// The rule for anyone adding a read path: route the row through
+// {@link readProject} / {@link readConfig} rather than casting a raw `SELECT *`.
+// A raw read yields the `enc:` blob, which will fail as a bearer token in a way
+// that looks like a wrong credential rather than a missing decrypt.
+
+/** Decrypt a project row's secret column in place. */
+function readProject<T extends ProjectRow | undefined>(row: T): T {
+  if (row) row.github_token = decryptSecret(row.github_token);
+  return row;
+}
+
+function readProjects(rows: ProjectRow[]): ProjectRow[] {
+  for (const row of rows) row.github_token = decryptSecret(row.github_token);
+  return rows;
+}
+
+/** Decrypt a config row's secret column in place. */
+function readConfig<T extends ConfigRow | undefined>(row: T): T {
+  if (row) row.api_key = decryptSecret(row.api_key);
+  return row;
+}
+
+function readConfigs(rows: ConfigRow[]): ConfigRow[] {
+  for (const row of rows) row.api_key = decryptSecret(row.api_key);
+  return rows;
+}
+
+/**
+ * One-time, transparent upgrade of any secret still stored in plaintext
+ * (PLANNING/overhaul-2/02 migration step 1). Runs inside initDb, needs no
+ * operator action, and is safe to run on every boot:
+ *
+ *  - values already carrying the `enc:` prefix are skipped, so a second pass is
+ *    a no-op and can never double-encrypt a value into unreadability;
+ *  - a failure here (an unreadable key file, say) logs and leaves the rows
+ *    exactly as they were rather than taking the boot path down with it. An
+ *    unencrypted token is a weaker posture; a daemon that won't start is a
+ *    worse one.
+ */
+function encryptExistingSecrets(d: DB): void {
+  try {
+    const projects = d
+      .prepare(`SELECT id, github_token FROM projects WHERE github_token IS NOT NULL AND github_token != ''`)
+      .all() as Array<{ id: number; github_token: string }>;
+    const configs = d
+      .prepare(`SELECT id, api_key FROM configs WHERE api_key IS NOT NULL AND api_key != ''`)
+      .all() as Array<{ id: number; api_key: string }>;
+    const pending =
+      projects.filter((p) => !isEncrypted(p.github_token)).length +
+      configs.filter((c) => !isEncrypted(c.api_key)).length;
+    if (pending === 0) return;
+
+    const setProject = d.prepare(`UPDATE projects SET github_token = ? WHERE id = ?`);
+    const setConfig = d.prepare(`UPDATE configs SET api_key = ? WHERE id = ?`);
+    d.transaction(() => {
+      for (const p of projects) {
+        if (!isEncrypted(p.github_token)) setProject.run(encryptSecret(p.github_token), p.id);
+      }
+      for (const c of configs) {
+        if (!isEncrypted(c.api_key)) setConfig.run(encryptSecret(c.api_key), c.id);
+      }
+    })();
+    console.log(`[db] encrypted ${pending} stored secret(s) at rest`);
+  } catch (err) {
+    console.warn(`[db] could not encrypt stored secrets: ${(err as Error).message}`);
+  }
+}
 
 /** Add a column to a table only if it does not already exist. */
 function addColumnIfMissing(d: DB, table: string, column: string, ddl: string): void {
@@ -378,6 +471,62 @@ export function initDb(): void {
   addColumnIfMissing(d, "tasks", "origin", "origin TEXT DEFAULT 'human'");
   addColumnIfMissing(d, "tasks", "priority", "priority INTEGER DEFAULT 3");
 
+  // When a human first laid eyes on a self-generated task. Server-side so the
+  // "new self-generated" section means the same thing in every browser and
+  // session, replacing the client-only localStorage tracking the first
+  // autonomy slice shipped with. NULL on every pre-existing row, which for a
+  // human-origin task is simply never consulted.
+  addColumnIfMissing(d, "tasks", "seen_at", "seen_at TEXT");
+
+  // Role versioning (PLANNING/overhaul-2/03). `roles` stays the single source
+  // of truth for what runs right now; `role_versions` is the paper trail behind
+  // it, and `roles.current_version_id` is the pointer between them. Nothing
+  // about dispatch changes — a role is still read from `roles`.
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS role_versions (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      role_id         INTEGER NOT NULL,
+      version_no      INTEGER NOT NULL,
+      system_prompt   TEXT,
+      tools_json      TEXT,
+      model           TEXT,
+      created_by_note TEXT,
+      created_at      TEXT
+    );
+  `);
+  addColumnIfMissing(d, "roles", "current_version_id", "current_version_id INTEGER");
+  // The join key that turns per-run outcome data into per-VERSION outcome data.
+  // Nullable, and deliberately never backfilled with a guess: a run that
+  // predates versioning simply doesn't contribute to any version's score.
+  addColumnIfMissing(d, "role_runs", "role_version_id", "role_version_id INTEGER");
+
+  // Budget guardrails (PLANNING/overhaul-2/01): when the project's spend
+  // ceiling stopped this task's next dispatch. NULL on every task that has
+  // never been budget-stopped, which is every task until an operator opts in.
+  // Deliberately NOT the existing `paused` flag: a human needs to be able to
+  // tell "I paused this" from "the budget stopped this", and only the latter
+  // clears itself once spend ages out of the rolling window.
+  addColumnIfMissing(d, "tasks", "budget_paused_at", "budget_paused_at TEXT");
+
+  // Intake refinement (PLANNING/intake-refinement.md): the pre-flight review
+  // layer's per-task state, NULL on every task that took the direct
+  // intake → start path (which is every task until an operator clicks
+  // "Review intake").
+  //   intake_review_state — "scouting" (the intake_triage+explorer prefix is
+  //     running early, before a flow is chosen), "proposed" (a proposal is
+  //     waiting on a human), "accepted", or "skipped". NULL = not reviewed.
+  //   intake_proposal_json — the IntakeProposal the review produced, plus the
+  //     human's edits once accepted (see server/src/intake-review.ts).
+  addColumnIfMissing(d, "tasks", "intake_review_state", "intake_review_state TEXT");
+  addColumnIfMissing(d, "tasks", "intake_proposal_json", "intake_proposal_json TEXT");
+
+  // Who set `effort_size`: "model" (the explorer role's own estimate, the
+  // default path) or "human" (corrected during intake review). The distinction
+  // has teeth — orchestrator.ts refuses to let a later explorer re-run
+  // overwrite a human's correction, which is the entire point of letting a
+  // human steer the size before the decomposition budget is drawn from it.
+  addColumnIfMissing(d, "tasks", "effort_size_source", "effort_size_source TEXT");
+
   // Context budgeting (PLANNING/overhaul/07): the ledger's own observability
   // columns, recorded by buildRoleContext's allocator call on every run —
   // in shadow mode (project config `contextBudget` unset/false) this records
@@ -451,7 +600,110 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_role_runs_target ON role_runs(target_run_id);
     CREATE INDEX IF NOT EXISTS idx_candidates_project ON candidates(project_id);
     CREATE INDEX IF NOT EXISTS idx_candidates_fp ON candidates(project_id, watcher, fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_role_versions_role ON role_versions(role_id, version_no);
+    CREATE INDEX IF NOT EXISTS idx_role_runs_version ON role_runs(role_version_id);
   `);
+
+  backfillRoleVersions(d);
+  backfillRootTaskIds(d);
+
+  // Last, so the columns and rows it rewrites definitely exist.
+  encryptExistingSecrets(d);
+}
+
+/**
+ * Resolve `root_task_id` for every task that predates the column.
+ *
+ * When the column was added it was deliberately left null on existing rows,
+ * which meant `familyRootId` treated every one of them — including children
+ * with a perfectly good `parent_task_id` — as its own family root, so each got
+ * its own branch and worktree. That's precisely the "one branch per subtask"
+ * sprawl this migration exists to stop, and it also made the server disagree
+ * with the client, whose `buildWorktreeFamilies` has always walked
+ * `parent_task_id` when `root_task_id` is missing.
+ *
+ * Walks each orphan up to its topmost ancestor, short-circuiting on any
+ * ancestor that already has a resolved root. Cycle-guarded: a corrupted
+ * parent chain falls back to treating the task as its own root rather than
+ * looping forever.
+ */
+function backfillRootTaskIds(d: DB): void {
+  const rows = d
+    .prepare(`SELECT task_id, parent_task_id, root_task_id FROM tasks`)
+    .all() as Array<{ task_id: string; parent_task_id: string | null; root_task_id: string | null }>;
+  if (!rows.length) return;
+
+  const byId = new Map(rows.map((r) => [r.task_id, r]));
+  const resolve = (row: (typeof rows)[number]): string => {
+    const seen = new Set<string>([row.task_id]);
+    let cur = row;
+    for (;;) {
+      if (cur.root_task_id && cur !== row) return cur.root_task_id;
+      if (!cur.parent_task_id) return cur.task_id;
+      const parent = byId.get(cur.parent_task_id);
+      if (!parent || seen.has(parent.task_id)) return cur.task_id; // dangling or cyclic
+      seen.add(parent.task_id);
+      cur = parent;
+    }
+  };
+
+  const update = d.prepare(`UPDATE tasks SET root_task_id = ? WHERE task_id = ?`);
+  let patched = 0;
+  d.transaction(() => {
+    for (const row of rows) {
+      if (row.root_task_id) continue;
+      update.run(resolve(row), row.task_id);
+      patched++;
+    }
+  })();
+  if (patched) console.log(`[db] backfilled root_task_id for ${patched} task(s)`);
+}
+
+/**
+ * Give every pre-existing role a version 1 matching what it's already running
+ * (PLANNING/overhaul-2/03 migration step 1). No behavior change: a role's
+ * "history" simply starts at the definition it has right now, so the first real
+ * edit produces a version 2 there's something to compare against.
+ *
+ * Idempotent — only roles with no `current_version_id` are touched.
+ */
+function backfillRoleVersions(d: DB): void {
+  const orphans = d
+    .prepare(
+      `SELECT id, system_prompt, tools_json, model FROM roles WHERE current_version_id IS NULL`,
+    )
+    .all() as Array<{ id: number; system_prompt: string | null; tools_json: string | null; model: string | null }>;
+  if (!orphans.length) return;
+
+  const ts = now();
+  const insert = d.prepare(
+    `INSERT INTO role_versions (role_id, version_no, system_prompt, tools_json, model, created_by_note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const point = d.prepare(`UPDATE roles SET current_version_id = ? WHERE id = ?`);
+  d.transaction(() => {
+    for (const role of orphans) {
+      // version_no is per-role, and a backfilled role has no versions yet — but
+      // compute it rather than assuming 1, so this stays correct if a future
+      // path ever inserts versions before pointing the role at one.
+      const next = (
+        d.prepare(`SELECT COALESCE(MAX(version_no), 0) AS n FROM role_versions WHERE role_id = ?`).get(role.id) as {
+          n: number;
+        }
+      ).n + 1;
+      const info = insert.run(
+        role.id,
+        next,
+        role.system_prompt,
+        role.tools_json,
+        role.model,
+        "initial version (recorded when versioning was introduced)",
+        ts,
+      );
+      point.run(Number(info.lastInsertRowid), role.id);
+    }
+  })();
+  console.log(`[db] recorded an initial version for ${orphans.length} role(s)`);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,8 +737,28 @@ export interface RoleRow {
   tools_json: string | null;
   model: string | null;
   can_create_subtasks: number;
+  /** The `role_versions` row matching this role's live definition
+   *  (PLANNING/overhaul-2/03). Null only between schema creation and the
+   *  backfill, never in normal operation. */
+  current_version_id: number | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One recorded state of a role's definition (PLANNING/overhaul-2/03). Append
+ *  only: a revert writes a NEW version whose content matches an old one rather
+ *  than rewriting history, the same way restoreCheckpoint treats task history. */
+export interface RoleVersionRow {
+  id: number;
+  role_id: number;
+  /** 1-based, per role. */
+  version_no: number;
+  system_prompt: string | null;
+  tools_json: string | null;
+  model: string | null;
+  /** Free text: "initial version", "reverted to v2", or an operator's note. */
+  created_by_note: string | null;
+  created_at: string;
 }
 
 export interface TaskRow {
@@ -532,9 +804,23 @@ export interface TaskRow {
   depends_on_json: string | null;
   origin: string | null;
   priority: number | null;
+  /** ISO timestamp a human first opened this task; NULL = not yet glanced at
+   *  (PLANNING/overhaul/08 §2's "distinct lane until first human glance"). */
+  seen_at: string | null;
   autonomy_level: string | null;
   effort_size: string | null;
+  /** "model" (explorer's own estimate) or "human" (corrected at intake review).
+   *  NULL = never set. See PLANNING/intake-refinement.md. */
+  effort_size_source: string | null;
   planning_rigor: string | null;
+  /** "scouting" | "proposed" | "accepted" | "skipped" — intake review state;
+   *  NULL for a task that took the direct intake → start path. */
+  intake_review_state: string | null;
+  /** The IntakeProposal JSON a review produced (see intake-review.ts). */
+  intake_proposal_json: string | null;
+  /** When the project's spend ceiling stopped this task's next dispatch
+   *  (PLANNING/overhaul-2/01). NULL = never budget-stopped. */
+  budget_paused_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -623,6 +909,10 @@ export interface RoleRunRow {
   carry_forward: string | null;
   /** Rolling ≤400-char digest of this run's report (PLANNING/overhaul/07 §2). */
   digest: string | null;
+  /** The `role_versions` row whose definition produced this run
+   *  (PLANNING/overhaul-2/03). NULL on every run predating versioning — those
+   *  are excluded from version scores rather than guessed at. */
+  role_version_id: number | null;
   created_at: string;
 }
 
@@ -741,11 +1031,11 @@ export function createProject(input: {
 }
 
 export function listProjects(): ProjectRow[] {
-  return getDb().prepare(`SELECT * FROM projects ORDER BY id DESC`).all() as ProjectRow[];
+  return readProjects(getDb().prepare(`SELECT * FROM projects ORDER BY id DESC`).all() as ProjectRow[]);
 }
 
 export function getProject(id: number): ProjectRow | undefined {
-  return getDb().prepare(`SELECT * FROM projects WHERE id = ?`).get(id) as ProjectRow | undefined;
+  return readProject(getDb().prepare(`SELECT * FROM projects WHERE id = ?`).get(id) as ProjectRow | undefined);
 }
 
 const PROJECT_UPDATABLE = new Set([
@@ -761,7 +1051,11 @@ const PROJECT_UPDATABLE = new Set([
 ]);
 
 export function updateProject(id: number, fields: Record<string, unknown>): ProjectRow | undefined {
-  const updates = Object.entries(fields).filter(([k]) => PROJECT_UPDATABLE.has(k));
+  const updates = Object.entries(fields)
+    .filter(([k]) => PROJECT_UPDATABLE.has(k))
+    // Encrypt on the way in (PLANNING/overhaul-2/02). Idempotent, so a caller
+    // that read a row and wrote it straight back is handled either way.
+    .map(([k, v]) => (k === "github_token" ? [k, encryptSecret(v as string | null)] : [k, v]) as [string, unknown]);
   if (updates.length) {
     updates.push(["updated_at", now()]);
     const setClause = updates.map(([k]) => `${k} = ?`).join(", ");
@@ -804,7 +1098,48 @@ export function getRole(projectId: number | null, key: string): RoleRow | undefi
   return listRoles(projectId).find((r) => r.key === key);
 }
 
-/** Insert or update a role identified by (project_id, key). */
+/**
+ * Record a new version of a role's definition and point the live row at it
+ * (PLANNING/overhaul-2/03 §1). Returns the new version's id.
+ */
+function recordRoleVersion(
+  d: DB,
+  roleId: number,
+  content: { system_prompt: string | null; tools_json: string | null; model: string | null },
+  note: string | null,
+): number {
+  const next = (
+    d.prepare(`SELECT COALESCE(MAX(version_no), 0) AS n FROM role_versions WHERE role_id = ?`).get(roleId) as {
+      n: number;
+    }
+  ).n + 1;
+  const info = d
+    .prepare(
+      `INSERT INTO role_versions (role_id, version_no, system_prompt, tools_json, model, created_by_note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(roleId, next, content.system_prompt, content.tools_json, content.model, note, now());
+  const versionId = Number(info.lastInsertRowid);
+  d.prepare(`UPDATE roles SET current_version_id = ? WHERE id = ?`).run(versionId, roleId);
+  return versionId;
+}
+
+/**
+ * Insert or update a role identified by (project_id, key).
+ *
+ * Versioned since PLANNING/overhaul-2/03: instead of overwriting a definition
+ * with no record of what it said before, this records a `role_versions` row and
+ * repoints `roles.current_version_id`. Dispatch is unchanged — the live `roles`
+ * row is still what runs.
+ *
+ * A version is recorded only when the three *scored* fields (system_prompt,
+ * tools_json, model) actually change. Everything else a role carries — title,
+ * ordering, enabled — updates in place without minting a version, because a
+ * version exists to be compared on outcomes and a re-ordered role produces no
+ * different output. This is also what keeps `seedGlobalRoles`, which re-upserts
+ * the whole catalog whenever its content hash moves, from stamping a redundant
+ * version onto every role each time one of them is edited.
+ */
 export function upsertRole(input: {
   project_id: number | null;
   key: string;
@@ -816,6 +1151,8 @@ export function upsertRole(input: {
   tools_json?: string | null;
   model?: string | null;
   can_create_subtasks?: boolean;
+  /** Recorded on the version this call creates, if it creates one. */
+  version_note?: string | null;
 }): RoleRow {
   const d = getDb();
   const ts = now();
@@ -828,6 +1165,11 @@ export function upsertRole(input: {
     | undefined;
 
   if (existing) {
+    const next = {
+      system_prompt: input.system_prompt ?? existing.system_prompt,
+      tools_json: input.tools_json ?? existing.tools_json,
+      model: input.model ?? existing.model,
+    };
     d.prepare(
       `UPDATE roles SET title=@title, enabled=@enabled, applies_to=@applies_to, ordering=@ordering,
         system_prompt=@system_prompt, tools_json=@tools_json, model=@model, can_create_subtasks=@can_create_subtasks, updated_at=@ts WHERE id=@id`,
@@ -837,12 +1179,19 @@ export function upsertRole(input: {
       enabled: input.enabled == null ? existing.enabled : input.enabled ? 1 : 0,
       applies_to: input.applies_to ?? existing.applies_to,
       ordering: input.ordering ?? existing.ordering,
-      system_prompt: input.system_prompt ?? existing.system_prompt,
-      tools_json: input.tools_json ?? existing.tools_json,
-      model: input.model ?? existing.model,
+      ...next,
       can_create_subtasks: input.can_create_subtasks == null ? existing.can_create_subtasks : input.can_create_subtasks ? 1 : 0,
       ts,
     });
+    const changed =
+      next.system_prompt !== existing.system_prompt ||
+      next.tools_json !== existing.tools_json ||
+      next.model !== existing.model;
+    // A role with no version at all still needs one — covers a row inserted by
+    // a path that predates the backfill.
+    if (changed || existing.current_version_id == null) {
+      recordRoleVersion(d, existing.id, next, input.version_note ?? null);
+    }
     return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(existing.id) as RoleRow;
   }
 
@@ -864,7 +1213,61 @@ export function upsertRole(input: {
       can_create_subtasks: input.can_create_subtasks ? 1 : 0,
       ts,
     });
-  return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(Number(info.lastInsertRowid)) as RoleRow;
+  const roleId = Number(info.lastInsertRowid);
+  recordRoleVersion(
+    d,
+    roleId,
+    {
+      system_prompt: input.system_prompt ?? null,
+      tools_json: input.tools_json ?? null,
+      model: input.model ?? null,
+    },
+    input.version_note ?? "initial version",
+  );
+  return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(roleId) as RoleRow;
+}
+
+// ---------------------------------------------------------------------------
+// Role versions (PLANNING/overhaul-2/03)
+// ---------------------------------------------------------------------------
+
+/** Newest first — the order the history panel renders. */
+export function listRoleVersions(roleId: number): RoleVersionRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM role_versions WHERE role_id = ? ORDER BY version_no DESC`)
+    .all(roleId) as RoleVersionRow[];
+}
+
+export function getRoleVersion(id: number): RoleVersionRow | undefined {
+  return getDb().prepare(`SELECT * FROM role_versions WHERE id = ?`).get(id) as RoleVersionRow | undefined;
+}
+
+/**
+ * Revert a role to an earlier version's content by recording a NEW version that
+ * matches it, then pointing the role there (PLANNING/overhaul-2/03 §4).
+ *
+ * Never destructive: the intervening versions stay in the history with their
+ * own scores, which is the whole point — "we tried that and it was worse" is
+ * information, and rewriting it away would destroy the record the scoring is
+ * built on.
+ */
+export function revertRoleToVersion(roleId: number, versionId: number): RoleRow {
+  const d = getDb();
+  const target = getRoleVersion(versionId);
+  if (!target || target.role_id !== roleId) throw new Error("Version not found for this role.");
+  const role = d.prepare(`SELECT * FROM roles WHERE id = ?`).get(roleId) as RoleRow | undefined;
+  if (!role) throw new Error("Role not found.");
+
+  d.prepare(
+    `UPDATE roles SET system_prompt = ?, tools_json = ?, model = ?, updated_at = ? WHERE id = ?`,
+  ).run(target.system_prompt, target.tools_json, target.model, now(), roleId);
+  recordRoleVersion(
+    d,
+    roleId,
+    { system_prompt: target.system_prompt, tools_json: target.tools_json, model: target.model },
+    `reverted to v${target.version_no}`,
+  );
+  return d.prepare(`SELECT * FROM roles WHERE id = ?`).get(roleId) as RoleRow;
 }
 
 export function deleteRole(id: number): void {
@@ -876,6 +1279,197 @@ export function countGlobalRoles(): number {
     n: number;
   };
   return row.n;
+}
+
+/**
+ * Below this many runs, a version's score is underpowered rather than bad — two
+ * runs and one failure isn't "worse", it's noise. The UI must not present a
+ * score as confident until this many runs have landed (PLANNING/overhaul-2/03
+ * risks §1).
+ */
+export const MIN_RUNS_FOR_CONFIDENT_SCORE = 5;
+
+/** One role version's outcome rollup (PLANNING/overhaul-2/03 §3). Rates 0..1. */
+export interface RoleVersionScoreRow {
+  version_id: number;
+  version_no: number;
+  created_at: string;
+  created_by_note: string | null;
+  /** Whether this is the definition currently running. */
+  is_current: boolean;
+  /** Primary runs stamped with this version. Runs predating versioning have no
+   *  `role_version_id` and are excluded rather than attributed by guess. */
+  runs: number;
+  pass_rate: number;
+  /** Runs whose counter-reviewer returned a non-pass verdict — the gate's own
+   *  "send it back" signal, read from the linked critique/second_review row.
+   *  Runs with no counter-review are excluded from the denominator (see
+   *  `reviewed_runs`), so a role that's never critiqued reads 0, not "perfect". */
+  loopback_rate: number;
+  /** Reviewed runs where the critique marked at least one criterion failed,
+   *  regardless of its overall verdict — a softer signal than the verdict
+   *  alone, since a critique can pass while still flagging something. */
+  critique_flag_rate: number;
+  /** Runs on a task that later drew a human non-acceptance action — a
+   *  checkpoint restore, a request-for-changes, or a wont_do. Attribution is
+   *  task-level, not run-level: the signal is "work from this version needed a
+   *  human to intervene", not "this exact run was rejected". */
+  human_override_rate: number;
+  /** Runs whose derived health (overhaul/04) was below `healthy` — a version
+   *  that only reaches `pass` via repair or fallback is doing worse than its
+   *  raw pass rate suggests. */
+  degraded_rate: number;
+  /** Runs that had a counter-review at all — the denominator behind
+   *  loopback_rate/critique_flag_rate, exposed so the UI can say "3 of 7
+   *  reviewed" rather than implying the whole sample was checked. */
+  reviewed_runs: number;
+  avg_tokens: number;
+  /** True below {@link MIN_RUNS_FOR_CONFIDENT_SCORE}: don't rank on this. */
+  sample_warning: boolean;
+}
+
+/**
+ * Score every version of one role by the outcomes of its own runs
+ * (PLANNING/overhaul-2/03 §3).
+ *
+ * This is the thing `getRoleStats` structurally cannot do: that query groups by
+ * `role_key` across all time, mixing every prompt a role has ever had into one
+ * number, so it can tell you a role is good but never that last week's edit
+ * made it worse. Grouping by `role_version_id` is the whole difference.
+ *
+ * A caveat the caller must carry rather than hide: pass rates across versions
+ * are only comparable when the underlying work was comparable. A version can
+ * score worse purely because it drew harder intakes. The `applies_to` scoping
+ * the doc recommends is a UI-level concern; what this function guarantees is
+ * only that each run is counted against the version that actually produced it.
+ */
+export function getRoleVersionStats(roleId: number): RoleVersionScoreRow[] {
+  const d = getDb();
+  const versions = d
+    .prepare(`SELECT * FROM role_versions WHERE role_id = ? ORDER BY version_no DESC`)
+    .all(roleId) as RoleVersionRow[];
+  if (!versions.length) return [];
+
+  const currentVersionId = (
+    d.prepare(`SELECT current_version_id AS v FROM roles WHERE id = ?`).get(roleId) as
+      | { v: number | null }
+      | undefined
+  )?.v ?? null;
+
+  const versionIds = versions.map((v) => v.id);
+  const placeholders = versionIds.map(() => "?").join(",");
+  const runs = d
+    .prepare(
+      `SELECT * FROM role_runs
+       WHERE role_version_id IN (${placeholders})
+         AND (run_kind = 'primary' OR run_kind IS NULL)`,
+    )
+    .all(...versionIds) as RoleRunRow[];
+
+  // Counter-reviews, keyed by the primary run they judged.
+  const critiques = new Map<number, RoleRunRow[]>();
+  if (runs.length) {
+    const runPlaceholders = runs.map(() => "?").join(",");
+    const rows = d
+      .prepare(
+        `SELECT * FROM role_runs
+         WHERE target_run_id IN (${runPlaceholders})
+           AND run_kind IN ('critique', 'second_review')`,
+      )
+      .all(...runs.map((r) => r.id)) as RoleRunRow[];
+    for (const c of rows) {
+      const list = critiques.get(c.target_run_id!) ?? [];
+      list.push(c);
+      critiques.set(c.target_run_id!, list);
+    }
+  }
+
+  // Human non-acceptance actions, per task, with their timestamps — a run only
+  // counts as overridden by an action recorded AFTER it ran.
+  const overrideByTask = new Map<string, string[]>();
+  const taskIds = [...new Set(runs.map((r) => r.task_id))];
+  if (taskIds.length) {
+    const taskPlaceholders = taskIds.map(() => "?").join(",");
+    const rows = d
+      .prepare(
+        `SELECT task_id, created_at FROM interventions
+         WHERE task_id IN (${taskPlaceholders})
+           AND kind IN ('restore_checkpoint', 'request_changes', 'wont_do')`,
+      )
+      .all(...taskIds) as Array<{ task_id: string; created_at: string }>;
+    for (const iv of rows) {
+      const list = overrideByTask.get(iv.task_id) ?? [];
+      list.push(iv.created_at);
+      overrideByTask.set(iv.task_id, list);
+    }
+  }
+
+  const byVersion = new Map<number, RoleRunRow[]>();
+  for (const run of runs) {
+    const list = byVersion.get(run.role_version_id!) ?? [];
+    list.push(run);
+    byVersion.set(run.role_version_id!, list);
+  }
+
+  const rate = (numerator: number, denominator: number): number =>
+    denominator > 0 ? numerator / denominator : 0;
+
+  return versions.map((version) => {
+    const mine = byVersion.get(version.id) ?? [];
+    let passes = 0;
+    let reviewed = 0;
+    let loopbacks = 0;
+    let flagged = 0;
+    let overridden = 0;
+    let degraded = 0;
+    let tokens = 0;
+
+    for (const run of mine) {
+      if (run.verdict === "pass") passes++;
+      tokens += run.tokens ?? 0;
+      if (!isTrustedHealth(computeRunHealth(roleRunHealthInput(run)))) degraded++;
+
+      const linked = critiques.get(run.id) ?? [];
+      if (linked.length) {
+        reviewed++;
+        if (linked.some((c) => c.verdict !== "pass")) loopbacks++;
+        if (linked.some((c) => hasFailedCriterion(c.criteria_results_json))) flagged++;
+      }
+
+      const actions = overrideByTask.get(run.task_id) ?? [];
+      if (actions.some((at) => at > run.created_at)) overridden++;
+    }
+
+    return {
+      version_id: version.id,
+      version_no: version.version_no,
+      created_at: version.created_at,
+      created_by_note: version.created_by_note,
+      is_current: version.id === currentVersionId,
+      runs: mine.length,
+      pass_rate: rate(passes, mine.length),
+      loopback_rate: rate(loopbacks, reviewed),
+      critique_flag_rate: rate(flagged, reviewed),
+      human_override_rate: rate(overridden, mine.length),
+      degraded_rate: rate(degraded, mine.length),
+      reviewed_runs: reviewed,
+      avg_tokens: mine.length ? Math.round(tokens / mine.length) : 0,
+      sample_warning: mine.length < MIN_RUNS_FOR_CONFIDENT_SCORE,
+    };
+  });
+}
+
+/** Whether a critique's per-criterion judgements contain a real failure. A
+ *  malformed/absent blob reads as "nothing flagged" — the same defensive
+ *  direction the rest of this file's JSON parsing takes. */
+function hasFailedCriterion(criteriaResultsJson: string | null): boolean {
+  if (!criteriaResultsJson) return false;
+  try {
+    const parsed = JSON.parse(criteriaResultsJson) as Array<{ status?: string }>;
+    return Array.isArray(parsed) && parsed.some((c) => c?.status === "fail" || c?.status === "failed");
+  } catch {
+    return false;
+  }
 }
 
 /** Per-role-key aggregated statistics across all projects. */
@@ -1228,16 +1822,20 @@ export function setMeta(key: string, value: string): void {
 
 /** The global default profile (`project_id IS NULL, key='default'`), if seeded. */
 export function getGlobalConfig(): ConfigRow | undefined {
-  return getDb()
-    .prepare(`SELECT * FROM configs WHERE project_id IS NULL AND key = 'default'`)
-    .get() as ConfigRow | undefined;
+  return readConfig(
+    getDb()
+      .prepare(`SELECT * FROM configs WHERE project_id IS NULL AND key = 'default'`)
+      .get() as ConfigRow | undefined,
+  );
 }
 
 /** A project's override profile for `key` (default 'default'), if any. */
 export function getProjectConfig(projectId: number, key = "default"): ConfigRow | undefined {
-  return getDb()
-    .prepare(`SELECT * FROM configs WHERE project_id = ? AND key = ?`)
-    .get(projectId, key) as ConfigRow | undefined;
+  return readConfig(
+    getDb()
+      .prepare(`SELECT * FROM configs WHERE project_id = ? AND key = ?`)
+      .get(projectId, key) as ConfigRow | undefined,
+  );
 }
 
 /**
@@ -1283,7 +1881,10 @@ export function upsertConfig(input: {
     const merged = {
       name: keep(input.name, base.name),
       base_url: keep(input.base_url, base.base_url),
-      api_key: keep(input.api_key, base.api_key),
+      // `base` here is a RAW row (read directly below, not through readConfig),
+      // so an untouched prior value is already ciphertext — and encryptSecret
+      // passes that through rather than double-encrypting it.
+      api_key: encryptSecret(keep(input.api_key, base.api_key)),
       api: keep(input.api, base.api),
       default_model: keep(input.default_model, base.default_model),
       context_window: keep(input.context_window, base.context_window),
@@ -1307,7 +1908,7 @@ export function upsertConfig(input: {
         request_timeout_ms=@request_timeout_ms, reasoning=@reasoning, thinking_level=@thinking_level,
         thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase, extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, structured_outputs_json=@structured_outputs_json, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id: existing.id, ts });
-    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow;
+    return readConfig(d.prepare(`SELECT * FROM configs WHERE id = ?`).get(existing.id) as ConfigRow);
   }
 
   const info = d
@@ -1318,7 +1919,7 @@ export function upsertConfig(input: {
          @context_window, @max_tokens, @request_timeout_ms, @reasoning, @thinking_level, @thinking_format, @text_mode, @two_phase, @extra_json, @compat_json, @thinking_budgets, @structured_outputs_json, @ts, @ts)`,
     )
     .run({ ...merged, project_id: input.project_id, key, ts });
-  return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
+  return readConfig(d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow);
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,10 +2003,31 @@ export function createTask(input: {
   return getTask(Number(info.lastInsertRowid))!;
 }
 
-/** The task_id of a family's shared-worktree anchor: itself for a root task
- *  or any task that predates root_task_id, otherwise its resolved root. */
+/**
+ * The task_id of a family's shared-worktree anchor: itself for a root task,
+ * otherwise its resolved root.
+ *
+ * `backfillRootTaskIds` fills the column in for every existing row, so the
+ * parent-walk fallback is belt-and-braces for a task whose root was somehow
+ * never resolved (a row written by an older build against a newer DB). It
+ * matters because the alternative — treating a task that plainly has a parent
+ * as its own root — silently hands it a second branch and worktree, and makes
+ * the server disagree with the client's `buildWorktreeFamilies`, which has
+ * always done this walk.
+ */
 export function familyRootId(task: TaskRow): string {
-  return task.root_task_id ?? task.task_id;
+  if (task.root_task_id) return task.root_task_id;
+  if (!task.parent_task_id) return task.task_id;
+  const seen = new Set<string>([task.task_id]);
+  let cur = task;
+  while (cur.parent_task_id && !seen.has(cur.parent_task_id)) {
+    seen.add(cur.parent_task_id);
+    const parent = getTask(cur.parent_task_id);
+    if (!parent) break;
+    if (parent.root_task_id) return parent.root_task_id;
+    cur = parent;
+  }
+  return cur.task_id;
 }
 
 /** Fetch a task by numeric id or by task_id hash. */
@@ -1470,6 +2092,10 @@ const TASK_UPDATABLE = new Set([
   "response",
   "failure_reason",
   "parent_task_id",
+  // Normally write-once at createTask. Updatable so a task orphaned by a
+  // vanished family root can be promoted to its own root (ensureTaskWorkspace)
+  // instead of being left with no worktree at all.
+  "root_task_id",
   "task_type",
   "step_number",
   "project_id",
@@ -1497,9 +2123,14 @@ const TASK_UPDATABLE = new Set([
   "depends_on_json",
   "origin",
   "priority",
+  "seen_at",
   "autonomy_level",
   "effort_size",
+  "effort_size_source",
   "planning_rigor",
+  "budget_paused_at",
+  "intake_review_state",
+  "intake_proposal_json",
 ]);
 
 export function updateTask(
@@ -1520,10 +2151,65 @@ export function updateTask(
   return getTask(identifier);
 }
 
+/**
+ * Hand a family's identity to a surviving member when its root is deleted.
+ *
+ * Without this, deleting a root leaves its descendants pointing at a row that
+ * no longer exists. `ensureTaskWorkspace` can't resolve the root, returns them
+ * with no `git_worktree_path`, and `taskRepoPath` then falls back to the
+ * project's SHARED checkout — so the orphans run with no worktree isolation at
+ * all, which is worse than the duplicate worktree the family scheme exists to
+ * prevent.
+ *
+ * The eldest surviving member takes over: it becomes its own root, adopts the
+ * dead root's worktree/branch, and every other member (plus anything that was
+ * parented directly on the deleted row) re-points at it.
+ */
+function reRootFamily(d: DB, root: TaskRow): void {
+  const members = listTasks({ rootTaskId: root.task_id }).filter((t) => t.task_id !== root.task_id);
+  if (!members.length) return;
+
+  // listTasks orders created_at DESC, so the last entry is the eldest.
+  const heir = members[members.length - 1]!;
+  const rest = members.filter((t) => t.task_id !== heir.task_id);
+
+  d.prepare(
+    `UPDATE tasks SET root_task_id = ?, parent_task_id = NULL, task_type = 'root',
+       git_worktree_path = COALESCE(git_worktree_path, ?),
+       git_branch = COALESCE(git_branch, ?),
+       git_base_branch = COALESCE(git_base_branch, ?),
+       updated_at = ?
+     WHERE task_id = ?`,
+  ).run(
+    heir.task_id,
+    root.git_worktree_path,
+    root.git_branch,
+    root.git_base_branch,
+    now(),
+    heir.task_id,
+  );
+
+  const reparent = d.prepare(
+    `UPDATE tasks SET root_task_id = ?,
+       parent_task_id = CASE WHEN parent_task_id = ? THEN ? ELSE parent_task_id END,
+       updated_at = ?
+     WHERE task_id = ?`,
+  );
+  for (const m of rest) reparent.run(heir.task_id, root.task_id, heir.task_id, now(), m.task_id);
+
+  console.log(
+    `[db] re-rooted family ${root.task_id.slice(0, 8)} -> ${heir.task_id.slice(0, 8)} (${members.length} member(s))`,
+  );
+}
+
 export function deleteTask(identifier: number | string): void {
   const d = getDb();
   const task = getTask(identifier);
   if (!task) return;
+
+  // Before the row goes: if this task anchors a family that outlives it, hand
+  // the family's worktree/branch to a survivor rather than orphaning them.
+  if (familyRootId(task) === task.task_id) reRootFamily(d, task);
 
   // Cascade-clean related rows before removing the task itself.
   d.prepare(`DELETE FROM role_runs WHERE task_id = ?`).run(task.task_id);
@@ -1583,6 +2269,9 @@ export function resetTask(identifier: number | string): TaskRow | undefined {
       step_number = NULL,
       model = NULL,
       depends_on_json = NULL,
+      effort_size_source = NULL,
+      intake_review_state = NULL,
+      intake_proposal_json = NULL,
       updated_at = @ts
     WHERE ${keyCol} = @keyVal
   `).run({ ts, keyVal });
@@ -1646,6 +2335,10 @@ export function createRoleRun(input: {
   context_tokens_est?: number | null;
   context_degraded?: number | null;
   carry_forward?: string | null;
+  /** The role definition that produced this run (PLANNING/overhaul-2/03) —
+   *  the role's `current_version_id` at dispatch time. The join key that turns
+   *  per-run outcomes into per-version outcomes. */
+  role_version_id?: number | null;
 }): RoleRunRow {
   const d = getDb();
   const ts = now();
@@ -1655,12 +2348,12 @@ export function createRoleRun(input: {
          criteria_results_json, tool_calls_json, transcript_jsonl, stop_reason, fallback, stalled, verdict_source,
          thinking_md, open_questions_json, target_run_id, run_kind, attempt, resumed_from,
          phase, failed_tool_calls, artifact_bytes, evidence_json, depth, model, tokens, subtasks_json,
-         no_decomposition_reason, context_tokens_est, context_degraded, carry_forward, created_at)
+         no_decomposition_reason, context_tokens_est, context_degraded, carry_forward, role_version_id, created_at)
        VALUES (@task_id, @role_key, @verdict, @summary, @output_md, @coverage_json,
          @criteria_results_json, @tool_calls_json, @transcript_jsonl, @stop_reason, @fallback, @stalled, @verdict_source,
          @thinking_md, @open_questions_json, @target_run_id, @run_kind, @attempt, @resumed_from,
          @phase, @failed_tool_calls, @artifact_bytes, @evidence_json, @depth, @model, @tokens, @subtasks_json,
-         @no_decomposition_reason, @context_tokens_est, @context_degraded, @carry_forward, @ts)`,
+         @no_decomposition_reason, @context_tokens_est, @context_degraded, @carry_forward, @role_version_id, @ts)`,
     )
     .run({
       task_id: input.task_id,
@@ -1694,6 +2387,7 @@ export function createRoleRun(input: {
       context_tokens_est: input.context_tokens_est ?? null,
       context_degraded: input.context_degraded ?? 0,
       carry_forward: input.carry_forward ?? null,
+      role_version_id: input.role_version_id ?? null,
       ts,
     });
   return d.prepare(`SELECT * FROM role_runs WHERE id = ?`).get(Number(info.lastInsertRowid)) as RoleRunRow;
@@ -2047,13 +2741,15 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
 
   /** Return all model configs including the global default row. Sorted by user ordering. */
   export function listModelConfigs(): ConfigRow[] {
-    return getDb()
-      .prepare(`SELECT * FROM configs ORDER BY ordering ASC, id ASC`)
-      .all() as ConfigRow[];
+    return readConfigs(
+      getDb()
+        .prepare(`SELECT * FROM configs ORDER BY ordering ASC, id ASC`)
+        .all() as ConfigRow[],
+    );
   }
 
   export function getConfigById(id: number): ConfigRow | undefined {
-    return getDb().prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow | undefined;
+    return readConfig(getDb().prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow | undefined);
   }
 
   /** Create a named model config. Throws if name already exists. */
@@ -2101,7 +2797,7 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
         key,
         name: input.name,
         base_url: input.base_url ?? null,
-        api_key: input.api_key ?? null,
+        api_key: encryptSecret(input.api_key ?? null),
         api: input.api ?? "openai-completions",
         default_model: input.default_model ?? null,
         context_window: input.context_window ?? null,
@@ -2119,7 +2815,7 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
         ordering,
         ts,
       });
-    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow;
+    return readConfig(d.prepare(`SELECT * FROM configs WHERE id = ?`).get(Number(info.lastInsertRowid)) as ConfigRow);
   }
 
   /** Update a model config by id. */
@@ -2158,7 +2854,9 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
     const merged = {
       name: keep(input.name, existing.name),
       base_url: keep(input.base_url, existing.base_url),
-      api_key: keep(input.api_key, existing.api_key),
+      // `existing` came from getConfigById, i.e. already decrypted — so an
+      // untouched prior value is re-encrypted here, same as a brand-new one.
+      api_key: encryptSecret(keep(input.api_key, existing.api_key)),
       api: keep(input.api, existing.api),
       default_model: keep(input.default_model, existing.default_model),
       context_window: keep(input.context_window, existing.context_window),
@@ -2183,7 +2881,7 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
         thinking_format=@thinking_format, text_mode=@text_mode, two_phase=@two_phase,
         extra_json=@extra_json, compat_json=@compat_json, thinking_budgets=@thinking_budgets, structured_outputs_json=@structured_outputs_json, updated_at=@ts WHERE id=@id`,
     ).run({ ...merged, id, ts });
-    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
+    return readConfig(d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow);
   }
 
   /** Delete a model config by id. Refuses to delete the global default row. */
@@ -2246,7 +2944,7 @@ export function getModelPerformanceStats(): ModelPerformanceRow[] {
     // Promote the target
     const ts = now();
     d.prepare(`UPDATE configs SET key = 'default', updated_at = ? WHERE id = ?`).run(ts, id);
-    return d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow;
+    return readConfig(d.prepare(`SELECT * FROM configs WHERE id = ?`).get(id) as ConfigRow);
   }
 
   /**
@@ -2521,10 +3219,168 @@ export function suppressCandidateForTask(taskId: string, reason: string): void {
   updateCandidate(row.id, { status: "suppressed", suppressed_at: now(), suppressed_reason: reason });
 }
 
+/** Mark self-generated tasks as glanced at. Idempotent and first-write-wins —
+ *  re-marking never moves the timestamp, so "new since you last looked" can't
+ *  be reset by a second page load. */
+export function markTasksSeen(taskIds: string[]): void {
+  if (!taskIds.length) return;
+  const d = getDb();
+  const ts = now();
+  const stmt = d.prepare(`UPDATE tasks SET seen_at = ? WHERE task_id = ? AND seen_at IS NULL`);
+  const tx = d.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(ts, id);
+  });
+  tx(taskIds);
+}
+
+/** Watcher-origin tasks a human has never opened — the server-side truth
+ *  behind the board's "new self-generated" section. */
+export function listUnseenWatcherTasks(projectId: number): TaskRow[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE project_id = ? AND origin LIKE 'watcher:%' AND seen_at IS NULL
+       ORDER BY created_at DESC`,
+    )
+    .all(projectId) as TaskRow[];
+}
+
+/** Every role run for a project since `isoTimestamp`, oldest first — the raw
+ *  material for the morning report's "what was attempted overnight". */
+export function listRoleRunsSince(projectId: number, isoTimestamp: string): RoleRunRow[] {
+  return getDb()
+    .prepare(
+      `SELECT rr.* FROM role_runs rr
+       JOIN tasks t ON t.task_id = rr.task_id
+       WHERE t.project_id = ? AND rr.created_at >= ?
+       ORDER BY rr.id ASC`,
+    )
+    .all(projectId, toDbTimestamp(isoTimestamp)) as RoleRunRow[];
+}
+
+/** Completed runs whose rolling digest (PLANNING/overhaul/07 §2) never landed —
+ *  the fire-and-forget digest call failed, or the daemon stopped while it was
+ *  in flight. Only rows with enough material to be worth digesting are
+ *  returned, so the backfill can't burn calls on one-line reports. */
+export function listRoleRunsMissingDigest(projectId: number, limit: number): RoleRunRow[] {
+  return getDb()
+    .prepare(
+      `SELECT rr.* FROM role_runs rr
+       JOIN tasks t ON t.task_id = rr.task_id
+       WHERE t.project_id = ?
+         AND rr.digest IS NULL
+         AND rr.output_md IS NOT NULL
+         AND length(rr.output_md) >= 400
+       ORDER BY rr.id DESC LIMIT ?`,
+    )
+    .all(projectId, limit) as RoleRunRow[];
+}
+
 /** Live sum of `role_runs.tokens` for watcher-originated tasks since
  *  `isoTimestamp` — the doc's "sum role_runs.tokens live" token budget, read
  *  on demand rather than counter-incremented (unlike task-starts/exec-runs,
- *  which have no row to sum after the fact). */
+ *  which have no row to sum after the fact). The bound goes through
+ *  {@link toDbTimestamp}: callers hand this a `Date.toISOString()` value, which
+ *  never matches stored rows without normalization. */
+/**
+ * `role_runs.tokens` carries ONE combined count (input + output — see agent.ts's
+ * usage accumulation), but pricing is per-direction. Converting the combined
+ * number to dollars therefore requires assuming a split. Orchestra's runs are
+ * read-heavy — a large assembled context against a comparatively short findings
+ * report — so output is the minority share. This constant names that assumption
+ * instead of burying it in a formula, and {@link ProjectSpend} returns it so the
+ * UI can label the dollar figure as the estimate it is.
+ */
+export const ASSUMED_OUTPUT_FRACTION = 0.15;
+
+export interface ProjectSpend {
+  /** Summed `role_runs.tokens` in the window. Always exact. */
+  tokens: number;
+  /** Dollar estimate for the runs whose model matched a config carrying
+   *  pricing. See {@link ASSUMED_OUTPUT_FRACTION} for the split assumption. */
+  usd: number;
+  /** True when at least one contributing run's model had no cost data, so the
+   *  dollar figure is a floor ("at least $X"), not a total. The whole point of
+   *  the flag: never present a silently under-reported number as a total. */
+  usdIsPartial: boolean;
+  /** Tokens that couldn't be priced — what `usdIsPartial` is hiding, quantified. */
+  unpricedTokens: number;
+  /** Echoed so a caller rendering `usd` can state the assumption it rests on. */
+  assumedOutputFraction: number;
+  /** Window start actually used, for display alongside the numbers. */
+  since: string;
+}
+
+/**
+ * Spend for one project's tasks over a rolling window (PLANNING/overhaul-2/01).
+ *
+ * Sums `role_runs.tokens` across every run belonging to the project's tasks,
+ * then prices the ones whose `model` matches a named model config carrying
+ * `cost_per_1m_input`/`cost_per_1m_output` in its `extra_json`. Runs on models
+ * with no pricing still count toward `tokens` — the token ceiling must be fully
+ * enforceable on a project that has never entered a price — and set
+ * `usdIsPartial` so the dollar figure is never mistaken for a complete total.
+ */
+export function getProjectSpend(projectId: number, sinceIso: string): ProjectSpend {
+  const rows = getDb()
+    .prepare(
+      `SELECT rr.model AS model, COALESCE(SUM(rr.tokens), 0) AS tokens
+       FROM role_runs rr
+       JOIN tasks t ON t.task_id = rr.task_id
+       WHERE t.project_id = ? AND rr.created_at >= ?
+       GROUP BY rr.model`,
+    )
+    .all(projectId, toDbTimestamp(sinceIso)) as Array<{ model: string | null; tokens: number }>;
+
+  // model id -> blended $/1M tokens, from the first config that both matches the
+  // model and actually carries pricing (several configs can share a
+  // default_model — a priced one beats an unpriced duplicate).
+  const priceByModel = new Map<string, number>();
+  for (const cfg of listModelConfigs()) {
+    if (!cfg.default_model || priceByModel.has(cfg.default_model)) continue;
+    let extras: Record<string, unknown> = {};
+    try {
+      if (cfg.extra_json) extras = JSON.parse(cfg.extra_json) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const inRate = typeof extras.cost_per_1m_input === "number" ? extras.cost_per_1m_input : null;
+    const outRate = typeof extras.cost_per_1m_output === "number" ? extras.cost_per_1m_output : null;
+    if (inRate == null && outRate == null) continue;
+    // A config priced in only one direction still prices better than nothing:
+    // treat the missing side as equal to the one that's set.
+    const input = inRate ?? outRate!;
+    const output = outRate ?? inRate!;
+    priceByModel.set(
+      cfg.default_model,
+      input * (1 - ASSUMED_OUTPUT_FRACTION) + output * ASSUMED_OUTPUT_FRACTION,
+    );
+  }
+
+  let tokens = 0;
+  let usd = 0;
+  let unpricedTokens = 0;
+  for (const row of rows) {
+    const t = row.tokens ?? 0;
+    tokens += t;
+    const rate = row.model ? priceByModel.get(row.model) : undefined;
+    if (rate == null) {
+      unpricedTokens += t;
+      continue;
+    }
+    usd += (t / 1_000_000) * rate;
+  }
+
+  return {
+    tokens,
+    usd,
+    usdIsPartial: unpricedTokens > 0,
+    unpricedTokens,
+    assumedOutputFraction: ASSUMED_OUTPUT_FRACTION,
+    since: sinceIso,
+  };
+}
+
 export function sumAutonomousTokensSince(projectId: number, isoTimestamp: string): number {
   const row = getDb()
     .prepare(
@@ -2533,7 +3389,7 @@ export function sumAutonomousTokensSince(projectId: number, isoTimestamp: string
        JOIN tasks t ON t.task_id = rr.task_id
        WHERE t.project_id = ? AND t.origin LIKE 'watcher:%' AND rr.created_at >= ?`,
     )
-    .get(projectId, isoTimestamp) as { total: number };
+    .get(projectId, toDbTimestamp(isoTimestamp)) as { total: number };
   return row.total;
 }
 

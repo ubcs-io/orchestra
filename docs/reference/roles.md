@@ -1,6 +1,6 @@
 # Roles Catalog
 
-Orchestra ships with **24 roles** seeded as global defaults. Each role is customizable per project — you can edit its system prompt, assigned tools, model, or enable/disable it via the Roles Editor UI or `PUT /api/projects/:id/roles/:key`.
+Orchestra ships with **25 roles** seeded as global defaults. Each role is customizable per project — you can edit its system prompt, assigned tools, model, or enable/disable it via the Roles Editor UI or `PUT /api/projects/:id/roles/:key`.
 
 Roles are organized into four groups: spec-track, research/UX-track, counter-reviewers, and the cross-cutting `critic`.
 
@@ -21,7 +21,12 @@ Roles are organized into four groups: spec-track, research/UX-track, counter-rev
 | `style_conventions` | Style & Conventions (Code Reviewer) | read-only | chore, feature |
 | `test_strategy` | Test Strategy (QA / SDET) | read-only | feature, bug, error_file, manual, chore, security |
 | `dependency_integration` | Dependency & Integration (Build / DevEx) | read-only | feature |
-| `decomposition` | Decomposition (Tech Lead / Scrum Master) | read-only | all spec kinds _(terminal)_ |
+| `decomposition` | Decomposition (Tech Lead / Scrum Master) | read-only | all spec kinds _(terminal for `spec`)_ |
+| `developer` | Developer (Implementation Engineer) | none by default — [write/edit/exec are opt-in](/guide/execution) | the execution flow _(see below)_ |
+
+::: tip `explorer` sizes the work
+`explorer` is the one role that has actually read the files before anyone estimates scope, so it also sets the task's `effort_size` (XS–XL). That number gates how much further planning happens — see [planning rigor & effort sizing](/reference/config#planning-rigor-effort-sizing).
+:::
 
 ## Research/UX-Track Roles
 
@@ -75,6 +80,10 @@ Roles are assigned tool sets that define what they can do:
 | **read-only** | `read`, `grep`, `find`, `ls` | Most code-inspecting roles |
 | **read + git_history** | above + `git_history` (recent commit inspection) | Bug investigators, security reviewers |
 | **none** | context-only reasoning | Lightweight roles (requirements analyst, research synthesis, brief review) |
+| **write** | `write`, `edit` | Nobody by default. Requires `allowWrite` on the project's [harness policy](/guide/execution); worktree-jailed. |
+| **exec** | `run_command` | Nobody by default. Requires `allowExec` **and** a non-empty command allowlist. |
+
+Every role also has two platform tools that aren't part of its tool set: `report_section`, which appends report prose to the task artifact durably as the role works, and `record_findings`, which delivers the verdict trailer. See [artifact-first output](/reference/reliability#artifact-first-output).
 
 ## Flow Templates
 
@@ -95,6 +104,18 @@ Each intake kind maps to a flow — a specific sequence of roles with a counter-
 
 **Bold** roles are counter-reviewers. `security` and `feature` are the two highest-rigor flows, so `critic` checks every step rather than just the reviewer step.
 
+### The execution flow
+
+One further flow is not tied to an intake kind. It produces the third exit shape, `code_change`:
+
+| Flow | Steps | `reviewDepth` |
+|---|---|---|
+| execution | **developer** → **critic** | `none` |
+
+A task enters it either as a decomposition leaf flagged `execution_ready`, or via the XS fast path from `explorer`. `reviewDepth` is `none` because `critic` *is* the review step here rather than a producer being reviewed — its own verdict is the sole automated gate before human merge review. Where the project's [command allowlist](/guide/execution#the-run-command-tool) defines `test` or `typecheck`, matching evidence criteria are attached automatically and must run green.
+
+See [Writing & Running Code](/guide/execution) for the full picture.
+
 ## Per-Project Customization
 
 Via `GET /api/projects/:id/roles` and `PUT /api/projects/:id/roles/:key` you can override any role for a specific project:
@@ -109,6 +130,36 @@ Project overrides are stored in SQLite and persist across restarts.
 ## Role Usage Stats
 
 The Roles Editor shows per-role-key pills — **calls**, **pass** (verdict = pass), **review** (counter-reviewer/critique passes), **nets** (agent networks containing the role), and total **tokens** — aggregated across every project via `GET /api/roles/stats`. Use it to spot roles that never pass, rarely get exercised, or burn disproportionate tokens.
+
+## Version History & Outcome Scoring
+
+Those lifetime totals have a structural blind spot: they aggregate across **all time**, mixing every prompt a role has ever had into one number. They can tell you a role is good; they can never tell you last week's edit made it worse.
+
+So every edit to a role's **prompt, tools, or model** records a `role_versions` row and repoints `roles.current_version_id`. Nothing about dispatch changes — the live `roles` row is still what runs; this is a paper trail behind it. Every run is stamped with the version that produced it (`role_runs.role_version_id`), and that stamp is what turns per-run outcome data into per-version outcome data.
+
+Edits to fields that can't change output — title, ordering, enabled — update in place without minting a version.
+
+Open **History** under any role in the Roles Editor for the list, a line diff against the live prompt, and a one-click revert. Each version carries:
+
+| Metric | Meaning |
+|---|---|
+| `runs` | Primary runs attributed to this version. Runs predating versioning have no stamp and are excluded rather than guessed at. |
+| `pass_rate` | Verdict = pass, over this version's own runs. |
+| `loopback_rate` | The counter-reviewer sent it back — over `reviewed_runs`, not all runs, so a role that's never critiqued reads 0 rather than looking perfect. |
+| `critique_flag_rate` | The critique marked at least one criterion failed, regardless of its overall verdict. A softer signal than the verdict alone. |
+| `human_override_rate` | The task later drew a checkpoint restore, a change request, or a won't-do. |
+| `degraded_rate` | Runs whose [health](/reference/reliability#run-health) was below `healthy` — a version that only reaches `pass` via repair or fallback is doing worse than its raw pass rate suggests. |
+| `sample_warning` | Fewer than 5 runs. |
+
+**Revert is never destructive.** It records a *new* version whose content matches the old one, leaving the intervening versions in the history with their own scores — "we tried that and it was worse" is information, and rewriting it away would destroy the record the scoring is built on. A revert is still checked against today's harness policy: an old version granting `write`/`edit` can't come back through that door while the project says no.
+
+::: warning Two things a score can't tell you
+**Small samples aren't verdicts.** A version with 2 runs and a bad pass rate isn't worse, it's underpowered — hence `sample_warning`, and why the panel labels rather than ranks below the floor.
+
+**Difficulty confounds.** A version can score worse purely because it drew harder intakes. What's guaranteed is only that each run counts against the version that actually produced it; comparing across different kinds of work is on you.
+
+Relatedly, a version that changed prompt **and** model at once can't attribute its score to either — the editor badges that as a *mixed edit*. It's a nudge to change one thing at a time, not a block.
+:::
 
 ## Open Questions
 

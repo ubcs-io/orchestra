@@ -41,10 +41,21 @@ Alongside the flow-level counter-reviewer, a cross-cutting **`critic`** role can
 
 - **spec** — ends with the `decomposition` role, producing an epic → story → task tree with acceptance criteria
 - **research_brief** — ends with the `research_synthesis` role, producing a decision brief with options, trade-offs, and a recommendation
+- **code_change** — ends with the `critic` role, producing an implemented change on the task's own branch, parked for [merge review](/guide/execution#the-merge-gate)
+
+### Reliability
+
+Orchestra is built for local, low-context models, which fail in specific ways: truncated output, unreliable custom tool calls, context exhaustion. Reports are written to the artifact as they're produced (so a failed structured payload never costs you the analysis), the verdict is obtained by the most guaranteed mechanism the endpoint supports, and every run carries a [health record](/reference/reliability#run-health) that the gates take into account before trusting what it concluded.
+
+### Self-Generated Work
+
+With [autonomy](/guide/autonomy) enabled, watchers scan the repo during idle windows — failing tests, decayed TODOs, lint drift, doc drift, quiet branches, stale dependencies — and propose candidates that become ordinary tasks under hard caps. Off by default, per project.
 
 ## Architecture
 
-One Node process is the whole app. The server boots the database, seeds the role catalog, serves the REST + SSE API and the built client, and starts the orchestrator loop — all in-process. No external broker, queue, or cron: SQLite is the durable work queue. Each scheduler round dispatches up to `maxConcurrentTasks` tasks' next role-step concurrently, each isolated in its own [git worktree](/guide/how-it-works#git-isolation-concurrency) — a single task is still strictly sequential against itself (a restore can never race that task's own in-flight step), but distinct tasks now genuinely overlap instead of taking turns.
+One Node process is the whole app. The server boots the database, seeds the role catalog, serves the REST + SSE API and the built client, and runs two independent loops in-process: the orchestrator scheduler and the watcher loop. No external broker, queue, or cron: SQLite is the durable work queue. Each scheduler round dispatches up to `maxConcurrentTasks` tasks' next role-step concurrently, each isolated in its own [git worktree](/guide/how-it-works#git-isolation-concurrency) — a single task is still strictly sequential against itself (a restore can never race that task's own in-flight step), but distinct tasks genuinely overlap instead of taking turns.
+
+A second, optional process — the [MCP server](/reference/mcp) — exposes task context and the candidate queue to external agents over stdio. It is never spawned by the daemon and only ever reads.
 
 - **Backend:** Fastify (REST + SSE), better-sqlite3 (WAL), pi
 - **Frontend:** Vite + React SPA, TanStack Router + TanStack Query, native `EventSource`
@@ -53,5 +64,7 @@ One Node process is the whole app. The server boots the database, seeds the role
 
 - [Quick Start](/guide/quick-start) — get Orchestra running in 5 minutes
 - [How It Works](/guide/how-it-works) — deep dive into the refinement pipeline
-- [Roles Catalog](/reference/roles) — all 24 roles and their capabilities
+- [Roles Catalog](/reference/roles) — all 25 roles and their capabilities
+- [Writing & Running Code](/guide/execution) — opt roles into editing source and running your test suite
+- [Autonomous Operation](/guide/autonomy) — let Orchestra generate its own work
 - [Agent Networks](/guide/networks) — build custom visual agent graphs

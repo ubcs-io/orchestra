@@ -8,7 +8,7 @@ Networks replace a flow template's ordered list with a directed graph of **nodes
 
 Access the editor at `/networks` in the UI. It provides:
 
-- A **role palette** — drag any of the 24 roles onto the canvas
+- A **role palette** — drag any of the 25 roles onto the canvas
 - **React Flow canvas** with snap-to-grid positioning
 - **Edge connections** — click-drag from a node's output handle to another node's input handle
 - **Per-network metadata** — intake kind, rigor level, max loopbacks, reviewer role, review depth
@@ -59,6 +59,10 @@ When a task enters the orchestrator:
 3. Otherwise, the built-in flow template is used as a fallback
 
 Networks are stored in SQLite alongside projects.
+
+::: tip Choosing a network per task
+The steps above are the *automatic* resolution. To pick a network — or edit its role list — for one specific task before it runs, file the intake through [Intake Review](/guide/intake-review): the review card offers every network in the project's scope, with its ordered role list, and seeds the accepted choice onto the task.
+:::
 
 ## API
 
