@@ -6,8 +6,10 @@ import {
   appendArtifactSection,
   commitArtifacts,
   currentBranch,
+  deleteBranch,
   ensureWorktree,
   isGitRepo,
+  listOrchestraBranches,
   moveArtifact,
   readArtifact,
   reconcileBranch,
@@ -30,6 +32,10 @@ function repo(): string {
   const r = tempGitRepo();
   cleanups.push(r);
   return r;
+}
+/** Porcelain working-tree status — "" means git sees nothing out of place. */
+function status(r: string): string {
+  return execFileSync("git", ["status", "--porcelain"], { cwd: r, encoding: "utf8" }).trim();
 }
 
 describe("isGitRepo", () => {
@@ -181,6 +187,76 @@ describe("worktrees", () => {
     // The branch (and its commit) survives — only the worktree checkout was removed.
     ensureWorktree(r, dir, "orchestra/task-1", base);
     expect(fs.existsSync(path.join(dir, "work.md"))).toBe(true);
+  });
+
+  it("makes the worktrees container self-ignoring, leaving the user's repo clean", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    ensureWorktree(r, worktreePath(r, "task-1"), "orchestra/task-1", base);
+
+    // A `.gitignore` of `*` inside the container hides the directory AND
+    // itself, so Orchestra never dirties `git status` and never has to touch
+    // the user's own root `.gitignore`.
+    expect(fs.readFileSync(path.join(r, ".orchestra-worktrees", ".gitignore"), "utf8")).toBe("*\n");
+    expect(fs.existsSync(path.join(r, ".gitignore"))).toBe(false);
+    expect(status(r)).toBe("");
+  });
+
+  it("leaves an existing container .gitignore alone", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    const ignoreFile = path.join(r, ".orchestra-worktrees", ".gitignore");
+    fs.mkdirSync(path.dirname(ignoreFile), { recursive: true });
+    fs.writeFileSync(ignoreFile, "*\n# hand-edited\n");
+
+    ensureWorktree(r, worktreePath(r, "task-1"), "orchestra/task-1", base);
+    expect(fs.readFileSync(ignoreFile, "utf8")).toContain("# hand-edited");
+  });
+});
+
+describe("deleteBranch", () => {
+  it("deletes a merged branch and refuses an unmerged one", () => {
+    const r = repo();
+    const base = currentBranch(r);
+
+    // Merged: worktree removed first (git won't delete a checked-out branch).
+    const mergedDir = worktreePath(r, "merged");
+    ensureWorktree(r, mergedDir, "orchestra/merged", base);
+    writeArtifact(path.join(mergedDir, "a.md"), "a");
+    commitArtifacts(mergedDir, ["a.md"], "landed work");
+    expect(reconcileBranch(mergedDir, "orchestra/merged", base).status).toBe("merged");
+    removeWorktree(r, mergedDir);
+
+    // Unmerged: a commit that never reached base.
+    const openDir = worktreePath(r, "open");
+    ensureWorktree(r, openDir, "orchestra/open", base);
+    writeArtifact(path.join(openDir, "b.md"), "b");
+    commitArtifacts(openDir, ["b.md"], "unlanded work");
+    removeWorktree(r, openDir);
+
+    expect(deleteBranch(r, "orchestra/merged")).toBe(true);
+    // `-d`, never `-D`: git's own unmerged check is the safety property.
+    expect(deleteBranch(r, "orchestra/open")).toBe(false);
+
+    const remaining = listOrchestraBranches(r);
+    expect(remaining).toEqual(["orchestra/open"]);
+  });
+
+  it("returns false rather than throwing for a branch that does not exist", () => {
+    const r = repo();
+    expect(deleteBranch(r, "orchestra/never-existed")).toBe(false);
+  });
+});
+
+describe("listOrchestraBranches", () => {
+  it("returns only orchestra/* branches, never the user's own", () => {
+    const r = repo();
+    const base = currentBranch(r);
+    execFileSync("git", ["branch", "feature/mine"], { cwd: r });
+    ensureWorktree(r, worktreePath(r, "t1"), "orchestra/t1", base);
+    ensureWorktree(r, worktreePath(r, "t2"), "orchestra/t2", base);
+
+    expect(listOrchestraBranches(r).sort()).toEqual(["orchestra/t1", "orchestra/t2"]);
   });
 });
 

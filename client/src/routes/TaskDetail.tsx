@@ -15,6 +15,7 @@ import { api, displayModelName, isEvidenceGreen, parseEvidence, verdictClass, ty
 import { blockedDeps } from "../relations";
 import { rolesWithWriteTools, taskWriteCapability } from "../writeCapability";
 import { NetworkNodeCard } from "../components/NetworkNodeCard";
+import { IntakeReviewPanel } from "../components/IntakeReviewPanel";
 import { ModelBubble } from "../components/ModelBubble";
 import { DiffPanel, RunDiffSection } from "../components/DiffPanel";
 import { ReviewCTA, collectQuestions, findAnsweredQuestion, type ClientOpenQuestion } from "../components/ReviewCTA";
@@ -1420,6 +1421,7 @@ export function TaskDetail() {
   const [restoreTarget, setRestoreTarget] = useState<RoleRun | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [intakeReviewOpen, setIntakeReviewOpen] = useState(false);
 
   const intervene = useMutation({
     mutationFn: ({ kind, payload }: { kind: string; payload?: unknown }) => api.intervene(taskId, kind, payload),
@@ -1753,8 +1755,49 @@ export function TaskDetail() {
             onChanged={refresh}
           />
         )}
-        {t.effort_size && <span className="pill dim">size: {t.effort_size}</span>}
-        {t.paused === 1 && <span className="pill warn">paused</span>}
+        {t.effort_size && (
+          <span
+            className="pill dim"
+            title={
+              t.effort_size_source === "human"
+                ? "Set by hand at intake review — a later explorer run will not overwrite it"
+                : "The explorer role's own estimate"
+            }
+          >
+            size: {t.effort_size}
+            {t.effort_size_source === "human" ? " ✋" : ""}
+          </span>
+        )}
+        {/* An intake still in pre-flight review (PLANNING/intake-refinement.md)
+            is paused on a human, but for a reason "paused" alone doesn't
+            explain — it hasn't chosen a flow yet. */}
+        {t.intake_review_state === "proposed" ? (
+          <button
+            type="button"
+            className="pill human"
+            onClick={() => setIntakeReviewOpen(true)}
+            title="This intake is waiting on your review — nothing runs until you decide"
+          >
+            review intake →
+          </button>
+        ) : t.intake_review_state === "scouting" || t.intake_review_state === "skip_pending" ? (
+          <span className="pill dim" title="Reading the repo to propose a flow, roles and effort size">
+            scouting
+          </span>
+        ) : t.paused === 1 ? (
+          <span className="pill warn">paused</span>
+        ) : null}
+        {intakeReviewOpen && (
+          <IntakeReviewPanel task={t} onClose={() => { setIntakeReviewOpen(false); refresh(); }} />
+        )}
+        {/* Distinct from "paused" on purpose (PLANNING/overhaul-2/01) — nobody
+            paused this, the project's spend ceiling did, and it releases itself
+            once spend ages out of the rolling window. */}
+        {t.budget_paused_at && (
+          <span className="pill bad" title={`Project spend ceiling reached at ${new Date(t.budget_paused_at).toLocaleString()}`}>
+            over budget
+          </span>
+        )}
         {t.reconcile_status === "pending_human_merge" && (
           t.github_pr_url ? (
             <a className="pill ok" href={t.github_pr_url} target="_blank" rel="noreferrer" onClick={() => setDiffOpen(true)}>
@@ -2372,6 +2415,18 @@ export function TaskDetail() {
                   <button className="small primary" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "resume" }); }}>Resume</button>
                 ) : (
                   <button className="small" onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "pause" }); }}>Pause</button>
+                )}
+                {/* Its own button rather than folded into Resume: overriding a
+                    spend ceiling is a different decision from un-pausing, and
+                    is logged as one (PLANNING/overhaul-2/01). */}
+                {t.budget_paused_at && (
+                  <button
+                    className="small danger"
+                    title="Let this task keep running past the project's spend ceiling, for a bounded window"
+                    onClick={(e) => { e.stopPropagation(); intervene.mutate({ kind: "resume_over_budget" }); }}
+                  >
+                    Run over budget
+                  </button>
                 )}
                 <button className="small" onClick={(e) => { e.stopPropagation(); setResetModal(true); }} title="Reset to intake">
                   🔄

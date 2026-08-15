@@ -8,27 +8,11 @@ import { GitHubBubble } from "../components/GitHubBubble";
 import { WorktreeKanban } from "../components/WorktreeKanban";
 import { WorktreeDetailPane } from "../components/WorktreeDetailPane";
 import { SignalsPanel } from "../components/SignalsPanel";
+import { MorningReportPanel } from "../components/MorningReportPanel";
+import { IntakeReviewPanel } from "../components/IntakeReviewPanel";
 import { rolesWithWriteTools, taskWriteCapability, type WriteCapability } from "../writeCapability";
 
-// Self-generated task "first glance" tracking (PLANNING/overhaul/08) is
-// client-only for this pass — no server-side "seen" flag exists yet, so this
-// won't share across sessions/browsers (a known follow-up gap, not solved here).
-const WATCHER_GLANCED_KEY = "orchestra:glanced-watcher-tasks";
-function loadGlancedSet(): Set<string> {
-  try {
-    const raw = localStorage.getItem(WATCHER_GLANCED_KEY);
-    return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
-  } catch {
-    return new Set();
-  }
-}
-function saveGlancedSet(s: Set<string>): void {
-  try {
-    localStorage.setItem(WATCHER_GLANCED_KEY, JSON.stringify([...s]));
-  } catch {
-    /* localStorage unavailable (private mode etc.) — glancing just won't persist */
-  }
-}
+type BoardTab = "intake" | "signals" | "report";
 
 /** Small header pill summarizing this project's idle-window autonomy budget
  *  (PLANNING/overhaul/08 §3) — hidden entirely when autonomy isn't enabled. */
@@ -138,7 +122,13 @@ function TaskCard({
           {cap === "acting" && <span className="pill accent">acting</span>}
           {cap === "planning" && <span className="pill dim">planning</span>}
           <span>{planProgress(task)}</span>
-          {task.paused === 1 && <span className="pill warn">paused</span>}
+          {task.intake_review_state === "proposed" ? (
+            <span className="pill human" title="Waiting on your review before a flow is chosen">needs review</span>
+          ) : task.intake_review_state === "scouting" || task.intake_review_state === "skip_pending" ? (
+            <span className="pill dim" title="Reading the repo to propose a flow">scouting</span>
+          ) : task.paused === 1 ? (
+            <span className="pill warn">paused</span>
+          ) : null}
           {task.stale_reason && (
             <span className="pill bad" title={task.stale_reason}>
               possibly stale
@@ -178,7 +168,13 @@ function TaskCard({
         {cap === "acting" && <span className="pill accent">acting</span>}
         {cap === "planning" && <span className="pill dim">planning</span>}
         <span>{planProgress(task)}</span>
-        {task.paused === 1 && <span className="pill warn">paused</span>}
+        {task.intake_review_state === "proposed" ? (
+          <span className="pill human" title="Waiting on your review before a flow is chosen">needs review</span>
+        ) : task.intake_review_state === "scouting" || task.intake_review_state === "skip_pending" ? (
+          <span className="pill dim" title="Reading the repo to propose a flow">scouting</span>
+        ) : task.paused === 1 ? (
+          <span className="pill warn">paused</span>
+        ) : null}
         {task.stale_reason && (
           <span className="pill bad" title={task.stale_reason}>
             possibly stale
@@ -224,6 +220,17 @@ export function ProjectBoard() {
   // (and its todos/decompositions) so the board comes back empty.
   const [isCleanSlate, setIsCleanSlate] = useState(false);
 
+  // Intake review (PLANNING/intake-refinement.md): which task's proposal is
+  // open, and whether this project reviews by default (which of the two intake
+  // buttons is primary).
+  const [reviewingTaskId, setReviewingTaskId] = useState<string | null>(null);
+  const intakeReviewCfgQ = useQuery({
+    queryKey: ["intake-review-config", pid],
+    queryFn: () => api.intakeReviewConfig(pid),
+    enabled: Number.isFinite(pid),
+  });
+  const reviewDefault = intakeReviewCfgQ.data?.config.default ?? "off";
+
   // Scheduler state for the intake column banner
   const [schedulerRunning, setSchedulerRunning] = useState(true);
   useEffect(() => {
@@ -234,14 +241,19 @@ export function ProjectBoard() {
     return () => clearInterval(iv);
   }, []);
 
+  // `review` opts this one intake into the pre-flight review layer
+  // (PLANNING/intake-refinement.md) instead of starting its filed kind's flow
+  // immediately. Same endpoint, same task row — only the hold differs.
   const submit = useMutation({
-    mutationFn: () => api.intake(pid, { name: name || "intake", content, intake_kind: kind }),
+    mutationFn: (review?: boolean) =>
+      api.intake(pid, { name: name || "intake", content, intake_kind: kind, review }),
     onSuccess: (data) => {
       setContent("");
       setName("");
       qc.invalidateQueries({ queryKey: ["tasks", pid] });
       if (data.task_id) {
         console.log(`[intake] task ${data.task_id} created`);
+        if (data.intake_review_state) setReviewingTaskId(data.task_id);
       }
     },
   });
@@ -276,30 +288,27 @@ export function ProjectBoard() {
   );
   const [showArchived, setShowArchived] = useState(false);
 
-  // Self-generated tasks (PLANNING/overhaul/08 §2/§3)
-  const [glancedIds, setGlancedIds] = useState<Set<string>>(() => loadGlancedSet());
+  // Self-generated tasks (PLANNING/overhaul/08 §2/§3). "Seen" is a server-side
+  // flag (`tasks.seen_at`), so what counts as new is the same in every browser
+  // and session — the first autonomy slice tracked this in localStorage, which
+  // meant opening the board on a second machine re-flagged everything as new.
   const unglancedWatcherTasks = useMemo(
     () =>
       (tasksQ.data?.tasks ?? []).filter(
-        (t) => (t.origin ?? "human").startsWith("watcher:") && !glancedIds.has(t.task_id),
+        (t) => (t.origin ?? "human").startsWith("watcher:") && !t.seen_at,
       ),
-    [tasksQ.data, glancedIds],
+    [tasksQ.data],
   );
+  const markSeen = useMutation({
+    mutationFn: (taskIds: string[]) => api.markTasksSeen(taskIds),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks", pid] }),
+  });
   function markGlanced(taskId: string) {
-    setGlancedIds((prev) => {
-      if (prev.has(taskId)) return prev;
-      const next = new Set(prev).add(taskId);
-      saveGlancedSet(next);
-      return next;
-    });
+    markSeen.mutate([taskId]);
   }
   function markAllGlanced() {
-    setGlancedIds((prev) => {
-      const next = new Set(prev);
-      for (const t of unglancedWatcherTasks) next.add(t.task_id);
-      saveGlancedSet(next);
-      return next;
-    });
+    const ids = unglancedWatcherTasks.map((t) => t.task_id);
+    if (ids.length) markSeen.mutate(ids);
   }
 
   // Signals tab (PLANNING/overhaul/08)
@@ -320,7 +329,7 @@ export function ProjectBoard() {
       ),
     [tasksQ.data],
   );
-  const [activeTab, setActiveTab] = useState<"intake" | "signals">("intake");
+  const [activeTab, setActiveTab] = useState<BoardTab>("intake");
   const [tabTouched, setTabTouched] = useState(false);
   const prevOpenWatcherCount = useRef(0);
   useEffect(() => {
@@ -330,7 +339,7 @@ export function ProjectBoard() {
     }
     prevOpenWatcherCount.current = count;
   }, [openWatcherTasks.length, tabTouched]);
-  function selectTab(tab: "intake" | "signals") {
+  function selectTab(tab: BoardTab) {
     setActiveTab(tab);
     setTabTouched(true);
   }
@@ -366,6 +375,14 @@ export function ProjectBoard() {
     () => (summaryQ.data?.review_list ?? []).filter((r) => r.project_id === pid),
     [summaryQ.data, pid],
   );
+  // Intakes parked on a human by the pre-flight review layer. Distinct from
+  // `reviewList` above, which is tasks that reached stage:review after running
+  // a whole flow — these haven't chosen a flow yet.
+  const intakeReviewList = useMemo(
+    () => (tasksQ.data?.tasks ?? []).filter((t) => t.intake_review_state === "proposed"),
+    [tasksQ.data],
+  );
+  const reviewingTask = reviewingTaskId ? tasksById.get(reviewingTaskId) : undefined;
 
   function toggleCleanupMode() {
     if (isCleanupMode && selectedTaskIds.size > 0) {
@@ -441,6 +458,26 @@ export function ProjectBoard() {
         <Link to="/projects/$projectId/roles" params={{ projectId }}>edit roles →</Link>
       </div>
 
+      {intakeReviewList.length > 0 && (
+        <div className="banner human" style={{ marginBottom: 12 }}>
+          {intakeReviewList.length} intake
+          {intakeReviewList.length === 1 ? "" : "s"} waiting on your review — nothing runs until you
+          decide:{" "}
+          {intakeReviewList.map((t, i) => (
+            <span key={t.task_id}>
+              {i > 0 && ", "}
+              <button className="small" onClick={() => setReviewingTaskId(t.task_id)}>
+                {t.name ?? t.task_id.slice(0, 8)}
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {reviewingTask && (
+        <IntakeReviewPanel task={reviewingTask} onClose={() => setReviewingTaskId(null)} />
+      )}
+
       {reviewList.length > 0 && (
         <div className="banner human" style={{ marginBottom: 12 }}>
           {reviewList.length} task{reviewList.length === 1 ? "" : "s"} need{reviewList.length === 1 ? "s" : ""} your review:{" "}
@@ -467,6 +504,9 @@ export function ProjectBoard() {
                 </span>
               )}
             </button>
+            <button className={`tab${activeTab === "report" ? " active" : ""}`} onClick={() => selectTab("report")}>
+              ☀️ Report
+            </button>
           </div>
         ) : (
           <h2>New intake</h2>
@@ -490,11 +530,27 @@ export function ProjectBoard() {
             </div>
             <label>Content — a request, a bare error/stack trace, or an open-ended research prompt</label>
             <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="Consider how to address the UX issue on the settings page…" />
-            <div style={{ marginTop: 8 }}>
-              <button className="primary" disabled={!content || submit.isPending} onClick={() => submit.mutate()}>
+            <div className="row" style={{ marginTop: 8, gap: 8 }}>
+              <button
+                className={reviewDefault === "on" ? "" : "primary"}
+                disabled={!content || submit.isPending}
+                onClick={() => submit.mutate(false)}
+              >
                 {submit.isPending ? "Submitting…" : "Create task"}
               </button>
-              <span className="muted" style={{ marginLeft: 10 }}>The task appears in the intake column immediately.</span>
+              <button
+                className={reviewDefault === "on" ? "primary" : ""}
+                disabled={!content || submit.isPending}
+                onClick={() => submit.mutate(true)}
+                title="Read the repo first, then propose the flow, roles and effort size for you to correct before anything runs"
+              >
+                Review intake ▸
+              </button>
+              <span className="muted">
+                {reviewDefault === "on"
+                  ? "This project reviews intakes by default."
+                  : "The task appears in the intake column immediately."}
+              </span>
             </div>
           </>
         )}
@@ -507,6 +563,8 @@ export function ProjectBoard() {
             markAllGlanced={markAllGlanced}
           />
         )}
+
+        {showSignalsTab && activeTab === "report" && <MorningReportPanel projectId={pid} />}
       </div>
 
       {selectedFamily ? (

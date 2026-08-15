@@ -66,6 +66,10 @@ Open `http://localhost:5173` in your browser.
 
 You'll see the live SSE stream on the Task Detail page as roles inspect your codebase and record their findings.
 
+::: tip Not sure which kind or how big it is?
+Press **Review intake ▸** instead of "Create task". Orchestra reads the repository first, then proposes the flow, the role plan, and the effort size for you to correct before anything runs — see [Intake Review](/guide/intake-review).
+:::
+
 ## Production Build
 
 ```bash
@@ -75,9 +79,23 @@ npm start       # node server/dist/main.js on :5001
 
 The production process serves both the API and the built SPA from a single Node process.
 
+Other scripts: `npm run typecheck` (both workspaces) and `npm run test` / `test:watch` / `test:coverage` (server tests via Vitest).
+
+## Deployment
+
+The single process is designed to run on a headless box under **systemd** (or pm2/Docker with a restart policy), bound to a tailnet interface, with other clients reaching the UI/API/SSE over Tailscale.
+
+::: danger There is no authentication
+Network reachability is the entire trust boundary. Anyone who can reach the port can register projects, run roles against your repositories, and — if you have enabled them — trigger source edits and allowlisted commands on the host. GitHub PATs and API keys are stored **unencrypted** in SQLite (masked on API responses, not at rest). Bind to a private interface.
+:::
+
+Multiple clients can watch and steer the same task concurrently: steering actions are POSTs, up to `maxConcurrentTasks` tasks execute in parallel in their own worktrees, a given task's own steps and restores stay serialized, and SSE fans live progress out to every viewer.
+
 ## Next Steps
 
 - [How It Works](/guide/how-it-works) — understand the refinement pipeline
-- [Roles Catalog](/reference/roles) — learn about all 24 role agents, including the adversarial `critic`
+- [Roles Catalog](/reference/roles) — learn about all 25 role agents, including the adversarial `critic`
+- [Writing & Running Code](/guide/execution) — let roles edit source and run your test suite (opt-in)
+- [Autonomous Operation](/guide/autonomy) — watchers, budgets, and the morning report
 - [Agent Networks](/guide/networks) — create custom visual agent graphs
-- Visit `/models` in the UI to set up named model configs, compare them, and ping your endpoints for connectivity
+- Visit `/models` in the UI to set up named model configs, compare them, probe their capabilities, and ping your endpoints for connectivity

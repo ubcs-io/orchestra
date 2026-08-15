@@ -69,6 +69,9 @@ export interface Task {
   origin: string | null;
   /** 1-5, default 3 — the scheduler's tie-break among same-class tasks. */
   priority: number | null;
+  /** ISO timestamp a human first opened this task; null = not yet glanced at.
+   *  Server-side, so "new" means the same thing in every browser. */
+  seen_at: string | null;
   /** "plan" | "edit" | "auto" override, or null to inherit the project's own
    *  default (see server/src/autonomy-level.ts). Distinct from the unrelated
    *  project-level watcher-scheduling "autonomy" config. */
@@ -80,6 +83,17 @@ export interface Task {
    *  project's own default (see server/src/planning-rigor.ts). Distinct from
    *  the unrelated fixed FLOW_TEMPLATES rigor tag and counter-reviewer gate rigor. */
   planning_rigor: string | null;
+  /** When the project's spend ceiling stopped this task's next dispatch
+   *  (PLANNING/overhaul-2/01); null = not budget-stopped. Deliberately distinct
+   *  from `paused`, so "I paused this" and "the budget stopped this" read
+   *  differently — and it clears itself once spend ages out of the window. */
+  budget_paused_at: string | null;
+  /** Pre-flight review state (PLANNING/intake-refinement.md); null on every
+   *  task that took the direct intake → start path. */
+  intake_review_state: IntakeReviewState | null;
+  /** "model" (explorer's own estimate) or "human" (corrected at intake review).
+   *  A human-set size is never overwritten by a later explorer re-run. */
+  effort_size_source: string | null;
   /** Run-health rollups (PLANNING/overhaul/04) attached by GET /api/tasks — count
    *  of this task's degraded/empty primary runs, and the health of its most
    *  recent primary run. Present on the task-list payload only. */
@@ -202,6 +216,53 @@ export interface Role {
   tools_json: string | null;
   model: string | null;
   can_create_subtasks: number;
+  /** The role_versions row matching this role's live definition
+   *  (PLANNING/overhaul-2/03). */
+  current_version_id?: number | null;
+}
+
+/** One recorded state of a role's definition (PLANNING/overhaul-2/03). */
+export interface RoleVersion {
+  id: number;
+  role_id: number;
+  version_no: number;
+  system_prompt: string | null;
+  tools_json: string | null;
+  model: string | null;
+  created_by_note: string | null;
+  created_at: string;
+}
+
+/** A version's outcome rollup over its OWN runs — not the role's lifetime
+ *  total, which is the whole point (PLANNING/overhaul-2/03 §3). Rates 0..1. */
+export interface RoleVersionScore {
+  version_id: number;
+  version_no: number;
+  created_at: string;
+  created_by_note: string | null;
+  is_current: boolean;
+  runs: number;
+  pass_rate: number;
+  loopback_rate: number;
+  critique_flag_rate: number;
+  human_override_rate: number;
+  degraded_rate: number;
+  /** Denominator behind loopback/critique rates — runs that had a
+   *  counter-review at all. */
+  reviewed_runs: number;
+  avg_tokens: number;
+  /** Below the run-count floor: underpowered, not bad. Don't rank on it. */
+  sample_warning: boolean;
+}
+
+export interface RoleVersionsResponse {
+  role_id: number;
+  /** Whether these versions belong to a project override or the global role. */
+  is_project_override: boolean;
+  current_version_id: number | null;
+  min_runs_for_confidence: number;
+  versions: RoleVersion[];
+  scores: RoleVersionScore[];
 }
 
 export interface Intervention {
@@ -408,6 +469,9 @@ export interface TaskDetail {
   interventions: Intervention[];
   children: Task[];
   chat_messages: ChatMessage[];
+  /** Expiry of any resume_over_budget grant on this task, expired or not
+   *  (PLANNING/overhaul-2/01) — null when none was ever granted. */
+  budget_override_until: string | null;
   taxonomy: string[];
 }
 
@@ -543,6 +607,54 @@ export type HarnessPolicyPatch = Partial<
   >
 >;
 
+/** Per-project spend ceiling (PLANNING/overhaul-2/01) — see
+ *  server/src/budget-policy.ts. Off by default; `capUsd`/`capTokens` are each
+ *  optional, and a token-only budget is fully enforceable on a project whose
+ *  models have no configured price. */
+export interface BudgetPolicy {
+  enabled: boolean;
+  periodDays: number;
+  capUsd?: number;
+  capTokens?: number;
+  warnThresholdPct: number;
+  /** How long a resume_over_budget grant keeps one task dispatchable. */
+  overrideMinutes: number;
+}
+
+/** Spend over the policy's rolling window. `usd` is a floor, not a total, when
+ *  `usdIsPartial` — runs on models with no configured price contribute tokens
+ *  but no dollars. */
+export interface ProjectSpend {
+  tokens: number;
+  usd: number;
+  usdIsPartial: boolean;
+  unpricedTokens: number;
+  assumedOutputFraction: number;
+  since: string;
+}
+
+export interface BudgetStatus {
+  policy: BudgetPolicy;
+  /** Switched on AND carrying at least one cap — an enabled policy with no cap
+   *  stops nothing, and this is the field that says so. */
+  enforced: boolean;
+  spend: ProjectSpend;
+  overCap: boolean;
+  warning: boolean;
+  usagePct: number | null;
+  breached: Array<"tokens" | "usd">;
+}
+
+/** Send only what you're changing; `null` clears an optional cap. */
+export type BudgetPatch = Partial<{
+  enabled: boolean;
+  periodDays: number;
+  capUsd: number | null;
+  capTokens: number | null;
+  warnThresholdPct: number;
+  overrideMinutes: number;
+}>;
+
 /** One watcher's config — see server/src/autonomy.ts. Only "test-suite" ships
  *  in this pass. */
 export interface WatcherConfig {
@@ -551,6 +663,24 @@ export interface WatcherConfig {
   cadenceMinutes: number;
   perWatcherDailyCap: number;
   commands?: string[];
+  /** Age gate for the watchers that have one (todo-scan, branch-triage). */
+  thresholdDays?: number;
+}
+
+/** What this server build can actually run — served from the live registry so
+ *  the editor never lists a watcher the backend doesn't have. */
+export interface WatcherDescriptor {
+  name: string;
+  description: string;
+  requiresExec: boolean;
+  usesThresholdDays: boolean;
+}
+
+/** Idle-time upkeep of the system itself (PLANNING/overhaul/08 §5). */
+export interface SelfMaintenanceConfig {
+  enabled: boolean;
+  reprobeModels: boolean;
+  backfillDigests: boolean;
 }
 
 export interface ActiveHours {
@@ -575,6 +705,38 @@ export interface AutonomyConfig {
   autoQueueDepth: number;
   budgets: AutonomyBudgets;
   watchers: WatcherConfig[];
+  selfMaintenance: SelfMaintenanceConfig;
+}
+
+export interface ReportTaskLine {
+  taskId: string;
+  name: string;
+  stage: string;
+  origin: string;
+  runs: number;
+  latestHealth: RunHealth;
+  latestVerdict: string | null;
+  evidence: string[];
+  evidenceAllGreen: boolean;
+  reason?: string;
+}
+
+/** The overnight rollup (PLANNING/overhaul/08 §4) — computed from what actually
+ *  happened, never generated, so it can't misreport the night it summarizes. */
+export interface MorningReport {
+  projectId: number;
+  projectName: string;
+  windowStart: string;
+  windowEnd: string;
+  completed: ReportTaskLine[];
+  parked: ReportTaskLine[];
+  inProgress: ReportTaskLine[];
+  unseenCount: number;
+  runCount: number;
+  tokensUsed: number;
+  healthCounts: Record<RunHealth, number>;
+  watcherActivity: { watcher: string; queued: number; rejected: number; capped: number; suppressed: number }[];
+  budget: AutonomyBudgetStatus;
 }
 
 /** Every field is independently patchable; the server merges over the
@@ -591,6 +753,103 @@ export type AutonomyLevel = "plan" | "edit" | "auto";
  *  in the UI to avoid colliding with the unrelated FLOW_TEMPLATES rigor tag
  *  and counter-reviewer gate rigor already surfaced elsewhere. */
 export type PlanningRigor = "minimal" | "standard" | "thorough";
+
+// ---------------------------------------------------------------------------
+// Intake review (PLANNING/intake-refinement.md)
+// ---------------------------------------------------------------------------
+
+export type EffortSize = "XS" | "S" | "M" | "L" | "XL";
+
+/** "scouting" — the flow-independent intake_triage+explorer prefix is running.
+ *  "skip_pending" — "Start as-is" arrived mid-prefix; it applies at the next
+ *   step boundary rather than under a running step.
+ *  "proposed" — a proposal is waiting on a human; the task is paused.
+ *  "accepted" — a human accepted it (possibly edited); the flow is seeded.
+ *  "skipped"  — the review was bypassed; the intake runs exactly as filed. */
+export type IntakeReviewState =
+  | "scouting"
+  | "skip_pending"
+  | "proposed"
+  | "accepted"
+  | "skipped";
+
+/** A role the planner added to / removed from the chosen network's own steps. */
+export interface PlanDelta {
+  role_key: string;
+  change: "added" | "removed";
+  why: string;
+}
+
+/** A question the planner answered on the human's behalf — same three fields as
+ *  a role's open_questions, so a correction routes through the existing
+ *  answer-match machinery. */
+export interface ProposalAssumption {
+  question: string;
+  assumed_answer: string;
+  confidence: "low" | "medium" | "high";
+}
+
+/** A role the planner thinks is missing. Advisory only — never auto-created. */
+export interface CustomNodeSuggestion {
+  role_key: string;
+  title: string;
+  persona_sketch: string;
+  why: string;
+}
+
+/** What the review proposes, and what the human edits before accepting. */
+export interface IntakeProposal {
+  restated_request: string;
+  intake_kind: string;
+  network_id: string | null;
+  network_name: string;
+  network_why: string;
+  role_plan: string[];
+  plan_deltas: PlanDelta[];
+  effort_size: EffortSize;
+  size_rationale: string;
+  planning_rigor: PlanningRigor;
+  autonomy_level: AutonomyLevel | null;
+  assumptions: ProposalAssumption[];
+  custom_node: CustomNodeSuggestion | null;
+  confidence: "low" | "medium" | "high";
+  /** "heuristic" = the planner call was off/failed and these are today's
+   *  default answers; the card says so rather than implying an informed read. */
+  source: "planner" | "heuristic";
+  /** Set when a scout role itself flagged the intake (e.g. too vague). */
+  scout_warning: string | null;
+}
+
+/** One network the review can route to, with its ordered role list. */
+export interface NetworkOption {
+  network_id: string;
+  name: string;
+  description: string;
+  intake_kind: string | null;
+  is_system: boolean;
+  roles: string[];
+}
+
+/** What one effort size would actually buy at the task's current rigor —
+ *  computed server-side from the same resolveFamilyBudget the decomposition
+ *  gate uses, so the card can't quote a budget the pipeline won't honour. */
+export interface EffortBudgetRow {
+  size: EffortSize;
+  maxCount: number;
+  maxDepth: number;
+}
+
+export interface IntakeProposalResponse {
+  state: IntakeReviewState | null;
+  proposal: IntakeProposal | null;
+  networks: NetworkOption[];
+  roles: { key: string; title: string }[];
+  intake_kinds: string[];
+  /** The built-in flow's ordered roles per intake kind — what the role list
+   *  resets to when the kind changes or no network is selected. */
+  flows: Record<string, string[]>;
+  budget_preview: EffortBudgetRow[];
+}
 
 export interface AutonomyBudgetStatus {
   exhausted: boolean;
@@ -642,6 +901,31 @@ export interface SafetyResponse {
       roles_with_exec?: string[];
     }>;
   };
+  /** Per-project spend ceilings (PLANNING/overhaul-2/01). Absent on servers
+   *  predating the feature. */
+  budget_policy?: {
+    global_default: BudgetPolicy;
+    projects_enforced: number;
+    usd_note: string;
+    projects: Array<{
+      id: number;
+      name: string;
+      enabled: boolean;
+      enforced: boolean;
+      period_days: number;
+      cap_tokens: number | null;
+      cap_usd: number | null;
+      warn_threshold_pct: number;
+      override_minutes: number;
+      spent_tokens: number;
+      spent_usd: number;
+      spent_usd_is_partial: boolean;
+      unpriced_tokens: number;
+      usage_pct: number | null;
+      over_cap: boolean;
+      breached: Array<"tokens" | "usd">;
+    }>;
+  };
   limits: {
     role_tool_budget: number;
     request_timeout_ms: number;
@@ -666,6 +950,18 @@ export interface SafetyResponse {
     db_path: string;
     api_key_in_db: boolean;
     api_key_in_env: boolean;
+    /** Whether this server encrypts the two secret columns at rest
+     *  (PLANNING/overhaul-2/02). Absent on servers predating the feature —
+     *  which is exactly the case where it isn't true. */
+    secrets_encrypted_at_rest?: boolean;
+  };
+  /** Stored-secret inventory and rotation metadata (PLANNING/overhaul-2/02).
+   *  Presence and age only — never a value. */
+  secrets?: {
+    projects: Array<{ id: number; name: string; has_github_token: boolean; last_updated_at: string }>;
+    key_source: string;
+    key_loss_note: string;
+    roles_with_secret_access: Array<{ project_id: number; role: string }>;
   };
   concerns: string[];
 }
@@ -817,6 +1113,12 @@ export const api = {
   safety: () => req<SafetyResponse>("/api/safety"),
   saveSafety: (body: SafetyPatch) =>
     req<{ ok: boolean; changes: string[] }>("/api/safety", { method: "PATCH", body: JSON.stringify(body) }),
+  /** Drop Orchestra's copy of a project's GitHub PAT (PLANNING/overhaul-2/02).
+   *  Does not revoke the token on GitHub — the response says so. */
+  clearGithubToken: (projectId: number) =>
+    req<{ ok: true; project_id: number; note: string }>(`/api/safety/secrets/github/${projectId}`, {
+      method: "DELETE",
+    }),
 
   scheduler: () => req<{ running: boolean; stopping: boolean }>("/api/scheduler"),
   startScheduler: () => req<{ running: boolean; stopping: boolean }>("/api/scheduler/start", { method: "POST" }),
@@ -833,16 +1135,35 @@ export const api = {
   ) => req<{ project: Project }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   roles: (projectId: number) => req<{ roles: Role[] }>(`/api/projects/${projectId}/roles`),
-  saveRole: (projectId: number, key: string, body: Partial<Role>) =>
+  saveRole: (projectId: number, key: string, body: Partial<Role> & { version_note?: string }) =>
     req<{ role: Role }>(`/api/projects/${projectId}/roles/${key}`, {
       method: "PUT",
       body: JSON.stringify(body),
+    }),
+
+  /** Version history + per-version outcome scores (PLANNING/overhaul-2/03). */
+  roleVersions: (projectId: number, key: string) =>
+    req<RoleVersionsResponse>(`/api/projects/${projectId}/roles/${key}/versions`),
+  /** Records a NEW version matching the old one — history is never rewritten. */
+  revertRoleVersion: (projectId: number, key: string, versionId: number) =>
+    req<{ role: Role }>(`/api/projects/${projectId}/roles/${key}/versions/${versionId}/revert`, {
+      method: "POST",
     }),
 
   harnessPolicy: (projectId: number) =>
     req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`),
   saveHarnessPolicy: (projectId: number, body: HarnessPolicyPatch) =>
     req<{ policy: HarnessPolicy }>(`/api/projects/${projectId}/harness-policy`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
+  /** Policy and live standing together — the config form and the status
+   *  readout are one panel (PLANNING/overhaul-2/01). */
+  budget: (projectId: number) =>
+    req<{ policy: BudgetPolicy; status: BudgetStatus }>(`/api/projects/${projectId}/budget`),
+  saveBudget: (projectId: number, body: BudgetPatch) =>
+    req<{ policy: BudgetPolicy; status: BudgetStatus }>(`/api/projects/${projectId}/budget`, {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
@@ -856,6 +1177,22 @@ export const api = {
     }),
   autonomyBudget: (projectId: number) =>
     req<AutonomyBudgetStatus>(`/api/projects/${projectId}/autonomy/budget`),
+
+  /** The watcher registry this server build actually has. */
+  watcherCatalog: () => req<{ catalog: WatcherDescriptor[] }>(`/api/watchers`),
+
+  morningReport: (projectId: number, sinceHours = 24) =>
+    req<{ report: MorningReport; markdown: string; sinceHours: number }>(
+      `/api/projects/${projectId}/morning-report?sinceHours=${sinceHours}`,
+    ),
+
+  /** Record that a human has laid eyes on these self-generated tasks.
+   *  First-write-wins server-side — re-marking never resets the timestamp. */
+  markTasksSeen: (taskIds: string[]) =>
+    req<{ ok: true; marked: number }>(`/api/tasks/seen`, {
+      method: "POST",
+      body: JSON.stringify({ taskIds }),
+    }),
 
   autonomyLevel: (projectId: number) =>
     req<{ level: AutonomyLevel }>(`/api/projects/${projectId}/autonomy-level`),
@@ -932,10 +1269,41 @@ export const api = {
   updateTask: (taskId: string, body: { name?: string; content?: string; intake_kind?: string }) =>
     req<TaskDetail>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(body) }),
 
-  intake: (projectId: number, body: { name: string; content: string; intake_kind?: string }) =>
-    req<{ accepted: boolean; path: string; task_id: string | null }>(`/api/projects/${projectId}/intake`, {
+  /** `review: true` holds the task for the pre-flight review layer instead of
+   *  starting its filed kind's flow (PLANNING/intake-refinement.md). Omitted =
+   *  the project's own default, "off" until an operator opts in. */
+  intake: (
+    projectId: number,
+    body: { name: string; content: string; intake_kind?: string; review?: boolean },
+  ) =>
+    req<{
+      accepted: boolean;
+      path: string;
+      task_id: string | null;
+      intake_review_state: IntakeReviewState | null;
+    }>(`/api/projects/${projectId}/intake`, {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+
+  // ---- Intake review (PLANNING/intake-refinement.md) ----
+  intakeProposal: (taskId: string) =>
+    req<IntakeProposalResponse>(`/api/tasks/${taskId}/intake-proposal`),
+  /** Accept with edits — omit `proposal` to accept exactly what was proposed. */
+  acceptIntakeProposal: (taskId: string, proposal?: IntakeProposal) =>
+    req<{ task: Task; proposal: IntakeProposal }>(`/api/tasks/${taskId}/intake-proposal/accept`, {
+      method: "POST",
+      body: JSON.stringify(proposal ? { proposal } : {}),
+    }),
+  /** "Start as-is" — bypass the review, run the intake exactly as filed. */
+  skipIntakeProposal: (taskId: string) =>
+    req<{ task: Task }>(`/api/tasks/${taskId}/intake-proposal/skip`, { method: "POST" }),
+  intakeReviewConfig: (projectId: number) =>
+    req<{ config: { default: "on" | "off" } }>(`/api/projects/${projectId}/intake-review`),
+  saveIntakeReviewConfig: (projectId: number, value: "on" | "off") =>
+    req<{ config: { default: "on" | "off" } }>(`/api/projects/${projectId}/intake-review`, {
+      method: "PATCH",
+      body: JSON.stringify({ default: value }),
     }),
 
   intervene: (taskId: string, kind: string, payload?: unknown) =>

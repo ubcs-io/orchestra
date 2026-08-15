@@ -19,6 +19,11 @@
  * Call Point 5 — Answer Match Assessment (a human's later answer to a role's
  *                 recorded best-effort guess — confirms it, or contradicts it
  *                 and should roll the task back to right after the guess)
+ * Call Point 6 — Candidate Triage (a watcher-produced candidate, before it may
+ *                 become a task)
+ * Call Point 7 — Intake Planning (a fresh intake plus its scout findings —
+ *                 which flow/network, which roles, and how big this really is,
+ *                 proposed for a human to correct before any of it is spent)
  */
 
 import { Type, type Static } from "@sinclair/typebox";
@@ -51,6 +56,11 @@ export interface RouterConfig {
   /** Call Point 6 (PLANNING/overhaul/08): triage a watcher-produced candidate
    *  into worth_doing/priority/suggested_kind before it may become a task. */
   candidateTriage: boolean;
+  /** Call Point 7 (PLANNING/intake-refinement.md): propose kind/network/role
+   *  plan/effort size for a reviewed intake. Off = the review still runs and
+   *  still gives a human the editable card, filled from the heuristic proposal
+   *  (today's routing) instead of an informed read. */
+  intakePlanning: boolean;
   /** Override model for router calls (falls back to project connection default). */
   model?: string;
   /** Token budget per router call. Default 1024. */
@@ -67,6 +77,7 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   secondReview: false,
   answerReincorporation: false,
   candidateTriage: false,
+  intakePlanning: false,
 };
 
 /** Resolve router config from a project's config_json or return defaults. */
@@ -151,6 +162,10 @@ async function tryConstrained<T extends import("@sinclair/typebox").TSchema>(
   systemPrompt: string,
   userPrompt: string,
   schema: T,
+  /** Raised only by call points whose output is genuinely longer than a
+   *  verdict-plus-reason (Call Point 7's proposal carries prose rationales),
+   *  so every existing call point keeps its original 1024 budget. */
+  maxTokens = 1024,
 ): Promise<Static<T> | null> {
   if (!connection || connection.structuredOutputs.mode === "off") return null;
   try {
@@ -162,7 +177,7 @@ async function tryConstrained<T extends import("@sinclair/typebox").TSchema>(
         { role: "user", content: userPrompt },
       ],
       schema,
-      1024,
+      maxTokens,
     );
   } catch (err) {
     console.warn(`[router] constrained call failed, falling back: ${(err as Error).message}`);
@@ -1008,6 +1023,238 @@ async function defaultTriageCandidate(
 }
 
 // ---------------------------------------------------------------------------
+// Call Point 7: Intake Planning (PLANNING/intake-refinement.md)
+// ---------------------------------------------------------------------------
+
+export interface IntakePlanInput {
+  projectName: string;
+  taskName: string;
+  /** The raw intake, capped by the caller. */
+  intakeContent: string;
+  /** What intake already inferred / the human picked — the status quo answer. */
+  currentIntakeKind: string;
+  /** intake_triage's report from the scout prefix. */
+  triageSummary: string;
+  /** explorer's report — the file list and affected surface. */
+  explorerSummary: string;
+  /** explorer's own size estimate, if it recorded one. The planner is asked to
+   *  confirm or correct it, and is told this is the number a human is about to
+   *  be asked to steer. */
+  explorerEffortSize: string | null;
+  /** Every network this project could route to, with its ordered role list. */
+  networks: Array<{
+    network_id: string;
+    name: string;
+    description: string;
+    intake_kind: string | null;
+    roles: string[];
+  }>;
+  /** Role keys that actually exist, so a proposed plan can't name a fiction. */
+  availableRoles: string[];
+  /** What each effort size would buy, rendered from the real budget table so
+   *  the planner sizes against consequences rather than adjectives. */
+  budgetPreview: string;
+}
+
+export interface IntakePlanResult {
+  restated_request: string;
+  intake_kind: string;
+  network_id: string | null;
+  network_why: string;
+  role_plan: string[];
+  plan_deltas: Array<{ role_key: string; change: "added" | "removed"; why: string }>;
+  effort_size: string;
+  size_rationale: string;
+  planning_rigor: string;
+  assumptions: Array<{ question: string; assumed_answer: string; confidence: string }>;
+  custom_node: { role_key: string; title: string; persona_sketch: string; why: string } | null;
+  confidence: string;
+}
+
+/** JSON-schema payload for the constrained-decoding rung — mirrors IntakePlanResult. */
+const IntakePlanResultSchema = Type.Object({
+  restated_request: Type.String(),
+  intake_kind: Type.String(),
+  network_id: Type.Union([Type.String(), Type.Null()]),
+  network_why: Type.String(),
+  role_plan: Type.Array(Type.String()),
+  plan_deltas: Type.Array(
+    Type.Object({
+      role_key: Type.String(),
+      change: Type.Union([Type.Literal("added"), Type.Literal("removed")]),
+      why: Type.String(),
+    }),
+  ),
+  effort_size: Type.Union([
+    Type.Literal("XS"),
+    Type.Literal("S"),
+    Type.Literal("M"),
+    Type.Literal("L"),
+    Type.Literal("XL"),
+  ]),
+  size_rationale: Type.String(),
+  planning_rigor: Type.Union([
+    Type.Literal("minimal"),
+    Type.Literal("standard"),
+    Type.Literal("thorough"),
+  ]),
+  assumptions: Type.Array(
+    Type.Object({
+      question: Type.String(),
+      assumed_answer: Type.String(),
+      confidence: Type.Union([
+        Type.Literal("low"),
+        Type.Literal("medium"),
+        Type.Literal("high"),
+      ]),
+    }),
+  ),
+  custom_node: Type.Union([
+    Type.Object({
+      role_key: Type.String(),
+      title: Type.String(),
+      persona_sketch: Type.String(),
+      why: Type.String(),
+    }),
+    Type.Null(),
+  ]),
+  confidence: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
+});
+
+const INTAKE_PLAN_SYSTEM_PROMPT = `You are the intake planner for an automated code refinement pipeline. A human
+has just filed a request, and two scout roles have already looked at the real repository: intake_triage
+(what is being asked) and explorer (which files this actually touches). Your job is to propose how the
+request should be routed — which flow, which roles, and how big the work really is.
+
+Everything you propose is shown to the human for correction before anything runs. Propose the honest
+answer, not the safe one: a human correcting an over-estimate is the cheap outcome, but only if you gave
+them a real number to correct.
+
+Guidelines:
+- **intake_kind** selects the flow's criteria and counter-reviewer. Pick the one that matches the work,
+  even when it differs from what the human picked — they chose before anyone read the code.
+- **network_id** must be one of the offered networks, or null to use the built-in flow for the intake
+  kind. Prefer a network whose intake_kind matches; only pick a differently-scoped one when its role list
+  is clearly a better fit for this specific request, and say why.
+- **role_plan** is the ordered list of roles to actually run. Start from the chosen network's role list.
+  Only add or remove a role when this specific request needs it — every entry in plan_deltas must name a
+  concrete reason grounded in what explorer found. Do not remove the flow's reviewer or its terminal role.
+  Every role_plan entry must be a role that exists in the available roles list.
+- **effort_size** is the single most consequential number here: it sets how much further planning and how
+  many subtasks this work may spawn. Size the work you can see in explorer's file list, not the work the
+  request's wording implies. A copy/string change touching three files is XS or S no matter how important
+  it sounds; a rename whose call sites explorer found across many modules is not S just because each edit
+  is small. Do not hedge upward "to be safe" — that is exactly the failure this review exists to catch.
+- **planning_rigor** scales the process applied per unit of size — "minimal" for work whose shape is
+  obvious, "thorough" when the change is small but the blast radius is dangerous. Most work is "standard".
+- **assumptions**: every question you had to answer yourself to produce this proposal, with the answer you
+  assumed and your confidence. This is where a human catches a wrong premise cheaply — do not leave it
+  empty just because the proposal came out clean.
+- **custom_node**: null in almost every case. Only when no existing role covers a concern this request
+  genuinely needs. It is advisory — a human decides whether such a role is ever created.
+
+Respond ONLY with valid JSON matching this schema — no markdown, no explanation outside the JSON:
+{
+  "restated_request": "one paragraph: what is actually being asked",
+  "intake_kind": "manual | error_file | feature | bug | security | chore | spike | research | ux | question",
+  "network_id": "id from the offered list, or null",
+  "network_why": "why this network/flow fits",
+  "role_plan": ["role_key", "..."],
+  "plan_deltas": [{ "role_key": "...", "change": "added" | "removed", "why": "..." }],
+  "effort_size": "XS | S | M | L | XL",
+  "size_rationale": "the concrete files/surfaces that drove it",
+  "planning_rigor": "minimal | standard | thorough",
+  "assumptions": [{ "question": "...", "assumed_answer": "...", "confidence": "low" | "medium" | "high" }],
+  "custom_node": null,
+  "confidence": "low" | "medium" | "high"
+}`;
+
+function buildIntakePlanPrompt(input: IntakePlanInput): string {
+  const networks = input.networks.length
+    ? input.networks
+        .map(
+          (n) =>
+            `- ${n.network_id} — "${n.name}"${n.intake_kind ? ` (intake kind: ${n.intake_kind})` : ""}\n` +
+            `  ${n.description || "(no description)"}\n` +
+            `  roles: ${n.roles.join(" → ") || "(none)"}`,
+        )
+        .join("\n")
+    : "(none registered — the built-in flow for the intake kind applies)";
+
+  return `Project: ${input.projectName}
+Task: ${input.taskName}
+Intake kind as filed: ${input.currentIntakeKind}
+Explorer's own effort size: ${input.explorerEffortSize ?? "(not recorded)"}
+
+## The raw intake
+${input.intakeContent}
+
+## intake_triage's report
+${input.triageSummary || "(no report recorded)"}
+
+## explorer's report
+${input.explorerSummary || "(no report recorded)"}
+
+## Networks available in this project
+${networks}
+
+## Roles available
+${input.availableRoles.join(", ")}
+
+## What each effort size buys
+${input.budgetPreview}
+
+Propose how this intake should be routed.`;
+}
+
+async function defaultPlanIntake(
+  input: IntakePlanInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+  connection?: Connection,
+): Promise<IntakePlanResult | null> {
+  const constrained = await tryConstrained(
+    connection,
+    modelId,
+    INTAKE_PLAN_SYSTEM_PROMPT,
+    buildIntakePlanPrompt(input),
+    IntakePlanResultSchema,
+    2048,
+  );
+  if (constrained) return constrained;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    const json = await routerCall<IntakePlanResult>(
+      roleRunner,
+      repoPath,
+      planningDir,
+      modelId,
+      INTAKE_PLAN_SYSTEM_PROMPT,
+      buildIntakePlanPrompt(input),
+      controller.signal,
+    );
+
+    clearTimeout(timeout);
+
+    if (typeof json.intake_kind !== "string") throw new Error("missing intake_kind");
+    if (!Array.isArray(json.role_plan) || json.role_plan.length === 0) {
+      throw new Error("missing role_plan");
+    }
+    return json;
+  } catch (err) {
+    console.warn(`[router] intake planning failed: ${(err as Error).message}`);
+    // Null, not a fabricated proposal: the caller's fallback is the *heuristic*
+    // proposal (today's routing, honestly labelled as such in the card), which
+    // is strictly better than this call point inventing defaults of its own.
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Injector seam (same pattern as orchestrator's setRoleRunner)
 // ---------------------------------------------------------------------------
 
@@ -1065,12 +1312,24 @@ type CandidateTriageParams = [
   connection?: Connection,
 ];
 
+type IntakePlanParams = [
+  input: IntakePlanInput,
+  roleRunner: RoleRunner,
+  repoPath: string,
+  planningDir: string,
+  modelId: string,
+  connection?: Connection,
+];
+
 export type DistillFn = (...args: DistillParams) => Promise<DistillationResult>;
 export type EscalationFn = (...args: EscalationParams) => Promise<EscalationAssessmentResult>;
 export type BorderlineFn = (...args: BorderlineParams) => Promise<BorderlineAssessmentResult>;
 export type SecondReviewFn = (...args: SecondReviewParams) => Promise<SecondReviewResult>;
 export type AnswerMatchFn = (...args: AnswerMatchParams) => Promise<AnswerMatchResult>;
 export type TriageFn = (...args: CandidateTriageParams) => Promise<CandidateTriageDecision>;
+/** Null = "no informed proposal available"; the caller falls back to the
+ *  heuristic proposal rather than this call point inventing one. */
+export type IntakePlanFn = (...args: IntakePlanParams) => Promise<IntakePlanResult | null>;
 
 let _distill: DistillFn = defaultDistill;
 let _assessEscalation: EscalationFn = defaultAssessEscalation;
@@ -1078,6 +1337,7 @@ let _assessBorderline: BorderlineFn = defaultAssessBorderline;
 let _assessSecondReview: SecondReviewFn = defaultAssessSecondReview;
 let _assessAnswerMatch: AnswerMatchFn = defaultAssessAnswerMatch;
 let _triageCandidate: TriageFn = defaultTriageCandidate;
+let _planIntake: IntakePlanFn = defaultPlanIntake;
 
 export function setDistillFn(fn: DistillFn): void { _distill = fn; }
 export function setEscalationFn(fn: EscalationFn): void { _assessEscalation = fn; }
@@ -1085,6 +1345,7 @@ export function setBorderlineFn(fn: BorderlineFn): void { _assessBorderline = fn
 export function setSecondReviewFn(fn: SecondReviewFn): void { _assessSecondReview = fn; }
 export function setAnswerMatchFn(fn: AnswerMatchFn): void { _assessAnswerMatch = fn; }
 export function setTriageFn(fn: TriageFn): void { _triageCandidate = fn; }
+export function setIntakePlanFn(fn: IntakePlanFn): void { _planIntake = fn; }
 
 export function resetRouterFns(): void {
   _distill = defaultDistill;
@@ -1093,6 +1354,7 @@ export function resetRouterFns(): void {
   _assessSecondReview = defaultAssessSecondReview;
   _assessAnswerMatch = defaultAssessAnswerMatch;
   _triageCandidate = defaultTriageCandidate;
+  _planIntake = defaultPlanIntake;
 }
 
 /** Public entry points that tests can override via the seam. */
@@ -1102,3 +1364,4 @@ export const assessBorderline: BorderlineFn = (...args) => _assessBorderline(...
 export const assessSecondReview: SecondReviewFn = (...args) => _assessSecondReview(...args);
 export const assessAnswerMatch: AnswerMatchFn = (...args) => _assessAnswerMatch(...args);
 export const triageCandidate: TriageFn = (...args) => _triageCandidate(...args);
+export const planIntake: IntakePlanFn = (...args) => _planIntake(...args);

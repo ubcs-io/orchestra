@@ -35,7 +35,10 @@ export type StageDir = (typeof STAGE_DIRS)[number];
 function git(repoPath: string, args: string[]): string {
   const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
   const cmd = `cd ${q(repoPath)} && git ${args.map(q).join(" ")}`;
-  return execSync(cmd, { encoding: "utf8" }).trim();
+  // 32MB ceiling rather than execSync's 1MB default: a porcelain blame of a
+  // large source file or a wide diff legitimately exceeds 1MB, and hitting the
+  // default surfaces as an opaque ENOBUFS rather than as git's own error.
+  return execSync(cmd, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim();
 }
 
 export interface GitRepoResult {
@@ -252,6 +255,131 @@ export function resolveRef(repoPath: string, ref: string): string {
   return git(repoPath, ["rev-parse", ref]);
 }
 
+// ---------------------------------------------------------------------------
+// Read-only repository inspection (PLANNING/overhaul/08 watchers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every file git tracks in `repoPath`, as repo-relative POSIX paths.
+ *
+ * Deliberately `git ls-files` rather than a manual directory walk: it inherits
+ * the repo's own `.gitignore` for free, so `node_modules`, build output and
+ * Orchestra's own `.orchestra-worktrees` are excluded by construction rather
+ * than by a skip-list that drifts per stack. Returns `[]` on any git failure —
+ * a watcher that can't enumerate files reports nothing, it doesn't crash a scan.
+ */
+export function listTrackedFiles(repoPath: string): string[] {
+  try {
+    const out = git(repoPath, ["ls-files"]);
+    return out ? out.split("\n").filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Author timestamps (epoch seconds) per final line number of `relPath`, from
+ * `git blame --porcelain`. Line numbers are 1-indexed, matching blame's own
+ * output and an editor's gutter.
+ *
+ * Porcelain emits the full commit header only the *first* time a commit is
+ * seen; later lines from the same commit carry just the sha line — hence the
+ * sha→time side table. Returns an empty map on any failure (unblameable file,
+ * binary, deleted), which callers read as "unknown age".
+ */
+export function blameLineTimestamps(repoPath: string, relPath: string): Map<number, number> {
+  const times = new Map<number, number>();
+  let out: string;
+  try {
+    out = git(repoPath, ["blame", "--porcelain", "--", relPath]);
+  } catch {
+    return times;
+  }
+  const commitTimes = new Map<string, number>();
+  let currentSha = "";
+  let currentLine = 0;
+  for (const line of out.split("\n")) {
+    const header = /^([0-9a-f]{40})\s+\d+\s+(\d+)(?:\s+\d+)?$/.exec(line);
+    if (header) {
+      currentSha = header[1]!;
+      currentLine = Number(header[2]);
+      const known = commitTimes.get(currentSha);
+      if (known !== undefined) times.set(currentLine, known);
+      continue;
+    }
+    if (line.startsWith("author-time ")) {
+      const t = Number(line.slice("author-time ".length).trim());
+      if (Number.isFinite(t) && currentLine > 0) {
+        commitTimes.set(currentSha, t);
+        times.set(currentLine, t);
+      }
+    }
+  }
+  return times;
+}
+
+export interface LocalBranchInfo {
+  name: string;
+  tipSha: string;
+  /** ISO-8601 committer date of the branch tip. */
+  lastCommitAt: string;
+  subject: string;
+  /** Commits on this branch that `baseBranch` doesn't have. */
+  ahead: number;
+  /** Commits on `baseBranch` that this branch doesn't have. */
+  behind: number;
+}
+
+/**
+ * Local branches with their divergence from `baseBranch` — the raw material for
+ * the `branch-triage` watcher. Purely read-only: nothing is checked out, moved
+ * or deleted, matching the doc's "branch-triage *asks*, never deletes".
+ *
+ * `baseBranch` itself is excluded (it can't be triaged against itself), as are
+ * Orchestra's own `orchestra/*` bookkeeping branches — the per-task branches and
+ * the `_scan` branch are machinery, not work a human abandoned.
+ */
+export function listLocalBranches(repoPath: string, baseBranch: string): LocalBranchInfo[] {
+  let out: string;
+  try {
+    out = git(repoPath, [
+      "for-each-ref",
+      "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)%09%(subject)",
+      "refs/heads",
+    ]);
+  } catch {
+    return [];
+  }
+  const branches: LocalBranchInfo[] = [];
+  for (const line of out.split("\n").filter(Boolean)) {
+    const [name, tipSha, lastCommitAt, ...rest] = line.split("\t");
+    if (!name || !tipSha || name === baseBranch) continue;
+    if (name.startsWith(ORCHESTRA_BRANCH_PREFIX)) continue;
+    let ahead = 0;
+    let behind = 0;
+    try {
+      // `--left-right --count base...branch` prints "<behind>\t<ahead>":
+      // left-side-only commits (on base, missing here) then right-side-only.
+      const counts = git(repoPath, ["rev-list", "--left-right", "--count", `${baseBranch}...${name}`]);
+      const [b, a] = counts.split(/\s+/).map(Number);
+      behind = Number.isFinite(b) ? b! : 0;
+      ahead = Number.isFinite(a) ? a! : 0;
+    } catch {
+      // Unrelated histories or a missing base ref — report the branch with
+      // zero divergence rather than dropping it entirely.
+    }
+    branches.push({
+      name,
+      tipSha,
+      lastCommitAt: lastCommitAt ?? "",
+      subject: rest.join("\t"),
+      ahead,
+      behind,
+    });
+  }
+  return branches;
+}
+
 function branchExists(repoPath: string, branch: string): boolean {
   try {
     git(repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
@@ -311,6 +439,34 @@ export function worktreePath(repoPath: string, taskId: string): string {
   return path.join(repoPath, WORKTREES_DIR, taskId);
 }
 
+/** The container holding every per-task worktree for a project. */
+export function worktreesRoot(repoPath: string): string {
+  return path.join(repoPath, WORKTREES_DIR);
+}
+
+/**
+ * Make the worktrees container self-ignoring: a `.gitignore` of `*` placed
+ * *inside* `.orchestra-worktrees/` hides the whole directory AND the ignore
+ * file itself, so Orchestra never dirties the user's `git status` and never has
+ * to touch (or ask them to commit) their own root `.gitignore`. That "minimal
+ * footprint in someone else's repo" property is the whole point — a root
+ * `.gitignore` edit would show up as a real working-tree change on a repo
+ * Orchestra doesn't own.
+ *
+ * Best-effort like `commitArtifacts`, not strict like `ensureWorktree`: a
+ * missing ignore file is cosmetic, and must never block a task from running.
+ */
+export function ensureWorktreesIgnored(root: string): void {
+  const ignoreFile = path.join(root, ".gitignore");
+  try {
+    if (fs.existsSync(ignoreFile)) return;
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(ignoreFile, "*\n");
+  } catch (err) {
+    console.warn(`[git] could not write "${ignoreFile}": ${(err as Error).message}`);
+  }
+}
+
 /**
  * Whether `worktreeDir` is already a live worktree. Checked by asking git
  * from *inside* that directory rather than string-matching it against
@@ -343,6 +499,7 @@ function worktreeRegistered(worktreeDir: string): boolean {
 export function ensureWorktree(repoPath: string, worktreeDir: string, branch: string, baseBranch: string): void {
   if (worktreeRegistered(worktreeDir)) return;
   fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
+  ensureWorktreesIgnored(path.dirname(worktreeDir));
   if (branchExists(repoPath, branch)) {
     git(repoPath, ["worktree", "add", worktreeDir, branch]);
   } else {
@@ -367,6 +524,51 @@ export function removeWorktree(repoPath: string, worktreeDir: string): void {
     } catch (err2) {
       console.warn(`[git] worktree cleanup failed for "${worktreeDir}": ${(err2 as Error).message}`);
     }
+  }
+}
+
+/** The `orchestra/*` branch prefix. Every branch Orchestra creates lives under
+ *  it (see `taskBranchName`), which is what lets `listOrchestraBranches` and
+ *  `listLocalBranches` tell machinery apart from the user's own branches. */
+export const ORCHESTRA_BRANCH_PREFIX = "orchestra/";
+
+/** Reserved worktree directory / branch suffix for the watcher scan checkout
+ *  (see watcher-scans.ts). It belongs to the project as a whole rather than to
+ *  any task, so it looks exactly like an orphan to the sweep — which must
+ *  therefore skip it by name. Declared here, next to `WORKTREES_DIR`, so the
+ *  sweep and the watchers agree without importing each other. */
+export const SCAN_WORKSPACE_NAME = "_scan";
+
+/**
+ * Delete a task branch. Always `-d`, never `-D`: git refuses to delete a branch
+ * holding commits unmerged into its upstream/HEAD, and that refusal IS the
+ * safety property we want — Orchestra reclaims its own bookkeeping but never
+ * destroys work a human hasn't landed. Returns false when git refused (or the
+ * branch was already gone) so callers can surface the leftover rather than
+ * silently assuming it went.
+ *
+ * Deleting a branch that's still checked out anywhere fails, so callers must
+ * remove the worktree holding it first.
+ */
+export function deleteBranch(repoPath: string, branch: string): boolean {
+  try {
+    git(repoPath, ["branch", "-d", branch]);
+    return true;
+  } catch {
+    // Unmerged, still checked out, or already deleted — all "leave it alone".
+    return false;
+  }
+}
+
+/** Every `orchestra/*` branch in the repo. Used by the orphan sweep to find
+ *  bookkeeping branches whose owning task row is gone. */
+export function listOrchestraBranches(repoPath: string): string[] {
+  try {
+    return git(repoPath, ["for-each-ref", "--format=%(refname:short)", `refs/heads/${ORCHESTRA_BRANCH_PREFIX}`])
+      .split("\n")
+      .filter(Boolean);
+  } catch {
+    return [];
   }
 }
 

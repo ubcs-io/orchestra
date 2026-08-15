@@ -3,23 +3,26 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CoverageItem, CriteriaResult, RoleRunResult, Subtask, Verdict } from "../src/agent";
-import { closeDb, createCandidate, createIntervention, createProject, createRoleRun, createTask, getCandidate, getProject, getTask, getTaskHealthSummaries, listCandidates, listInterventions, listRoleRuns, listTasks, resetTask, updateCandidate, updateProject, updateTask, upsertConfig, type TaskRow } from "../src/db";
+import { closeDb, createCandidate, createIntervention, createProject, createRoleRun, createTask, deleteTask, familyRootId, getCandidate, getProject, getTask, getRole, getTaskHealthSummaries, listCandidates, listInterventions, listRoleRuns, listTasks, resetTask, updateCandidate, updateProject, updateTask, upsertConfig, upsertRole, type TaskRow } from "../src/db";
 import type { RoleRunRow } from "../src/db";
 import { resetConfig } from "../src/config";
-import { appendArtifactSection, checkoutBranch, commitArtifacts, scaffoldPlanning, writeArtifact } from "../src/git";
+import { appendArtifactSection, checkoutBranch, commitArtifacts, currentBranch, ensureWorktree, listOrchestraBranches, reconcileBranch, scaffoldPlanning, worktreePath, writeArtifact } from "../src/git";
 import { flowForIntake, ROUTING_TEMPLATES, type Criterion } from "../src/roles";
 import { seedGlobalRoles } from "../src/roles";
 import {
   applyFamilyBudget,
   applyPlanMutation,
   checkEvidenceCriteria,
+  deleteTaskAndWorktree,
   dependenciesSatisfied,
   EFFORT_BUDGET,
+  ensureTaskWorkspace,
   inferIntakeKind,
   mergeCoverageItems,
   nextPending,
   parseDecompositionTree,
   planFromTemplate,
+  reapSettledWorkspaces,
   reincorporateAnswer,
   renderSubtaskTree,
   resetReachabilityChecker,
@@ -31,12 +34,15 @@ import {
   restoreCheckpoint,
   setReachabilityChecker,
   setRoleRunner,
+  sweepOrphanWorkspaces,
+  taskRepoPath,
   tick,
   tickOnce,
 } from "../src/orchestrator";
 import type { RoleRunner } from "../src/orchestrator";
 import { resetRouterFns, setAnswerMatchFn, setSecondReviewFn, setTriageFn } from "../src/router";
 import { resetHumanActivityClock } from "../src/autonomy";
+import { grantBudgetOverride, resolveBudgetPolicy } from "../src/budget-policy";
 import { tickWatchers } from "../src/watchers";
 import { freshDb, tempGitRepo } from "./helpers";
 
@@ -2205,6 +2211,115 @@ describe("priority-aware scheduling (PLANNING/overhaul/08 §3)", () => {
   });
 });
 
+describe("role version stamping (PLANNING/overhaul-2/03)", () => {
+  it("stamps a dispatched run with the role version that produced it, and follows an edit", async () => {
+    const { projectId } = setupProject();
+    const task = createProjectTask(projectId, { origin: "human" });
+    setRoleRunner(fakeRunner("pass"));
+
+    await tickOnce(1);
+    const firstRun = listRoleRuns(task.task_id)[0]!;
+    const roleBefore = getRole(projectId, firstRun.role_key)!;
+    expect(firstRun.role_version_id).toBe(roleBefore.current_version_id);
+    expect(firstRun.role_version_id).not.toBeNull();
+
+    // Edit that role's prompt: subsequent runs must score against the NEW
+    // version, and the already-recorded run must keep pointing at the old one.
+    upsertRole({
+      project_id: projectId,
+      key: firstRun.role_key,
+      system_prompt: `${roleBefore.system_prompt}\n\nAlso do the new thing.`,
+    });
+    const roleAfter = getRole(projectId, firstRun.role_key)!;
+    expect(roleAfter.current_version_id).not.toBe(roleBefore.current_version_id);
+
+    await tickOnce(1);
+    const runs = listRoleRuns(task.task_id);
+    const laterRun = runs.find((r) => r.id !== firstRun.id && r.run_kind === "primary");
+    expect(listRoleRuns(task.task_id)[0]!.role_version_id).toBe(roleBefore.current_version_id);
+    if (laterRun) expect(laterRun.role_version_id).not.toBeNull();
+  });
+});
+
+describe("budget guardrails (PLANNING/overhaul-2/01)", () => {
+  /** Give the project a spend history the cap can bite on. */
+  function spend(projectId: number, tokens: number): void {
+    const donor = createProjectTask(projectId, { stage: "ready" });
+    createRoleRun({ task_id: donor.task_id, role_key: "explorer", model: "local", tokens });
+  }
+
+  it("does not gate dispatch while the budget is off, however much has been spent", async () => {
+    const { projectId } = setupProject();
+    spend(projectId, 5_000_000);
+    const task = createProjectTask(projectId, { origin: "human" });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(task.task_id)!.stage).toBe("refining");
+    expect(getTask(task.task_id)!.budget_paused_at).toBeNull();
+  });
+
+  it("skips dispatch and flags the task once the token cap is crossed", async () => {
+    const { projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ budget: { enabled: true, capTokens: 1_000 } }),
+    });
+    spend(projectId, 2_000);
+    const task = createProjectTask(projectId, { origin: "human" });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+
+    const after = getTask(task.task_id)!;
+    expect(after.stage).toBe("intake"); // never dispatched
+    expect(after.budget_paused_at).toBeTruthy();
+    // The budget stop must stay tellable apart from a human pause.
+    expect(after.paused ?? 0).toBe(0);
+    expect(listRoleRuns(task.task_id).length).toBe(0);
+  });
+
+  it("resumes only via the explicit resume_over_budget override", async () => {
+    const { projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ budget: { enabled: true, capTokens: 1_000 } }),
+    });
+    spend(projectId, 2_000);
+    const task = createProjectTask(projectId, { origin: "human" });
+    setRoleRunner(fakeRunner("pass"));
+
+    await tickOnce(1);
+    expect(getTask(task.task_id)!.stage).toBe("intake");
+
+    // A plain resume is not enough — it addresses the human pause flag, which
+    // was never what stopped this.
+    createIntervention({ task_id: task.task_id, kind: "resume", created_by: "user" });
+    await tickOnce(1);
+    expect(getTask(task.task_id)!.stage).toBe("intake");
+
+    grantBudgetOverride(task.task_id, resolveBudgetPolicy(getProject(projectId)!.config_json));
+    await tickOnce(1);
+    expect(getTask(task.task_id)!.stage).toBe("refining");
+  });
+
+  it("releases a budget-stopped task on its own once the cap is raised", async () => {
+    const { projectId } = setupProject();
+    updateProject(projectId, {
+      config_json: JSON.stringify({ budget: { enabled: true, capTokens: 1_000 } }),
+    });
+    spend(projectId, 2_000);
+    const task = createProjectTask(projectId, { origin: "human" });
+    setRoleRunner(fakeRunner("pass"));
+    await tickOnce(1);
+    expect(getTask(task.task_id)!.budget_paused_at).toBeTruthy();
+
+    updateProject(projectId, {
+      config_json: JSON.stringify({ budget: { enabled: true, capTokens: 1_000_000 } }),
+    });
+    await tickOnce(1);
+    const after = getTask(task.task_id)!;
+    expect(after.budget_paused_at).toBeNull();
+    expect(after.stage).toBe("refining");
+  });
+});
+
 describe("materializeIntakeTask (PLANNING/overhaul/08 §2)", () => {
   it("defaults to origin human / priority 3 — the same behavior ingestProject's own call site relies on", () => {
     const { projectId } = setupProject();
@@ -3529,5 +3644,237 @@ describe("grounded verification (overhaul/05)", () => {
     expect(contexts[1]).toContain("Verification evidence");
     expect(contexts[1]).toContain("npm test");
     expect(contexts[1]).toContain("Automatically verified");
+  });
+});
+
+// ---- Workspace reaping --------------------------------------------------
+
+/** A root task plus `childCount` children, all sharing one real worktree and
+ *  branch via ensureTaskWorkspace's family logic. */
+function familyOnDisk(projectId: number, childCount = 2): { root: TaskRow; children: TaskRow[] } {
+  const project = getProject(projectId)!;
+  let root = createTask({ name: "root", project_id: projectId, stage: "refining" });
+  root = ensureTaskWorkspace(root, project);
+  const children = Array.from({ length: childCount }, (_, i) => {
+    const c = createTask({
+      name: `child-${i}`,
+      project_id: projectId,
+      parent_task_id: root.task_id,
+      task_type: "child",
+      stage: "refining",
+    });
+    return ensureTaskWorkspace(c, project);
+  });
+  return { root: getTask(root.task_id)!, children };
+}
+
+/** Porcelain working-tree status — "" means git sees nothing out of place. */
+function status(repo: string): string {
+  return execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).trim();
+}
+
+/** Put a real commit on the family branch so "merged" vs "unmerged" is a
+ *  meaningful distinction for `deleteBranch`'s `-d`. */
+function commitOnFamilyBranch(root: TaskRow, name: string): void {
+  writeArtifact(path.join(root.git_worktree_path!, name), "work\n");
+  commitArtifacts(root.git_worktree_path!, [name], `work: ${name}`);
+}
+
+describe("workspace reaping", () => {
+  it("reclaims a settled family's worktree and merged branch, clearing the path on every member", async () => {
+    const { repo, projectId } = setupProject();
+    const { root, children } = familyOnDisk(projectId);
+    const dir = root.git_worktree_path!;
+    const branch = root.git_branch!;
+    commitOnFamilyBranch(root, "landed.md");
+    expect(reconcileBranch(dir, branch, root.git_base_branch!).status).toBe("merged");
+
+    for (const t of [root, ...children]) updateTask(t.task_id, { stage: "ready" });
+    updateTask(root.task_id, { reconcile_status: "merged" });
+
+    await reapSettledWorkspaces(children.map((c) => c.task_id));
+
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(listOrchestraBranches(repo)).not.toContain(branch);
+    // Every member, not just the root — the diff/push routes resolve through
+    // taskRepoPath, so a stale path on a child would send git at nothing.
+    for (const t of [root, ...children]) {
+      expect(getTask(t.task_id)!.git_worktree_path).toBeNull();
+      // git_branch survives as the historical record.
+      expect(getTask(t.task_id)!.git_branch).toBe(branch);
+    }
+  });
+
+  it("refuses to reap while a member is still at stage review awaiting merge approval", async () => {
+    const { projectId } = setupProject();
+    const { root, children } = familyOnDisk(projectId);
+    const dir = root.git_worktree_path!;
+    commitOnFamilyBranch(root, "landed.md");
+    reconcileBranch(dir, root.git_branch!, root.git_base_branch!);
+
+    updateTask(root.task_id, { stage: "ready", reconcile_status: "merged" });
+    updateTask(children[0]!.task_id, { stage: "ready" });
+    // The human still has this one's diff open — the branch IS what they're
+    // reviewing, so reaping here would delete the thing under review.
+    updateTask(children[1]!.task_id, { stage: "review", exit_state: "needs_merge_approval" });
+
+    await reapSettledWorkspaces([root.task_id]);
+
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(getTask(root.task_id)!.git_worktree_path).toBe(dir);
+  });
+
+  it("reaps an all-wont_do family's worktree but keeps its unmerged branch", async () => {
+    const { repo, projectId } = setupProject();
+    const { root, children } = familyOnDisk(projectId);
+    const dir = root.git_worktree_path!;
+    const branch = root.git_branch!;
+    commitOnFamilyBranch(root, "abandoned.md"); // never merged into base
+
+    for (const t of [root, ...children]) updateTask(t.task_id, { exit_state: "wont_do", paused: 1 });
+
+    await reapSettledWorkspaces([root.task_id, ...children.map((c) => c.task_id)]);
+
+    expect(fs.existsSync(dir)).toBe(false);
+    // `-d` refused it, so the unlanded commit survives for a human to judge.
+    expect(listOrchestraBranches(repo)).toContain(branch);
+  });
+});
+
+describe("sweepOrphanWorkspaces", () => {
+  it("deletes merged orphans, keeps unmerged ones, and never touches a live family", () => {
+    const { repo, projectId } = setupProject();
+    const project = getProject(projectId)!;
+    const base = project.main_branch ?? currentBranch(repo);
+
+    // Live family — must survive untouched.
+    const { root } = familyOnDisk(projectId, 1);
+    const liveDir = root.git_worktree_path!;
+
+    // Orphan 1: merged into base, no task row.
+    const mergedDir = worktreePath(repo, "orphan-merged");
+    ensureWorktree(repo, mergedDir, "orchestra/orphan-merged", base);
+    writeArtifact(path.join(mergedDir, "m.md"), "m");
+    commitArtifacts(mergedDir, ["m.md"], "orphan merged work");
+    reconcileBranch(mergedDir, "orchestra/orphan-merged", base);
+
+    // Orphan 2: holds a commit that never landed.
+    const openDir = worktreePath(repo, "orphan-open");
+    ensureWorktree(repo, openDir, "orchestra/orphan-open", base);
+    writeArtifact(path.join(openDir, "o.md"), "o");
+    commitArtifacts(openDir, ["o.md"], "orphan unlanded work");
+
+    const swept = sweepOrphanWorkspaces(project);
+
+    expect(swept.branchesDeleted).toEqual(["orchestra/orphan-merged"]);
+    expect(swept.branchesKept).toEqual(["orchestra/orphan-open"]);
+    expect(swept.worktreesRemoved.sort()).toEqual([mergedDir, openDir].sort());
+    expect(fs.existsSync(mergedDir)).toBe(false);
+    expect(fs.existsSync(openDir)).toBe(false);
+
+    // The live family is untouched in both DB and working tree.
+    expect(fs.existsSync(liveDir)).toBe(true);
+    expect(listOrchestraBranches(repo)).toContain(root.git_branch!);
+  });
+
+  it("keeps a worktree a re-rooted family inherited, whose directory name no longer matches any task id", () => {
+    const { repo, projectId } = setupProject();
+    const project = getProject(projectId)!;
+    const { root, children } = familyOnDisk(projectId, 1);
+    const dir = root.git_worktree_path!;
+    // Directory is named for the ROOT's task id.
+    expect(path.basename(dir)).toBe(root.task_id);
+
+    deleteTask(root.task_id); // heir inherits the worktree, keeping the old name
+    expect(getTask(children[0]!.task_id)!.git_worktree_path).toBe(dir);
+
+    const swept = sweepOrphanWorkspaces(project);
+
+    // Matching orphans by directory name against task ids would have reaped a
+    // live worktree here; matching on the recorded path does not.
+    expect(swept.worktreesRemoved).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it("heals a worktree container that predates the self-ignore file", () => {
+    const { repo, projectId } = setupProject();
+    const project = getProject(projectId)!;
+    familyOnDisk(projectId, 0);
+    // Simulate a project created before ensureWorktreesIgnored existed.
+    fs.rmSync(path.join(repo, ".orchestra-worktrees", ".gitignore"));
+    expect(status(repo)).toContain(".orchestra-worktrees");
+
+    sweepOrphanWorkspaces(project);
+
+    // Gone from the user's `git status` — the fixture's own untracked
+    // PLANNING/ scaffold is unrelated and stays.
+    expect(status(repo)).not.toContain(".orchestra-worktrees");
+    expect(fs.readFileSync(path.join(repo, ".orchestra-worktrees", ".gitignore"), "utf8")).toBe("*\n");
+  });
+});
+
+describe("family re-rooting on root deletion", () => {
+  it("hands the worktree and branch to the eldest survivor instead of orphaning it", async () => {
+    const { projectId } = setupProject();
+    const project = getProject(projectId)!;
+    const { root, children } = familyOnDisk(projectId, 2);
+    const dir = root.git_worktree_path!;
+    const branch = root.git_branch!;
+
+    await deleteTaskAndWorktree(root.task_id, false);
+
+    // The worktree is NOT reaped — the family outlives the deleted root.
+    expect(fs.existsSync(dir)).toBe(true);
+
+    const survivors = children.map((c) => getTask(c.task_id)!);
+    const heir = survivors.find((t) => t.task_id === t.root_task_id)!;
+    expect(heir).toBeTruthy();
+    expect(heir.task_type).toBe("root");
+    expect(heir.parent_task_id).toBeNull();
+    expect(heir.git_worktree_path).toBe(dir);
+    expect(heir.git_branch).toBe(branch);
+    // Every survivor points at the heir, not at the deleted row.
+    for (const s of survivors) expect(s.root_task_id).toBe(heir.task_id);
+
+    // And they still resolve to a real worktree — not the shared checkout,
+    // which is what losing the root used to silently fall back to.
+    for (const s of survivors) {
+      const resolved = ensureTaskWorkspace(getTask(s.task_id)!, project);
+      expect(resolved.git_worktree_path).toBe(dir);
+      expect(taskRepoPath(resolved, project)).not.toBe(project.repo_path);
+    }
+  });
+
+  it("still reaps the workspace when the deleted root was the whole family", async () => {
+    const { repo, projectId } = setupProject();
+    const { root } = familyOnDisk(projectId, 0);
+    const dir = root.git_worktree_path!;
+
+    await deleteTaskAndWorktree(root.task_id, false);
+
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(listOrchestraBranches(repo)).not.toContain(root.git_branch!);
+  });
+});
+
+describe("familyRootId", () => {
+  it("walks parent_task_id when root_task_id was never resolved", () => {
+    const { projectId } = setupProject();
+    const root = createTask({ name: "root", project_id: projectId });
+    const child = createTask({ name: "child", project_id: projectId, parent_task_id: root.task_id });
+    const grandchild = createTask({ name: "gc", project_id: projectId, parent_task_id: child.task_id });
+
+    // Simulate a row written before root_task_id existed: without the walk,
+    // this task becomes its own family root and gets a second branch/worktree.
+    updateTask(grandchild.task_id, { root_task_id: null });
+
+    expect(familyRootId(getTask(grandchild.task_id)!)).toBe(root.task_id);
+  });
+
+  it("returns the task's own id for a genuinely parentless task", () => {
+    const { projectId } = setupProject();
+    const solo = createTask({ name: "solo", project_id: projectId });
+    updateTask(solo.task_id, { root_task_id: null });
+    expect(familyRootId(getTask(solo.task_id)!)).toBe(solo.task_id);
   });
 });

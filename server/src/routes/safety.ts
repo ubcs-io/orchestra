@@ -14,7 +14,7 @@ import {
   READ_ONLY_TOOLS,
   READ_ONLY_TOOLS_WITH_GIT,
 } from "../roles.js";
-import { getGlobalConfig, getMeta, listProjects, listRoles, setMeta } from "../db.js";
+import { getGlobalConfig, getMeta, getProject, listProjects, listRoles, setMeta, updateProject } from "../db.js";
 import { resolveConnection } from "../settings.js";
 import { getConfig } from "../config.js";
 import {
@@ -24,6 +24,8 @@ import {
   execEnabled,
   resolveHarnessPolicy,
 } from "../harness-policy.js";
+import { DEFAULT_BUDGET_POLICY, budgetEnforced, evaluateProjectBudget } from "../budget-policy.js";
+import { SECRET_KEY_FILE } from "../crypto.js";
 
 function resolveRoleToolBudget(): number {
   const meta = getMeta("safety.role_tool_budget");
@@ -97,6 +99,8 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
     const writeToolSet = new Set<string>(WRITE_TOOL_NAMES);
     let projectsWithWrite = 0;
     let projectsWithExec = 0;
+    let projectsWithBudget = 0;
+    const budgetSummaries: Array<Record<string, unknown>> = [];
     const projectSummaries = listProjects().map((p) => {
       const policy = resolveHarnessPolicy(p.config_json);
       const projectRoles = listRoles(p.id).filter((r) => r.enabled && r.tools_json);
@@ -119,6 +123,33 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
         : [];
       if (rolesWithWrite.length > 0) projectsWithWrite++;
       if (rolesWithExec.length > 0) projectsWithExec++;
+
+      // Spend ceiling (PLANNING/overhaul-2/01). Reported alongside the harness
+      // policy because it answers the same operator question — what stops this
+      // thing? — and with the same honesty rule: `enforced` is the conjunction
+      // (switch on AND a cap set), and a partial dollar figure is labelled
+      // as the floor it is rather than presented as a total.
+      const budget = evaluateProjectBudget(p);
+      if (budgetEnforced(budget.policy)) projectsWithBudget++;
+      budgetSummaries.push({
+        id: p.id,
+        name: p.name,
+        enabled: budget.policy.enabled,
+        enforced: budget.enforced,
+        period_days: budget.policy.periodDays,
+        cap_tokens: budget.policy.capTokens ?? null,
+        cap_usd: budget.policy.capUsd ?? null,
+        warn_threshold_pct: budget.policy.warnThresholdPct,
+        override_minutes: budget.policy.overrideMinutes,
+        spent_tokens: budget.spend.tokens,
+        spent_usd: budget.spend.usd,
+        spent_usd_is_partial: budget.spend.usdIsPartial,
+        unpriced_tokens: budget.spend.unpricedTokens,
+        usage_pct: budget.usagePct,
+        over_cap: budget.overCap,
+        breached: budget.breached,
+      });
+
       return {
         id: p.id,
         name: p.name,
@@ -156,6 +187,16 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
         global_default: DEFAULT_HARNESS_POLICY,
         projects: projectSummaries,
       },
+      budget_policy: {
+        global_default: DEFAULT_BUDGET_POLICY,
+        projects_enforced: projectsWithBudget,
+        // What the dollar column rests on, stated once rather than implied:
+        // role_runs records one combined token count, so converting it to
+        // dollars assumes a split (see db.ts's ASSUMED_OUTPUT_FRACTION).
+        usd_note:
+          "dollar figures are estimates — token counts are combined input+output, priced with an assumed 15% output share, and runs on models with no configured price contribute nothing (spent_usd_is_partial)",
+        projects: budgetSummaries,
+      },
       limits: {
         role_tool_budget: resolveRoleToolBudget(),
         request_timeout_ms: conn.requestTimeoutMs,
@@ -180,6 +221,32 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
         db_path: cfg.dbPath,
         api_key_in_db: !!(globalConfig?.api_key?.length),
         api_key_in_env: !!process.env.ORCHESTRA_API_KEY,
+        /** PLANNING/overhaul-2/02: the two secret columns are AES-256-GCM at
+         *  rest, so the DB file no longer reads as plaintext credentials. */
+        secrets_encrypted_at_rest: true,
+      },
+      secrets: {
+        // Which projects have a token set, and when the row was last written —
+        // rotation visibility without ever moving the value itself. The token
+        // is never in this payload; only its presence and age.
+        projects: listProjects().map((p) => ({
+          id: p.id,
+          name: p.name,
+          has_github_token: !!p.github_token,
+          last_updated_at: p.updated_at,
+        })),
+        /** Where the instance key comes from. Named because losing it means
+         *  re-entering every stored secret — a cheap loss, but never a silent
+         *  one. */
+        key_source: process.env.ORCHESTRA_SECRET_KEY ? "ORCHESTRA_SECRET_KEY (env)" : SECRET_KEY_FILE,
+        key_loss_note:
+          "losing this key makes stored tokens unreadable — they must be re-entered (nothing else breaks)",
+        // The scope field ships as a documented no-op: no role receives a
+        // secret today. Reported so the panel says so rather than staying
+        // silent about a capability that doesn't exist yet.
+        roles_with_secret_access: listProjects().flatMap((p) =>
+          (resolveHarnessPolicy(p.config_json).secretScope ?? []).map((role) => ({ project_id: p.id, role })),
+        ),
       },
       concerns: CONCERN_TAXONOMY.slice(),
     };
@@ -206,5 +273,26 @@ export async function safetyRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return { ok: true, changes };
+  });
+
+  /**
+   * Revoke a project's stored GitHub token (PLANNING/overhaul-2/02 §3).
+   *
+   * Lives on the safety surface, next to the readout that shows the token
+   * exists, because "I can see it's set" and "I can get rid of it" belong in
+   * one place. Clearing here only removes Orchestra's copy — the PAT itself is
+   * still live on GitHub until it's revoked there, which the response says
+   * rather than leaving the operator to assume otherwise.
+   */
+  app.delete("/api/safety/secrets/github/:projectId", async (req: FastifyRequest, reply: FastifyReply) => {
+    const projectId = Number((req.params as { projectId: string }).projectId);
+    const project = getProject(projectId);
+    if (!project) return bad(reply, 404, "project not found");
+    updateProject(projectId, { github_token: null });
+    return {
+      ok: true,
+      project_id: projectId,
+      note: "Orchestra's copy is gone. The token is still valid on GitHub until you revoke it there.",
+    };
   });
 }

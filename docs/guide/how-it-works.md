@@ -4,12 +4,12 @@
 
 # How It Works
 
-Orchestra's refinement pipeline takes a raw intake through five stages:
+Orchestra's refinement pipeline takes a raw intake through six stages:
 
 ```
-INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY  (spec or research brief)
-                       (router +          read/grep the           or
-                        gatekeeper)       real repo, write     REVIEW (needs human)
+INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY  (spec, brief, or code change)
+   or a watcher         (router +         read/grep the            or
+                        gatekeeper)       real repo, write      REVIEW (needs human)
                             │             PLANNING artifacts
                             ▼
                     SQLite (source of truth + work queue)
@@ -18,6 +18,8 @@ INTAKE file / UI  ─►  Orchestrator  ─►  role agents (pi)  ─►  READY 
 ## Stage 1: Intake
 
 Drop work into Orchestra via the UI or by placing a file in `<repo>/PLANNING/INTAKE/`. It can be anything — a stack trace, a one-line request, or an open-ended research question.
+
+Work can also arrive without you: with [autonomy](/guide/autonomy) enabled, watchers scan the repo during idle windows and propose their own candidates, which run through this same pipeline once triaged.
 
 ## Stage 2: Ingest
 
@@ -38,13 +40,16 @@ A **flow template** for the intake kind becomes the task's ordered list of roles
 
 One role at a time runs as a pi agent session, against that task's own [dedicated git worktree](#git-isolation-concurrency). Each role:
 
-1. Reads/greps the real repository using its assigned tools
-2. Records a structured **verdict** (`pass`, `needs_more`, `blocker`, `needs_human`)
-3. Declares a **coverage map** — which concerns it examined, skipped, or ignored
-4. Records any **open questions** it couldn't fully resolve, each with its own best-effort guess (`assumed_answer`) and a `confidence` (`low`/`medium`/`high`) — so an ordinary open question doesn't need to stall the pipeline with `blocker`/`needs_human`; those verdicts are reserved for questions with no reasonable guess at all
-5. Appends a markdown section to the artifact, then commits (`refine(<role>): <task> — <purpose>`) — the resulting commit SHA is recorded on the run as its **checkpoint**, so the task can later be [restored](/guide/steering#task-lifecycle) back to right after this step
+1. Reads/greps the real repository using its assigned tools — and, where the project has [opted in](/guide/execution), edits source or runs allowlisted commands
+2. **Writes its report as it goes.** Each finished section is appended to the task artifact immediately via `report_section`, so the analysis is durable before the run ends
+3. Records a small structured **verdict trailer**: a verdict (`pass`, `needs_more`, `blocker`, `needs_human`), a summary, a **coverage map** of which concerns it examined/skipped/ignored, and any **open questions** it couldn't resolve — each with its own best-effort guess (`assumed_answer`) and `confidence`, so an ordinary open question doesn't stall the pipeline; `blocker`/`needs_human` are reserved for questions with no reasonable guess at all
+4. Commits (`refine(<role>): <task> — <purpose>`) — the resulting SHA is recorded as the run's **checkpoint**, so the task can later be [restored](/guide/steering#task-lifecycle) back to right after this step
 
-Roles that struggle with native tool calling can run in **two-phase mode** (exploration → JSON formalization) or **text mode** (JSON output via markdown).
+The split in steps 2 and 3 is the point: because the write-up is already on disk, a failed or truncated structured payload costs the ~4-field trailer, never the work. Orchestra then walks a [delivery ladder](/reference/reliability#the-verdict-delivery-ladder) to get that trailer — constrained decoding, tool call, JSON fence, a cheap repair call — and records which rung succeeded.
+
+Every run also gets a [health record](/reference/reliability#run-health) (`verified` / `healthy` / `recovered` / `degraded` / `empty`) that follows it into the UI, the gates, and the reliability rollups.
+
+How a run is shaped for a given model — single-turn, two-turn (exploration → formalization), or text-only — is [measured per model](/reference/reliability#model-capability-profiles) rather than hand-configured, though the `twoPhase`/`textMode` flags still work for a model you haven't probed.
 
 If a human later answers one of these open questions (once the task is at `stage: "review"`), the optional [Answer Match Assessment](/reference/config#strategic-llm-routing-advisors) call point compares the answer against the recorded guess. A confirmed guess is left alone; a contradicted one restores the task to that role's checkpoint and re-runs downstream steps with the corrected answer.
 
@@ -64,14 +69,20 @@ After each role (and any critique), the orchestrator evaluates the state:
 
 - **Keep refining** — advance to the next role
 - **Loop back** — if the counter-reviewer finds an unmet "must" criterion (or a critique blocker fires), re-run the responsible role (up to `maxLoopbacks` times)
-- **Escalate to REVIEW** — if loopback limit is exhausted, flag for human attention
+- **Escalate to REVIEW** — if the loopback limit is exhausted, flag for human attention
 - **Exit to READY** — when the terminal role completes
+
+[Run health](/reference/reliability#where-health-is-enforced) participates in these decisions: a counter-reviewer whose own run came back `degraded` or `empty` fails the gate outright (a synthesized run's defaulted criteria results must not slip through), and with `requireHealthyTerminal` enabled a degraded terminal run loops back and then escalates rather than promoting the task to READY on a synthesized verdict.
+
+Where the flow declares **evidence criteria** — the project's `test` or `typecheck` command exiting 0 inside the task's worktree — those are checked against harness-recorded [evidence](/guide/execution#evidence), not against the model's claims about them.
 
 Two optional LLM routing advisors can refine borderline gate calls: **escalation assessment** (is escalation truly needed, or should the task reroute/rerun/close instead?) and **borderline gate assessment** (for partial-criteria or near-loopback-exhaustion cases). Both are off by default and fall back to the heuristic decision above — see [Strategic LLM Routing Advisors](/reference/config#strategic-llm-routing-advisors).
 
 For **spec** tasks, the decomposition role spawns an epic → story → task child tree. Any open question a role raises along the way can also be spun off — via the Task Detail page's review call-to-action, or `POST /api/tasks/:id/questions/decompose` — into its own child **Question Flow** subtask, which gets a full task page of its own (and can recursively spin off its own open questions the same way). If a later Answer Match contradiction rolls a parent task back past the point where it decomposed, its already-spawned children aren't touched or deleted — they're just flagged `stale_reason` for a human to triage, since the guess they were built on turned out wrong.
 
 On **Exit to READY**, the orchestrator reconciles the task's dedicated branch back into its base branch: base is merged into the task branch first (so any conflict resolution happens on the disposable task branch, never on shared history), then the task branch is merged into base. This is best-effort — a conflict or error is recorded on the task (`reconcile_status`, `reconcile_detail`) rather than blocking the "ready" transition, since the artifact itself is unaffected; only its git history needs manual attention. The task branch itself is always left in place afterward, merged or not.
+
+That describes an **artifact-only** task. A task that wrote real source code is treated differently: at autonomy level `plan` or `edit` it is parked for an explicit human merge approval rather than auto-reconciled, and only the `approve_merge` intervention lands it. At level `auto` the orchestrator attempts the merge itself once the task's own checks pass, falling back to the human gate on any conflict. Family-wide reconciliation follows the **root** task's level and waits until every member of the worktree family has settled. See [the merge gate](/guide/execution#the-merge-gate).
 
 ## Git Isolation & Concurrency
 
@@ -118,3 +129,13 @@ State lives in SQLite (the authoritative work queue); the `PLANNING/` tree mirro
 | `research` | research_brief | low | Open-ended research → decision brief |
 | `ux` | research_brief | low | UX-focused question → design review + brief |
 | `question` | research_brief | low | Quick question → options + synthesis |
+
+## Three Exit Shapes
+
+| Exit kind | Terminal role | Produces |
+|---|---|---|
+| `spec` | `decomposition` | An epic → story → task tree with acceptance criteria. |
+| `research_brief` | `research_synthesis` | A decision brief: options, trade-offs, edge cases, recommendation. |
+| `code_change` | `critic` | An implemented change on the task's branch, parked for merge review. |
+
+`code_change` isn't reachable from an intake kind directly. A task arrives there either as a decomposition leaf flagged `execution_ready`, or via the XS fast path — when `explorer` sizes the work `XS`, Orchestra skips the remaining planning roles and routes straight to the [execution flow](/guide/execution#how-a-task-reaches-execution), because a genuinely tiny change has no business walking the full gauntlet only for decomposition to conclude "no further work" several expensive steps later.

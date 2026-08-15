@@ -27,6 +27,14 @@ export default defineConfig({
           ],
         },
         {
+          text: "Going Further",
+          items: [
+            { text: "Intake Review", link: "/guide/intake-review" },
+            { text: "Writing & Running Code", link: "/guide/execution" },
+            { text: "Autonomous Operation", link: "/guide/autonomy" },
+          ],
+        },
+        {
           text: "Building Networks",
           items: [
             { text: "Agent Networks", link: "/guide/networks" },
@@ -40,7 +48,9 @@ export default defineConfig({
           items: [
             { text: "Roles Catalog", link: "/reference/roles" },
             { text: "Configuration", link: "/reference/config" },
+            { text: "Reliability & Model Profiles", link: "/reference/reliability" },
             { text: "API Reference", link: "/reference/api" },
+            { text: "MCP Server", link: "/reference/mcp" },
           ],
         },
       ],

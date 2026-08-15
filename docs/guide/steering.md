@@ -29,6 +29,10 @@ All interventions are submitted via `POST /api/tasks/:id/interventions` with a J
 | `run_now` | Trigger the scheduler to process this specific task immediately, bypassing the idle poll interval. |
 | `wont_do` | Close the task as won't-do — sets it to `ready` with `exit_state: "wont_do"` and pauses it, without waiting for the flow to run to completion. |
 | `question_answer` | Answer an open question a role raised (surfaced via the review call-to-action). If the task is still refining, the answer is picked up on its next step; if it's already at `stage: "review"`, it's reincorporated immediately — see [Checkpoint Restore](#checkpoint-restore) below. |
+| `approve_merge` | Approve a `code_change` task's branch and merge it into base. Handled immediately, since a review-stage task has no scheduler pass coming to consume a deferred intervention. |
+| `request_changes` | Send a `code_change` task back for rework instead of merging, with an optional note. |
+| `set_autonomy_level` | Override [how far this task may go unattended](/guide/execution#autonomy-levels) — `plan`, `edit`, or `auto`. `null` clears the override and inherits the project default. |
+| `set_planning_rigor` | Override how much structure this task's decomposition may produce — `minimal`, `standard`, or `thorough`. `null` inherits the project default. |
 
 ## Task Lifecycle
 
@@ -37,6 +41,18 @@ All interventions are submitted via `POST /api/tasks/:id/interventions` with a J
 - **Subtasks** — create child tasks under a parent (useful for decomposition of complex work). Related tasks (a parent and its descendants) are color-grouped on the Project Board so a family stays visually identifiable as it grows.
 - **Question decomposition** — any open question a role raises (surfaced via the review call-to-action on Task Detail) can be spun off with one click into its own child **Question Flow** subtask (`POST /api/tasks/:id/questions/decompose`), so a tangent gets its own focused refinement pass instead of derailing the parent. The child gets a full task page and can itself decompose its own open questions recursively; an inline chat box on the parent lets you ask it quick follow-ups without navigating away.
 - **Edit** — modify a task's name or content while it's still in the intake stage
+- **Merge review** — a task that wrote real source lands at `stage: "review"` awaiting an explicit decision. The "review branch" pill opens a file-level diff of the task branch against its base (`GET /api/tasks/:id/diff`), and `GET /api/tasks/:id/runs/:runId/diff` narrows the same view to a single role run. Approve, request changes, or push the branch / open a PR without leaving the page — see [the merge gate](/guide/execution#the-merge-gate)
+- **Bulk actions** — close or hard-delete many tasks at once from the Project Board. Closing a watcher-originated task as won't-do also suppresses its [candidate fingerprint](/guide/autonomy#candidates-triage), so the same proposal doesn't come back tomorrow
+
+## Run Health
+
+Every completed run carries a [health badge](/reference/reliability#run-health) — `verified`, `healthy`, `recovered`, `degraded`, or `empty` — with a tooltip explaining *why*. It's worth reading before you trust a result you didn't watch:
+
+- `degraded` and `empty` mean something went wrong with the run itself (truncation, a stall, a synthesized verdict), not with the code it looked at
+- `verified` means the run's own commands were executed by the harness and came back green
+- A `degraded` counter-reviewer always fails its gate; turning on `requireHealthyTerminal` extends the same distrust to the terminal step, so a task can't reach READY on a synthesized verdict
+
+Board cards show a per-task degraded count, and `GET /api/stats/health?groupBy=model|role|mode` rolls the same data up so you can tell whether a bad night was one flaky role or one flaky model.
 
 ## Common Steering Patterns
 

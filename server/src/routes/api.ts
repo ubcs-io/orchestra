@@ -4,6 +4,7 @@
  * orchestrator and db modules.
  */
 
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +31,11 @@ import {
   getProject,
   getRole,
   getRoleStats,
+  getRoleVersion,
+  getRoleVersionStats,
+  listRoleVersions,
+  revertRoleToVersion,
+  MIN_RUNS_FOR_CONFIDENT_SCORE,
   getHealthStats,
   getTaskHealthSummaries,
   getTask,
@@ -52,16 +58,26 @@ import {
   upsertConfig,
   upsertRole,
   listCandidates,
+  listUnseenWatcherTasks,
+  markTasksSeen,
   type ProjectRow,
   type TaskRow,
 } from "../db.js";
 import { resolveAutonomyConfig, validateAutonomyConfig, getOrResetIdleWindowBudget, recordHumanActivity } from "../autonomy.js";
 import { resolveAutonomyLevel, validateAutonomyLevel } from "../autonomy-level.js";
 import { resolvePlanningRigor, validatePlanningRigor } from "../planning-rigor.js";
-import { abortWatcherScan, startWatcherLoop, stopWatcherLoop } from "../watchers.js";
+import { abortWatcherScan, startWatcherLoop, stopWatcherLoop, WATCHER_CATALOG } from "../watchers.js";
+import { buildMorningReport, renderMorningReport } from "../morning-report.js";
 import type { HealthStatGroupBy, RoleRunRow } from "../db.js";
 import { computeRunHealth, runHealthReason, roleRunHealthInput } from "../health.js";
 import { resolveHarnessPolicy, validateExecAllowlist, validateToolsJson } from "../harness-policy.js";
+import {
+  budgetOverrideExpiry,
+  evaluateProjectBudget,
+  grantBudgetOverride,
+  resolveBudgetPolicy,
+  validateBudgetPolicy,
+} from "../budget-policy.js";
 import {
   commitArtifacts,
   diffFilePatch,
@@ -104,24 +120,37 @@ import {
 import { CONCERN_TAXONOMY, FLOW_TEMPLATES, flowForIntake, type IntakeKind, type ExitKind } from "../roles.js";
   import {
     activeTaskIds,
+    applyIntakeProposal,
     approveCodeChangeMerge,
     artifactName,
     buildParentDigest,
     deleteTaskAndWorktree,
+    effortBudgetPreview,
     ensureTaskWorkspace,
     ingestProject,
     isSchedulerRunning,
     isSchedulerStopping,
+    reapSettledWorkspaces,
     reincorporateAnswer,
     requestCodeChanges,
     resetTaskAndWorktree,
     restoreCheckpoint,
+    skipIntakeReview,
+    sweepOrphanWorkspaces,
     startScheduler,
     stopScheduler,
     taskRepoPath,
     tick,
     type RefinementPlan,
   } from "../orchestrator.js";
+import {
+  buildNetworkCatalog,
+  INTAKE_KINDS,
+  intakeReviewState,
+  readProposal,
+  resolveIntakeReviewConfig,
+  validateProposal,
+} from "../intake-review.js";
 import { applyWaterfallLayout, type NetworkGraph } from "../roles.js";
 import { runRole } from "../agent.js";
 import { publish } from "../bus.js";
@@ -173,6 +202,10 @@ function taskDetail(taskId: string) {
     interventions,
     children,
     chat_messages: listChatMessages(task.task_id),
+    // Expiry of any resume_over_budget grant (PLANNING/overhaul-2/01), expired
+    // or not — a task that ran past its ceiling an hour ago should say so
+    // rather than just going quiet again.
+    budget_override_until: budgetOverrideExpiry(task.task_id),
     taxonomy: CONCERN_TAXONOMY,
     flow: {
       key: flow.key,
@@ -769,6 +802,8 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       if (!validation.ok) return bad(reply, 400, validation.error);
     }
 
+    // Externally unchanged — still "edit this role". Internally it now records
+    // a version behind the live row (PLANNING/overhaul-2/03).
     const role = upsertRole({
       project_id: id,
       key,
@@ -779,9 +814,61 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       tools_json: body.tools_json as string | undefined,
       model: body.model as string | undefined,
       can_create_subtasks: body.can_create_subtasks as boolean | undefined,
+      version_note: typeof body.version_note === "string" ? body.version_note : undefined,
     });
     return { role };
   });
+
+  // ---- Role version history + outcome scores (PLANNING/overhaul-2/03) ----
+  app.get("/api/projects/:id/roles/:key/versions", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const key = (req.params as { key: string }).key;
+    if (!getProject(id)) return bad(reply, 404, "project not found");
+    const role = getRole(id, key);
+    if (!role) return bad(reply, 404, "role not found");
+    return {
+      // The role id the versions belong to — a project override and the global
+      // it shadows are different rows with separate histories, and the caller
+      // needs to know which one it's looking at.
+      role_id: role.id,
+      is_project_override: role.project_id != null,
+      current_version_id: role.current_version_id,
+      min_runs_for_confidence: MIN_RUNS_FOR_CONFIDENT_SCORE,
+      versions: listRoleVersions(role.id),
+      scores: getRoleVersionStats(role.id),
+    };
+  });
+
+  app.post(
+    "/api/projects/:id/roles/:key/versions/:versionId/revert",
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const id = Number((req.params as { id: string }).id);
+      const key = (req.params as { key: string }).key;
+      const versionId = Number((req.params as { versionId: string }).versionId);
+      const project = getProject(id);
+      if (!project) return bad(reply, 404, "project not found");
+      const role = getRole(id, key);
+      if (!role) return bad(reply, 404, "role not found");
+
+      // The reverted-to definition still has to clear today's policy: an old
+      // version granting write/edit can't come back through this door while the
+      // project's harness policy says no.
+      const target = getRoleVersion(versionId);
+      if (!target || target.role_id !== role.id) return bad(reply, 404, "version not found for this role");
+      if (target.tools_json) {
+        const validation = validateToolsJson(target.tools_json, resolveHarnessPolicy(project.config_json));
+        if (!validation.ok) {
+          return bad(reply, 400, `cannot revert: ${validation.error}`);
+        }
+      }
+
+      try {
+        return { role: revertRoleToVersion(role.id, versionId) };
+      } catch (err) {
+        return bad(reply, 400, (err as Error).message);
+      }
+    },
+  );
 
   // ---- Harness policy (per project): gates write/edit tool grants ----
   app.get("/api/projects/:id/harness-policy", async (req: FastifyRequest, reply: FastifyReply) => {
@@ -867,6 +954,45 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     };
     const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
     return { policy: resolveHarnessPolicy(updated?.config_json ?? null) };
+  });
+
+  // ---- Budget guardrails (PLANNING/overhaul-2/01): per-project spend ceiling ----
+  app.get("/api/projects/:id/budget", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    // Policy AND live standing in one response: the config form and the status
+    // readout are the same panel, and asking for one without the other is never
+    // what a caller wants here.
+    return { policy: resolveBudgetPolicy(project.config_json), status: evaluateProjectBudget(project) };
+  });
+
+  app.patch("/api/projects/:id/budget", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = req.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return bad(reply, 400, "request body must be an object");
+    }
+    // Merged over the currently-resolved policy (not the raw stored
+    // config_json), so a patch of just `{enabled}` can't clobber a cap set
+    // earlier — same approach as the autonomy PATCH above. `null` is meaningful
+    // for the two optional caps ("unset this dimension") and survives the merge.
+    const merged = { ...resolveBudgetPolicy(project.config_json), ...(body as Record<string, unknown>) };
+    const validation = validateBudgetPolicy(merged);
+    if (!validation.ok) return bad(reply, 400, validation.error);
+
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = { ...existing, budget: validation.policy };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    const next = updated ?? project;
+    return { policy: resolveBudgetPolicy(next.config_json), status: evaluateProjectBudget(next) };
   });
 
   // ---- Autonomy (PLANNING/overhaul/08) ----
@@ -992,6 +1118,44 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     return getOrResetIdleWindowBudget(id, cfg);
   });
 
+  // What this build can actually run, for the watcher editor — so the UI lists
+  // the live registry instead of a hardcoded parallel list that silently drifts
+  // as watchers are added.
+  app.get("/api/watchers", async () => ({ catalog: WATCHER_CATALOG }));
+
+  // The morning report (PLANNING/overhaul/08 §4). Deterministic — computed from
+  // what actually happened, never generated — so it costs nothing and still
+  // renders when the token budget is spent or the endpoint is down.
+  app.get("/api/projects/:id/morning-report", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const raw = Number((req.query as { sinceHours?: string }).sinceHours);
+    const sinceHours = Number.isFinite(raw) ? Math.min(Math.max(raw, 1), 24 * 30) : 24;
+    const since = new Date(Date.now() - sinceHours * 3_600_000);
+    const report = buildMorningReport(project, since);
+    return { report, markdown: renderMorningReport(report), sinceHours };
+  });
+
+  // Self-generated tasks a human hasn't opened yet — the server-side truth the
+  // board's "new" section reads, replacing the per-browser localStorage the
+  // first autonomy slice used.
+  app.get("/api/projects/:id/unseen-tasks", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    return { tasks: listUnseenWatcherTasks(id) };
+  });
+
+  app.post("/api/tasks/seen", async (req: FastifyRequest, reply: FastifyReply) => {
+    const body = (req.body ?? {}) as { taskIds?: unknown };
+    if (!Array.isArray(body.taskIds) || !body.taskIds.every((t) => typeof t === "string")) {
+      return bad(reply, 400, "taskIds must be an array of task id strings");
+    }
+    markTasksSeen(body.taskIds as string[]);
+    return { ok: true, marked: body.taskIds.length };
+  });
+
   // ---- Tasks ----
   app.get("/api/tasks", async (req: FastifyRequest) => {
     const q = req.query as { projectId?: string; stage?: string };
@@ -1096,7 +1260,13 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
       bad(reply, 400, "project not found for task");
       return null;
     }
-    return { task, project, repoPath: taskRepoPath(task, project) };
+    // Fall back to the repo root when the recorded worktree is gone — reaped
+    // after the family merged, or left dangling by a crash. Diff/push/PR need
+    // only refs, and a worktree shares its object store with the root, so
+    // everything below works identically from there.
+    let repoPath = taskRepoPath(task, project);
+    if (repoPath !== project.repo_path && !fs.existsSync(repoPath)) repoPath = project.repo_path;
+    return { task, project, repoPath };
   }
 
   // File-level diff of a task's branch against its base — powers the
@@ -1223,11 +1393,22 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
   // Create an intake directly (manual textarea) OR drop a file into INTAKE.
   // Ingested synchronously so the task row exists before the response returns —
   // the caller sees the task immediately instead of waiting for a scheduler tick.
+  //
+  // `review` opts this one intake into the pre-flight review layer
+  // (PLANNING/intake-refinement.md): the task is created identically, then held
+  // while a scout prefix runs and a proposal is built for a human to steer.
+  // Omitted = the project's own default, which is "off" everywhere until an
+  // operator opts in — so the un-reviewed path is untouched.
   app.post("/api/projects/:id/intake", async (req: FastifyRequest, reply: FastifyReply) => {
     const id = Number((req.params as { id: string }).id);
     const project = getProject(id);
     if (!project) return bad(reply, 404, "project not found");
-    const body = (req.body ?? {}) as { name?: string; content?: string; intake_kind?: string };
+    const body = (req.body ?? {}) as {
+      name?: string;
+      content?: string;
+      intake_kind?: string;
+      review?: boolean;
+    };
     if (!body.content) return bad(reply, 400, "content is required");
     const name = (body.name || "intake").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 60);
 
@@ -1238,10 +1419,123 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     writeArtifact(path.join(project.repo_path, rel), body.content);
 
     // Ingest synchronously — creates the task row immediately so the caller
-    // sees it without waiting for the next scheduler tick.
-    const created = ingestProject(project);
+    // sees it without waiting for the next scheduler tick. `ingestProject`
+    // applies the project's own review default; an explicit `review` on the
+    // request overrides it for this intake only.
+    const created = ingestProject(project, { review: body.review });
     const task = created.length > 0 ? created[0] : null;
-    return reply.code(201).send({ accepted: true, path: rel, task_id: task?.task_id ?? null });
+    return reply.code(201).send({
+      accepted: true,
+      path: rel,
+      task_id: task?.task_id ?? null,
+      intake_review_state: task?.intake_review_state ?? null,
+    });
+  });
+
+  // ---- Intake review (PLANNING/intake-refinement.md) ----
+
+  // The proposal plus everything the review card needs to render its controls:
+  // the network catalog to pick from, the role catalog to edit the plan with,
+  // and what each effort size would actually buy at the task's current rigor —
+  // computed from the same resolveFamilyBudget the decomposition gate uses, so
+  // the card can never quote a budget the pipeline won't honour.
+  app.get("/api/tasks/:id/intake-proposal", async (req: FastifyRequest, reply: FastifyReply) => {
+    const task = getTask((req.params as { id: string }).id);
+    if (!task) return bad(reply, 404, "task not found");
+    const project = task.project_id != null ? getProject(task.project_id) : undefined;
+    const proposal = readProposal(task);
+    const rigor = project
+      ? (task.planning_rigor as "minimal" | "standard" | "thorough" | null) ??
+        resolvePlanningRigor(project.config_json)
+      : "standard";
+    return {
+      state: intakeReviewState(task),
+      proposal,
+      networks: buildNetworkCatalog(task.project_id ?? null),
+      roles: listRoles(task.project_id ?? null).map((r) => ({ key: r.key, title: r.title })),
+      intake_kinds: INTAKE_KINDS,
+      // The built-in flow behind each kind, so the card can reset the role list
+      // when a human changes the kind or picks "no network" — otherwise it would
+      // silently keep the role list of the flow they just navigated away from.
+      flows: Object.fromEntries(INTAKE_KINDS.map((k) => [k, flowForIntake(k).steps])),
+      budget_preview: effortBudgetPreview(task, proposal?.planning_rigor ?? rigor),
+    };
+  });
+
+  // Accept the proposal — with whatever the human edited — and release the task.
+  app.post("/api/tasks/:id/intake-proposal/accept", async (req: FastifyRequest, reply: FastifyReply) => {
+    const task = getTask((req.params as { id: string }).id);
+    if (!task) return bad(reply, 404, "task not found");
+    const stored = readProposal(task);
+    if (!stored) return bad(reply, 400, "task has no intake proposal to accept");
+    if (intakeReviewState(task) !== "proposed") {
+      return bad(reply, 400, `intake review is "${intakeReviewState(task) ?? "not started"}", not awaiting a decision`);
+    }
+    const body = (req.body ?? {}) as { proposal?: unknown };
+    // No edits posted = accept exactly what was proposed.
+    const validation = validateProposal(body.proposal ?? stored, stored);
+    if (!validation.ok) return bad(reply, 400, validation.error);
+
+    // Logged like every other steering action rather than mutating the task
+    // silently — the accepted proposal (edits included) is the record of why
+    // this task got the flow and the budget it did.
+    createIntervention({
+      task_id: task.task_id,
+      kind: "intake_review_accept",
+      payload_json: JSON.stringify(validation.proposal),
+    });
+    const updated = applyIntakeProposal(task.task_id, validation.proposal);
+    return { task: updated, proposal: validation.proposal };
+  });
+
+  // "Start as-is" — bypass the review and run the intake exactly as the direct
+  // path would have.
+  app.post("/api/tasks/:id/intake-proposal/skip", async (req: FastifyRequest, reply: FastifyReply) => {
+    const task = getTask((req.params as { id: string }).id);
+    if (!task) return bad(reply, 404, "task not found");
+    const state = intakeReviewState(task);
+    // Only while the review still owns the task. Once accepted (or already
+    // skipped) the task is running a real flow, and clearing its plan here
+    // would wipe work in progress rather than bypass a review.
+    if (state !== "scouting" && state !== "skip_pending" && state !== "proposed") {
+      return bad(
+        reply,
+        400,
+        state == null
+          ? "task is not in intake review"
+          : `intake review is already "${state}" — there is nothing left to skip`,
+      );
+    }
+    createIntervention({ task_id: task.task_id, kind: "intake_review_skip" });
+    return { task: skipIntakeReview(task.task_id) };
+  });
+
+  // Whether this project reviews intakes by default (the board reads it to pick
+  // which of its two buttons is the primary one).
+  app.get("/api/projects/:id/intake-review", async (req: FastifyRequest, reply: FastifyReply) => {
+    const project = getProject(Number((req.params as { id: string }).id));
+    if (!project) return bad(reply, 404, "project not found");
+    return { config: resolveIntakeReviewConfig(project.config_json) };
+  });
+
+  app.patch("/api/projects/:id/intake-review", async (req: FastifyRequest, reply: FastifyReply) => {
+    const id = Number((req.params as { id: string }).id);
+    const project = getProject(id);
+    if (!project) return bad(reply, 404, "project not found");
+    const body = (req.body ?? {}) as { default?: unknown };
+    if (body.default !== "on" && body.default !== "off") {
+      return bad(reply, 400, `default must be "on" or "off"`);
+    }
+
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = project.config_json ? (JSON.parse(project.config_json) as Record<string, unknown>) : {};
+    } catch {
+      existing = {};
+    }
+    const nextConfig = { ...existing, intakeReview: { default: body.default } };
+    const updated = updateProject(id, { config_json: JSON.stringify(nextConfig) });
+    return { config: resolveIntakeReviewConfig(updated?.config_json ?? null) };
   });
 
   // Manual task creation without a repo file (e.g. quick note).
@@ -1458,7 +1752,33 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
         suppressCandidateForTask(t.task_id, "closed as wont_do (bulk)");
       }
     }
+    // Archiving is the end of the road for these tasks, so any family that just
+    // became fully settled gives its worktree and branch back rather than
+    // leaving them in the user's repo forever.
+    await reapSettledWorkspaces(tasks.map((t) => t.task_id));
     return { ok: true, updated: tasks.length };
+  });
+
+  // Reclaim Orchestra's leftovers in the user's repo: `orchestra/*` branches
+  // and worktree directories with no owning task row. Exposed manually as well
+  // as run from self-maintenance, so a project with autonomy switched off can
+  // still tidy up. Never destroys unmerged work — `branches_kept` reports what
+  // it deliberately left behind.
+  app.post("/api/projects/:id/sweep-workspaces", async (req: FastifyRequest, reply: FastifyReply) => {
+    const projectId = Number((req.params as { id: string }).id);
+    const project = getProject(projectId);
+    if (!project) return bad(reply, 404, "project not found");
+    try {
+      const swept = sweepOrphanWorkspaces(project);
+      return {
+        ok: true,
+        branches_deleted: swept.branchesDeleted,
+        branches_kept: swept.branchesKept,
+        worktrees_removed: swept.worktreesRemoved.map(sanitizePath),
+      };
+    } catch (err) {
+      return bad(reply, 500, (err as Error).message);
+    }
   });
 
   // "Clean slate" — hard-deletes tasks (and their worktrees/plans) rather than
@@ -1495,6 +1815,20 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     // consumes the intervention row on its next pass.
     if (body.kind === "pause") updateTask(task.task_id, { paused: 1 });
     if (body.kind === "resume" || body.kind === "run_now") updateTask(task.task_id, { paused: 0 });
+    // A deliberate human override of the project's spend ceiling for this one
+    // task (PLANNING/overhaul-2/01). Logged as an intervention like any other
+    // steering action — never a silent auto-continue — and bounded to
+    // policy.overrideMinutes, because a rolling window has no period boundary
+    // for an unbounded grant to expire at.
+    let budgetOverrideUntil: string | null = null;
+    if (body.kind === "resume_over_budget") {
+      const project = task.project_id != null ? getProject(task.project_id) : undefined;
+      if (!project) return bad(reply, 400, "task has no project — nothing to override");
+      const policy = resolveBudgetPolicy(project.config_json);
+      if (!policy.enabled) return bad(reply, 400, "this project has no budget enabled — nothing to override");
+      budgetOverrideUntil = grantBudgetOverride(task.task_id, policy);
+      updateTask(task.task_id, { budget_paused_at: null });
+    }
     if (body.kind === "set_autonomy_level") {
       const p = (body.payload ?? {}) as { level?: unknown };
       if (p.level === null || p.level === undefined) {
@@ -1539,12 +1873,16 @@ if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { "" }`,
     // Atomic execution leaf (exit_kind "code_change") merge-review actions —
     // same immediate-handling need as question_answer above: a review-stage
     // task has no scheduler pass coming to consume a deferred intervention.
-    if (body.kind === "approve_merge") approveCodeChangeMerge(task.task_id);
+    if (body.kind === "approve_merge") await approveCodeChangeMerge(task.task_id);
     if (body.kind === "request_changes") {
       const p = (body.payload ?? {}) as { note?: string };
       requestCodeChanges(task.task_id, p.note);
     }
-    return { intervention: iv, task: getTask(task.task_id) };
+    return {
+      intervention: iv,
+      task: getTask(task.task_id),
+      ...(budgetOverrideUntil ? { budget_override_until: budgetOverrideUntil } : {}),
+    };
   });
 
   // ---- Agent Networks (visual flow templates) ----

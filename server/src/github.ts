@@ -6,14 +6,23 @@
  */
 
 import { getConfig } from "./config.js";
+import { decryptSecret } from "./crypto.js";
 import { remoteUrl } from "./git.js";
 import type { ProjectRow } from "./db.js";
 
-/** Project-level token wins over the shared env fallback — different projects
- *  plausibly point at different GitHub orgs/accounts, unlike the single shared
- *  LLM endpoint the model-connection env-override exists for. */
+/**
+ * Project-level token wins over the shared env fallback — different projects
+ * plausibly point at different GitHub orgs/accounts, unlike the single shared
+ * LLM endpoint the model-connection env-override exists for.
+ *
+ * `project.github_token` arrives already decrypted (db.ts decrypts the column
+ * on read — PLANNING/overhaul-2/02), so this stays a plain field read. The
+ * defensive `decryptSecret` call is for a caller that hands us a raw row read
+ * outside db.ts's accessors: it's a no-op on a value that isn't `enc:`-prefixed
+ * and turns a would-be "GitHub says 401" into a working push.
+ */
 export function resolveGithubToken(project: ProjectRow): string | undefined {
-  return project.github_token || getConfig().githubToken || undefined;
+  return decryptSecret(project.github_token) || getConfig().githubToken || undefined;
 }
 
 export function parseOwnerRepo(url: string): { owner: string; repo: string } | null {

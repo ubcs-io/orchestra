@@ -1,3 +1,6 @@
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   closeDb,
@@ -12,6 +15,7 @@ import {
 import type { ExecEvidence } from "../src/exec";
 import { resetRouterFns, setTriageFn } from "../src/router";
 import {
+  DEFAULT_AUTONOMY_CONFIG,
   getOrResetIdleWindowBudget,
   recordAutonomousTaskStart,
   resetHumanActivityClock,
@@ -24,6 +28,7 @@ import {
   extractFailingTestIds,
   runTestSuiteWatcher,
   tickWatchers,
+  WATCHER_CATALOG,
   triageAndMaybeQueue,
 } from "../src/watchers";
 import { freshDb, tempGitRepo } from "./helpers";
@@ -136,11 +141,10 @@ describe("runTestSuiteWatcher", () => {
         },
       }),
     });
-    const found = await runTestSuiteWatcher(project, {
-      name: "test-suite",
-      enabled: true,
-      cadenceMinutes: 60,
-      perWatcherDailyCap: 2,
+    const found = await runTestSuiteWatcher({
+      project,
+      scanDir: repo,
+      cfg: { name: "test-suite", enabled: true, cadenceMinutes: 60, perWatcherDailyCap: 2 },
     });
     expect(found).toEqual([]);
   });
@@ -155,10 +159,10 @@ describe("runTestSuiteWatcher", () => {
         harness: { allowExec: true, execAllowlist: [{ name: "test", argv: ["node", "-e", "process.exit(1)"] }] },
       }),
     });
-    const wc = { name: "test-suite", enabled: true, cadenceMinutes: 60, perWatcherDailyCap: 2, commands: ["test"] };
-    const first = await runTestSuiteWatcher(project, wc);
+    const cfg = { name: "test-suite", enabled: true, cadenceMinutes: 60, perWatcherDailyCap: 2, commands: ["test"] };
+    const first = await runTestSuiteWatcher({ project, scanDir: repo, cfg });
     expect(first).toEqual([]);
-    const second = await runTestSuiteWatcher(project, wc);
+    const second = await runTestSuiteWatcher({ project, scanDir: repo, cfg });
     expect(second).toHaveLength(1);
     expect(second[0]).toMatchObject({ watcher: "test-suite", kind: "error_file" });
   }, 15000);
@@ -171,11 +175,10 @@ describe("runTestSuiteWatcher", () => {
       repo_path: repo,
       config_json: JSON.stringify({ harness: { allowExec: true, execAllowlist: [] } }),
     });
-    const found = await runTestSuiteWatcher(project, {
-      name: "test-suite",
-      enabled: true,
-      cadenceMinutes: 60,
-      perWatcherDailyCap: 2,
+    const found = await runTestSuiteWatcher({
+      project,
+      scanDir: repo,
+      cfg: { name: "test-suite", enabled: true, cadenceMinutes: 60, perWatcherDailyCap: 2 },
     });
     expect(found).toEqual([]);
   });
@@ -382,4 +385,80 @@ describe("tickWatchers gating", () => {
     await tickPromise;
     expect(Date.now() - start).toBeLessThan(10_000); // well under the 60s hang/timeout
   }, 15000);
+});
+
+describe("watcher registry", () => {
+  it("the catalog and the runnable registry stay in lockstep", () => {
+    // A catalog entry with no implementation would be offered in the UI and
+    // then silently never run; an implementation missing from the catalog
+    // could never be enabled. Both are quiet failures worth failing loudly on.
+    expect(WATCHER_CATALOG.map((c) => c.name).sort()).toEqual(
+      DEFAULT_AUTONOMY_CONFIG.watchers.map((w) => w.name).sort(),
+    );
+  });
+
+  it("marks exactly the command-running watchers as exec-dependent", () => {
+    const requiresExec = WATCHER_CATALOG.filter((c) => c.requiresExec).map((c) => c.name).sort();
+    expect(requiresExec).toEqual(["dep-staleness", "lint-drift", "test-suite"]);
+  });
+
+  it("runs a native watcher end-to-end with no exec policy configured at all", async () => {
+    freshDb();
+    const repo = tempGitRepo();
+    // A branch with unmerged commits, quiet for a long time.
+    const base = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    const when = new Date(Date.now() - 120 * 86_400_000).toISOString();
+    execFileSync("git", ["checkout", "-q", "-b", "feature/forgotten"], { cwd: repo });
+    writeFileSync(path.join(repo, "x.ts"), "export const x = 1;\n");
+    execFileSync("git", ["add", "-A"], { cwd: repo });
+    execFileSync("git", ["commit", "-qm", "wip"], {
+      cwd: repo,
+      env: { ...process.env, GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when },
+    });
+    execFileSync("git", ["checkout", "-q", base], { cwd: repo });
+
+    const project = createProject({
+      name: "p",
+      repo_path: repo,
+      main_branch: base,
+      config_json: JSON.stringify({
+        // Note: no harness/exec policy whatsoever.
+        autonomy: {
+          enabled: true,
+          idleAfterMinutes: 0,
+          selfMaintenance: { enabled: false, reprobeModels: false, backfillDigests: false },
+          watchers: [{ name: "branch-triage", enabled: true, cadenceMinutes: 0, perWatcherDailyCap: 5, thresholdDays: 30 }],
+        },
+        router: { enabled: true, candidateTriage: true },
+      }),
+    });
+    resetHumanActivityClock();
+    setTriageFn(async () => ({ worth_doing: true, priority: 2, rationale: "ask about it", suggested_kind: "question" }));
+
+    expect(await tickWatchers()).toBe(true);
+    const candidates = listCandidates({ projectId: project.id });
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.watcher).toBe("branch-triage");
+    expect(candidates[0]?.status).toBe("queued");
+    expect(getTask(candidates[0]!.task_id!)?.origin).toBe("watcher:branch-triage");
+  }, 20000);
+
+  it("skips a config entry naming a watcher this build doesn't have", async () => {
+    freshDb();
+    const repo = tempGitRepo();
+    createProject({
+      name: "p",
+      repo_path: repo,
+      config_json: JSON.stringify({
+        autonomy: {
+          enabled: true,
+          idleAfterMinutes: 0,
+          selfMaintenance: { enabled: false, reprobeModels: false, backfillDigests: false },
+          watchers: [{ name: "from-a-newer-build", enabled: true, cadenceMinutes: 0, perWatcherDailyCap: 5 }],
+        },
+      }),
+    });
+    resetHumanActivityClock();
+    await expect(tickWatchers()).resolves.toBe(false);
+  });
 });
