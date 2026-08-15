@@ -52,6 +52,6 @@ Orchestra is in **alpha**, and developed in phases:
 - **Autonomy** — per-run context budgeting for small windows, plus watchers that generate their own work under idle-window budgets and report each morning.
 - **Transport** — a read-only MCP surface so an external agent can read task context and the candidate queue.
 
-All of the above is implemented and typechecks/builds, alongside the original pipeline: ingest, planning, concurrent role execution across per-task git worktrees, per-step adversarial critique, gating with optional LLM routing advisors, checkpoint restore, answer reincorporation, coverage rollup, decomposition, and the React UI. Successful LLM refinement still depends on a reachable, tool-capable endpoint.
+All of the above is implemented and typechecks/builds, alongside the original pipeline: ingest, planning, concurrent role execution across per-task git worktrees, per-step adversarial critique, gating with optional LLM routing advisors, checkpoint restore, answer reincorporation, coverage rollup, decomposition, intake review, and the React UI. Successful LLM refinement still depends on a reachable, tool-capable endpoint.
 
-Not yet built: encryption at rest for stored tokens, per-task spend caps, and role prompt versioning with outcome scoring.
+Operational guardrails: encryption at rest for stored tokens (AES-256-GCM), per-project rolling-window spend ceilings that actually stop dispatch, and role versioning with per-version outcome scoring.

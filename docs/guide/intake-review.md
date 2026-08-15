@@ -57,7 +57,7 @@ A size you set by hand is recorded as yours and is never overwritten by a later 
 Review is per-intake by default. To review every intake in a project — including files dropped into the `INTAKE/` folder — set the project default:
 
 ```bash
-curl -X PATCH localhost:4317/api/projects/1/intake-review \
+curl -X PATCH localhost:5001/api/projects/1/intake-review \
   -H 'content-type: application/json' \
   -d '{"default":"on"}'
 ```

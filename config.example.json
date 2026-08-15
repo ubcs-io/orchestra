@@ -6,7 +6,7 @@
   "apiKey": "",
   "defaultModelId": "deepseek-r1:latest",
   "contextWindow": 128000,
-  "maxTokens": 8192,
+  "maxTokens": 32768,
   "requestTimeoutMs": 300000,
   "schedulerIdleMs": 3000,
   "roleToolBudget": 40,

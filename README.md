@@ -79,6 +79,18 @@ Three exit shapes:
 - **research_brief** → ends in `research_synthesis` → a decision brief.
 - **code_change** → ends in `critic` → an implemented change parked for merge review. Not reachable from an intake kind directly: a task gets there as an `execution_ready` decomposition leaf, or via the **XS fast path** when `explorer` sizes the work as trivial and skips the remaining planning roles.
 
+### Intake review
+
+Filing an intake normally starts work at once — the kind you picked picks the flow, and the first honest *how big is this* estimate (`explorer`'s XS–XL read) doesn't happen until several steps in. **Intake review** is an optional pre-flight step that moves those routing decisions in front of you, before anything is spent. It rides parallel to the default "Create task" path, which is unchanged.
+
+- **The two scout roles run first** — `intake_triage` (what's being asked) and `explorer` (which files this touches). These are the opening steps of whichever flow you end up picking, so review *reuses* rather than re-runs them once you accept.
+- **A review card**, every field editable: the normalized problem statement, intake kind, network (including your custom ones), the exact ordered role list, **effort size** (with the decomposition budget shown live — e.g. *"M × standard → up to 12 subtasks, max depth 2"*), planning rigor, autonomy level, and any assumptions the planner made with its confidence.
+- **Start / Start as-is / Save & hold** — accept with your edits, abandon the review, or park the task for later.
+- **Choosing XS takes the same fast path** an `explorer` verdict would — straight to the developer/critic execution flow, with the same guards (never at `plan` autonomy, never at `thorough` rigor, never for a research/brief-shaped task).
+- **Works with no LLM at all.** The optional `intakePlanning` advisor (off by default) only improves the card's starting position; without it, the card is filled with the heuristic proposal — exactly what the task would have done anyway, labelled as such.
+
+**[Full guide →](https://ubcs-io.github.io/orchestra/guide/intake-review)**
+
 ### Live visibility & steering
 
 - **Live pane** — Server-Sent Events stream the active role's reasoning and every file it reads, in real time, as structured typed events (role/tool boundaries, thinking, text, status) with inline markdown highlighting — not just a raw log.
@@ -176,7 +188,7 @@ The **`/models`** page manages named model configs — reusable endpoint + model
 
 ### Strategic LLM routing advisors (experimental)
 
-Beyond the deterministic router, `server/src/router.ts` provides six **optional, narrowly-scoped advisory LLM calls** at decision points where heuristics are weakest. Each is independently toggleable, off by default, hard-timeout-bounded, and falls back to the heuristic on failure — the orchestrator always owns the final decision:
+Beyond the deterministic router, `server/src/router.ts` provides seven **optional, narrowly-scoped advisory LLM calls** at decision points where heuristics are weakest. Each is independently toggleable, off by default, hard-timeout-bounded, and falls back to the heuristic on failure — the orchestrator always owns the final decision:
 
 1. **Question distillation** — distill and de-duplicate a role's open questions.
 2. **Escalation assessment** — before escalating to human REVIEW: `escalate` / `reroute` / `rerun` / `close`.
@@ -184,6 +196,7 @@ Beyond the deterministic router, `server/src/router.ts` provides six **optional,
 4. **Second review** — synthesize a primary run and its critique into `accept` / `accept_with_note` / `escalate` / `loopback`, so a critic false-positive can be overturned.
 5. **Answer match assessment** — compare a human's answer to a role's recorded guess; `contradicts` restores the task to that checkpoint and re-runs downstream steps.
 6. **Candidate triage** — whether a watcher candidate is worth doing, at what priority, as which kind. Disabled means *nothing is queued* — this one fails toward silence, not auto-approval.
+7. **Intake planning** — propose the kind, network, role list, and effort size against today's kind-inferred routing (backing [intake review](#intake-review)).
 
 ### Portable role contract (MCP)
 
@@ -233,11 +246,16 @@ The most commonly changed bootstrap keys:
 | `providerBaseUrl` | `ORCHESTRA_BASE_URL` | `http://192.168.1.2:8080/v1` | OpenAI-compatible **base** URL (not the `/chat/completions` path). |
 | `apiKey` | `ORCHESTRA_API_KEY` | `""` | Bearer token; empty if the endpoint has no auth. |
 | `defaultModelId` | `ORCHESTRA_MODEL` | `deepseek-r1:latest` | Model used when a project/role doesn't override. |
-| `contextWindow` / `maxTokens` | `ORCHESTRA_MAX_TOKENS` | `128000` / `32768` | Advertised to pi for the local model. |
+| `contextWindow` / `maxTokens` | `ORCHESTRA_MAX_TOKENS` (maxTokens only) | `128000` / `32768` | Advertised to pi for the local model. `contextWindow` is config-file only. |
+| `reasoning` | `ORCHESTRA_REASONING` | `true` | Whether the model is a reasoning model — set `false` for plain instruct models. |
+| `thinkingLevel` | `ORCHESTRA_THINKING_LEVEL` | `medium` | pi thinking verbosity (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). |
 | `maxConcurrentTasks` | `ORCHESTRA_MAX_CONCURRENT_TASKS` | `3` | Max tasks the scheduler runs role-steps for concurrently. |
 | `port` / `host` | `ORCHESTRA_PORT` / `ORCHESTRA_HOST` | `5001` / `0.0.0.0` | HTTP bind (UI + API + SSE). |
 | `githubToken` | `ORCHESTRA_GITHUB_TOKEN` | `""` | Fallback PAT for pushing branches / opening PRs. |
 | — | `ORCHESTRA_TOKENS` | `{}` | Per-model-config API keys as JSON keyed by config name, so secrets stay out of the DB. |
+| — | `ORCHESTRA_SECRET_KEY` | generated | 32-byte hex/base64 key for [secrets at rest](#secrets-at-rest); auto-generated to `secret.key` beside `config.json` on first boot. |
+
+Less-common keys — `thinkingFormat`, `requestTimeoutMs`, `dbPath`, `schedulerIdleMs`, `roleToolBudget`, `clientDir` — are documented in the full reference.
 
 **[Full configuration reference →](https://ubcs-io.github.io/orchestra/reference/config)** — every key, the runtime profile fields, model configs, per-project policy, and the routing advisors.
 
@@ -266,7 +284,7 @@ server/                one Node daemon (we own main())
   src/agent.ts         runRole(): one pi agent session per role (run shapes, verdict ladder, think splitting)
   src/roles.ts         role catalog (25 roles), flow templates, acceptance criteria, seed data
   src/orchestrator.ts  ingest → plan → run → critique → gate + scheduler + loop-back
-  src/router.ts        strategic LLM routing advisors (six call points)
+  src/router.ts        strategic LLM routing advisors (seven call points)
   src/harness-policy.ts per-project write/exec policy + tools_json validation
   src/exec.ts          allowlisted, worktree-scoped command runner + evidence records
   src/health.ts        run-health taxonomy (verified/healthy/recovered/degraded/empty)
@@ -282,18 +300,20 @@ server/                one Node daemon (we own main())
   src/planning-rigor.ts minimal/standard/thorough resolution
   src/morning-report.ts deterministic overnight rollup
   src/self-maintenance.ts idle-time model probing + digest backfill
+  src/intake-review.ts pre-flight intake review (scout roles, proposal card, accept/skip)
   src/git.ts           PLANNING scaffold + sandboxed artifact writes/commits + per-task worktrees + reconciliation + diffing
   src/github.ts        GitHub REST glue: push a task branch, open a PR
   src/bus.ts           in-process pub/sub for the SSE stream
   src/routes/          Fastify REST (api.ts) + SSE (sse.ts) + safety controls (safety.ts)
-  test/                Vitest suite (agent, autonomy, context-budget, db, exec, gbnf, git, harness-policy,
-                       health, mcp, morning-report, orchestrator, planning-rigor, probe, profiles, roles,
-                       router, self-maintenance, settings, structured, watchers, watcher-scans)
+  test/                Vitest suite (agent, autonomy, budget, context-budget, crypto, db, exec, gbnf, git,
+                       harness-policy, health, intake-review, mcp, morning-report, orchestrator, planning-rigor,
+                       probe, profiles, profiles-probes, role-versions, roles, router, self-maintenance,
+                       settings, structured, watchers, watcher-scans)
 client/                Vite + React SPA
   src/routes/          Projects, ProjectBoard (kanban), TaskDetail, RolesEditor, Settings, Models, NetworkEditor
   src/components/      ReviewCTA, QuestionDecompose, DiffPanel, EvidencePanel, HealthBadge, SignalsPanel,
-                       MorningReportPanel, WorktreeKanban, WorktreeDetailPane, FileTree, NetworkNodeCard,
-                       GitHubBubble, ModelBubble, MiniRadarChart, CollapsibleCard
+                       IntakeReviewPanel, MorningReportPanel, WorktreeKanban, WorktreeDetailPane, FileTree,
+                       NetworkNodeCard, GitHubBubble, ModelBubble, MiniRadarChart, CollapsibleCard
   src/api.ts           typed API client
 ```
 
@@ -327,7 +347,7 @@ Tool sets are read-only (`read`, `grep`, `find`, `ls`), read + `git_history`, or
 
 ## API
 
-REST is served under `/api`; live streams are SSE. Safety/dev controls are under `/api/safety`. Roughly ninety endpoints cover projects, tasks, interventions, networks, model configs and profiles, harness policy, autonomy and budgets, candidates, the morning report, diffs, and GitHub push/PR.
+REST is served under `/api`; live streams are SSE. Safety/dev controls are under `/api/safety`. About one hundred endpoints cover projects, tasks, interventions, networks, model configs and profiles, harness policy, autonomy and budgets, candidates, intake review, the morning report, diffs, and GitHub push/PR.
 
 **[Full API reference →](https://ubcs-io.github.io/orchestra/reference/api)**
 
@@ -345,6 +365,6 @@ The single process is designed to run on a headless box under **systemd** (or pm
 
 Alpha, and developed in phases. **Reliability:** artifact-first output, constrained decoding with per-endpoint probing, repair-and-resume, and health-aware gating. **Trust:** an allowlisted command runner producing harness-recorded evidence, and measured capability profiles replacing hand-tuned compat flags. **Autonomy:** context budgeting for small windows, plus watchers, budgets, and the morning report. **Transport:** a read-only MCP surface. All of that is implemented and typechecks/builds on top of the original pipeline — ingest, planning, concurrent role execution across per-task worktrees, per-step critique, counter-reviewer gating with loop-back, checkpoint restore, branch reconciliation, decomposition, artifacts/commits, SSE, runtime-editable connection profiles, named model configs, and the React UI.
 
-Successful *LLM* refinement still depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest suite of 26 files covers the agent, orchestrator, router, database, git operations, exec and evidence, health, profiles and probes, context budgeting, watchers and scans, autonomy, morning report, self-maintenance, the MCP surface, spend guardrails, secrets at rest, and role versioning.
+Successful *LLM* refinement still depends on a reachable tool-capable endpoint (set `providerBaseUrl`). A Vitest suite of 27 test files covers the agent, orchestrator, router, database, git operations, exec and evidence, health, profiles and probes, context budgeting, the budget and crypto suites, watchers and scans, autonomy, morning report, self-maintenance, intake review, the MCP surface, spend guardrails, secrets at rest, and role versioning.
 
 **Operational guardrails:** per-project spend ceilings that actually stop dispatch, encryption at rest for stored tokens, and role versioning with per-version outcome scoring — see below.
